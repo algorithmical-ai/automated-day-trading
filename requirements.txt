@@ -1,0 +1,29 @@
+# MCP Server (optional - will use fallback if not available)
+mcp>=1.0.0; python_version >= "3.9"
+
+# Environment Management
+python-dotenv>=1.0.0
+
+# WebSocket
+websockets>=12.0
+
+# AWS
+boto3>=1.28.0
+botocore>=1.31.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+
+# HTTP Clients
+httpx>=0.25.0
+aiohttp>=3.9.0
+requests>=2.31.0
+
+# Logging
+loguru>=0.7.0
+
+# Timezone
+pytz>=2023.3
+
