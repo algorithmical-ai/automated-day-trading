@@ -23,6 +23,15 @@ MCP_AUTH_HEADER_NAME = os.getenv("MCP_AUTH_HEADER_NAME", "Authorization")
 
 MARKET_DATA_MCP_TOKEN = os.getenv("MARKET_DATA_MCP_TOKEN", "")
 
+
+DEBUG_DAY_TRADING = os.environ.get("DEBUG_DAY_TRADING", False)
+if isinstance(DEBUG_DAY_TRADING, str):
+    if DEBUG_DAY_TRADING.lower() == "true":
+        DEBUG_DAY_TRADING = True
+    else:
+        DEBUG_DAY_TRADING = False
+
+
 # DynamoDB Configuration
 DYNAMODB_TABLE_NAME = os.getenv(
     "DYNAMODB_TABLE_NAME",
@@ -33,4 +42,3 @@ DYNAMODB_TABLE_NAME = os.getenv(
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-

@@ -7,7 +7,7 @@ import json
 import aiohttp
 from typing import Optional, Dict, Any
 from loguru_logger import logger
-from constants import MARKET_DATA_MCP_URL, MCP_AUTH_HEADER_NAME, MARKET_DATA_MCP_TOKEN
+from constants import DEBUG_DAY_TRADING, MARKET_DATA_MCP_URL, MCP_AUTH_HEADER_NAME, MARKET_DATA_MCP_TOKEN
 from tool_discovery import ToolDiscoveryService
 
 
@@ -127,6 +127,12 @@ class MCPClient:
 
     async def get_market_clock(self) -> Optional[Dict[str, Any]]:
         """Get market clock status"""
+        if DEBUG_DAY_TRADING:
+            return {
+                "clock": {
+                    "is_open": True
+                }
+            }
         return await self._call_mcp_tool("get_market_clock", {})
 
     async def get_alpaca_screened_tickers(self) -> Optional[Dict[str, Any]]:
