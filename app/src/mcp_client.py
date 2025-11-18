@@ -169,3 +169,8 @@ class MCPClient:
             "enter_reason": enter_reason,
         }
         return await self._call_mcp_tool("send_webhook_signal", params)
+
+    async def get_market_data(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Get market data for a ticker including technical analysis and datetime_price"""
+        params = {"ticker": ticker}
+        return await self._call_mcp_tool("get_market_data", params)
