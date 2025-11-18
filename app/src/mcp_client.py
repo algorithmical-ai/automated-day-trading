@@ -66,10 +66,11 @@ class MCPClient:
                     if response.status == 200:
                         data = await response.json()
                         return self._extract_result_payload(data)
-                    elif response.status == 404:
-                        # If 404, try POST to /mcp with tool name in body
+                    elif response.status in (404, 500):
+                        # If 404 or 500, try POST to /mcp with tool name in body using JSON-RPC format
+                        # The 500 error with "Unknown method: None" suggests server expects JSON-RPC
                         logger.debug(
-                            f"404 for {url1}, trying POST to {self.base_url} with tool in body"
+                            f"{response.status} for {url1}, trying POST to {self.base_url} with JSON-RPC format"
                         )
                         # Try sending as MCP-style JSON-RPC request
                         jsonrpc_body = {
@@ -87,8 +88,9 @@ class MCPClient:
                             else:
                                 error_text = await response2.text()
                                 logger.error(
-                                    f"HTTP Error calling {tool_name} (method 2): {response2.status} - {error_text[:200]}"
+                                    f"HTTP Error calling {tool_name} (JSON-RPC method): {response2.status} - {error_text[:200]}"
                                 )
+                                return None
                     else:
                         error_text = await response.text()
                         logger.error(
