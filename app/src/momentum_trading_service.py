@@ -3,7 +3,7 @@ Momentum Trading Service with entry and exit logic based on price momentum
 """
 
 import asyncio
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, date
 from loguru_logger import logger
 from mcp_client import MCPClient
