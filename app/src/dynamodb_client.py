@@ -375,8 +375,10 @@ class DynamoDBClient:
             # Scan all items with the indicator
             # Note: This is a scan operation, which can be expensive for large tables
             # In production, consider using GSI or different table design
+            # Use ExpressionAttributeNames because "indicator" is a reserved keyword
             response = self.mab_table.scan(
-                FilterExpression="indicator = :ind",
+                FilterExpression="#ind = :ind",
+                ExpressionAttributeNames={"#ind": "indicator"},
                 ExpressionAttributeValues={":ind": indicator},
             )
 
