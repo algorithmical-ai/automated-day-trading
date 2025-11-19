@@ -50,70 +50,33 @@ class MCPClient:
     async def _call_mcp_tool_http(
         self, tool_name: str, params: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """Fallback method using direct HTTP POST requests"""
+        """
+        Call MCP tool using HTTP POST with JSON-RPC format (MCP protocol)
+        MCP Inspector uses this format, so we should use it first
+        """
         try:
             headers = {"Content-Type": "application/json"}
             if self.auth_token:
                 headers[self.auth_header_name] = self.auth_token
 
-            # Try different endpoint structures
-            # Method 1: POST to /mcp/{tool_name}
-            url1 = f"{self.base_url}/{tool_name}"
+            # Use MCP JSON-RPC format (same as MCP Inspector)
+            # POST to base_url with tools/call method
+            jsonrpc_body = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": params},
+            }
 
             async with aiohttp.ClientSession() as session:
-                # Try POST to /mcp/{tool_name} first
-                async with session.post(url1, json=params, headers=headers) as response:
+                async with session.post(
+                    self.base_url, json=jsonrpc_body, headers=headers
+                ) as response:
                     if response.status == 200:
                         data = await response.json()
                         return self._extract_result_payload(data)
-                    elif response.status in (404, 500, 503):
-                        # If 404, 500, or 503, try POST to /mcp with tool name in body using JSON-RPC format
-                        # The 500 error with "Unknown method: None" suggests server expects JSON-RPC
-                        # 503 might be a temporary issue, so try fallback
-                        logger.debug(
-                            f"{response.status} for {url1}, trying POST to {self.base_url} with JSON-RPC format"
-                        )
-                        # Try sending as MCP-style JSON-RPC request
-                        jsonrpc_body = {
-                            "jsonrpc": "2.0",
-                            "id": 1,
-                            "method": "tools/call",
-                            "params": {"name": tool_name, "arguments": params},
-                        }
-                        async with session.post(
-                            self.base_url, json=jsonrpc_body, headers=headers
-                        ) as response2:
-                            if response2.status == 200:
-                                data = await response2.json()
-                                return self._extract_result_payload(data)
-                            else:
-                                # Handle error response - check if it's HTML or JSON
-                                content_type = response2.headers.get("Content-Type", "").lower()
-                                error_text = await response2.text()
-                                
-                                # Detect HTML responses
-                                if "text/html" in content_type or error_text.strip().startswith("<!DOCTYPE") or error_text.strip().startswith("<html"):
-                                    if response2.status == 503:
-                                        logger.warning(
-                                            f"Service temporarily unavailable (503) calling {tool_name} - MCP server returned HTML error page"
-                                        )
-                                    else:
-                                        logger.error(
-                                            f"HTTP Error calling {tool_name} (JSON-RPC method): {response2.status} - Server returned HTML error page"
-                                        )
-                                else:
-                                    # Try to extract meaningful error message from JSON response
-                                    try:
-                                        error_json = json.loads(error_text)
-                                        error_msg = str(error_json).replace("\n", " ")[:200]
-                                    except (json.JSONDecodeError, ValueError):
-                                        error_msg = error_text[:200]
-                                    logger.error(
-                                        f"HTTP Error calling {tool_name} (JSON-RPC method): {response2.status} - {error_msg}"
-                                    )
-                                return None
                     else:
-                        # Handle other error status codes
+                        # Handle error response - check if it's HTML or JSON
                         content_type = response.headers.get("Content-Type", "").lower()
                         error_text = await response.text()
                         
@@ -125,18 +88,30 @@ class MCPClient:
                                 )
                             else:
                                 logger.error(
-                                    f"HTTP Error calling {tool_name}: {response.status} - Server returned HTML error page"
+                                    f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - Server returned HTML error page"
                                 )
                         else:
-                            # Try to extract meaningful error message
+                            # Try to extract meaningful error message from JSON response
                             try:
                                 error_json = json.loads(error_text)
-                                error_msg = str(error_json).replace("\n", " ")[:200]
+                                # Check if it's a JSON-RPC error response
+                                if "error" in error_json:
+                                    error_data = error_json.get("error", {})
+                                    error_msg = error_data.get("message", str(error_data))
+                                    error_code = error_data.get("code", "unknown")
+                                    logger.error(
+                                        f"JSON-RPC Error calling {tool_name}: {error_code} - {error_msg}"
+                                    )
+                                else:
+                                    error_msg = str(error_json).replace("\n", " ")[:200]
+                                    logger.error(
+                                        f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - {error_msg}"
+                                    )
                             except (json.JSONDecodeError, ValueError):
                                 error_msg = error_text[:200]
-                            logger.error(
-                                f"HTTP Error calling {tool_name}: {response.status} - {error_msg}"
-                            )
+                                logger.error(
+                                    f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - {error_msg}"
+                                )
                         return None
         except aiohttp.ClientError as e:
             logger.exception(f"HTTP client error calling {tool_name}: {str(e)}")
