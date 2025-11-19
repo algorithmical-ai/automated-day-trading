@@ -107,9 +107,29 @@ class TradingService:
                         logger.debug(f"Ticker {ticker} is blacklisted, skipping")
                         continue
 
-                    enter_response = await self.mcp_client.enter(ticker, "buy_to_open")
+                    # Retry logic for enter() calls with exponential backoff for 503 errors
+                    # Note: enter() API typically takes 5-10 seconds, so retries use longer delays
+                    enter_response = None
+                    max_retries = 2  # Reduced to 2 since API is slow (5-10s per call)
+                    for attempt in range(max_retries):
+                        enter_response = await self.mcp_client.enter(ticker, "buy_to_open")
+                        if enter_response:
+                            break
+                        # If we get None (likely 503 error), wait and retry
+                        # Use longer delays since API normally takes 5-10 seconds
+                        if attempt < max_retries - 1:
+                            wait_time = (2 ** attempt) * 2.0  # 2s, 4s
+                            logger.debug(
+                                f"Retrying enter() for {ticker} (attempt {attempt + 1}/{max_retries}) "
+                                f"after {wait_time}s delay (API typically takes 5-10s)"
+                            )
+                            await asyncio.sleep(wait_time)
+                    
                     if not enter_response:
-                        logger.warning(f"Failed to get enter response for {ticker}")
+                        logger.warning(
+                            f"Failed to get enter response for {ticker} after {max_retries} attempts "
+                            f"(API may be temporarily unavailable)"
+                        )
                         continue
 
                     enter = enter_response.get("enter", False)
@@ -233,9 +253,29 @@ class TradingService:
                         logger.debug(f"Ticker {ticker} is blacklisted, skipping")
                         continue
 
-                    enter_response = await self.mcp_client.enter(ticker, "sell_to_open")
+                    # Retry logic for enter() calls with exponential backoff for 503 errors
+                    # Note: enter() API typically takes 5-10 seconds, so retries use longer delays
+                    enter_response = None
+                    max_retries = 2  # Reduced to 2 since API is slow (5-10s per call)
+                    for attempt in range(max_retries):
+                        enter_response = await self.mcp_client.enter(ticker, "sell_to_open")
+                        if enter_response:
+                            break
+                        # If we get None (likely 503 error), wait and retry
+                        # Use longer delays since API normally takes 5-10 seconds
+                        if attempt < max_retries - 1:
+                            wait_time = (2 ** attempt) * 2.0  # 2s, 4s
+                            logger.debug(
+                                f"Retrying enter() for {ticker} (attempt {attempt + 1}/{max_retries}) "
+                                f"after {wait_time}s delay (API typically takes 5-10s)"
+                            )
+                            await asyncio.sleep(wait_time)
+                    
                     if not enter_response:
-                        logger.warning(f"Failed to get enter response for {ticker}")
+                        logger.warning(
+                            f"Failed to get enter response for {ticker} after {max_retries} attempts "
+                            f"(API may be temporarily unavailable)"
+                        )
                         continue
 
                     enter = enter_response.get("enter", False)
@@ -386,13 +426,31 @@ class TradingService:
                         )
                         continue
 
-                    # Step 2.1: Call exit() MCP tool
-                    exit_response = await self.mcp_client.exit(
-                        ticker=ticker, enter_price=enter_price, action=exit_action
-                    )
-
+                    # Step 2.1: Call exit() MCP tool with retry logic
+                    # Note: exit() API typically takes 5-10 seconds, so retries use longer delays
+                    exit_response = None
+                    max_retries = 2  # Reduced to 2 since API is slow (5-10s per call)
+                    for attempt in range(max_retries):
+                        exit_response = await self.mcp_client.exit(
+                            ticker=ticker, enter_price=enter_price, action=exit_action
+                        )
+                        if exit_response:
+                            break
+                        # If we get None (likely 503 error), wait and retry
+                        # Use longer delays since API normally takes 5-10 seconds
+                        if attempt < max_retries - 1:
+                            wait_time = (2 ** attempt) * 2.0  # 2s, 4s
+                            logger.debug(
+                                f"Retrying exit() for {ticker} (attempt {attempt + 1}/{max_retries}) "
+                                f"after {wait_time}s delay (API typically takes 5-10s)"
+                            )
+                            await asyncio.sleep(wait_time)
+                    
                     if not exit_response:
-                        logger.warning(f"Failed to get exit response for {ticker}")
+                        logger.warning(
+                            f"Failed to get exit response for {ticker} after {max_retries} attempts "
+                            f"(API may be temporarily unavailable)"
+                        )
                         continue
 
                     exit_decision = exit_response.get("exit_decision", False)
