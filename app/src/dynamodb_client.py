@@ -55,9 +55,29 @@ class DynamoDBClient:
         """Convert float-like values to Decimal for DynamoDB"""
         if isinstance(obj, bool):
             return obj
+        # Check for float types (including numpy floats)
         if isinstance(obj, FLOAT_TYPES):
             # Convert float (or numpy floating) to Decimal using string to preserve precision
             return Decimal(str(float(obj)))
+        # Handle numpy scalar types that might not be caught by FLOAT_TYPES
+        try:
+            import numpy as np
+            if isinstance(obj, np.floating):
+                return Decimal(str(float(obj)))
+            if isinstance(obj, np.integer):
+                return int(obj)
+            # Handle numpy scalar types (numpy.float64, numpy.float32, etc.)
+            if hasattr(np, 'number') and isinstance(obj, np.number):
+                if isinstance(obj, np.floating):
+                    return Decimal(str(float(obj)))
+                elif isinstance(obj, np.integer):
+                    return int(obj)
+        except (ImportError, AttributeError):
+            pass
+        # Also check for int types that might need conversion (numpy ints)
+        if isinstance(obj, (int,)) and not isinstance(obj, bool):
+            # Keep as int (DynamoDB supports integers)
+            return obj
         if isinstance(obj, dict):
             return {k: self._convert_to_decimal(v) for k, v in obj.items()}
         if isinstance(obj, list):
@@ -259,7 +279,14 @@ class DynamoDBClient:
                     "daily_reset_date": datetime.utcnow().date().isoformat(),
                 }
                 if context:
-                    item["last_context"] = self._convert_to_decimal(context)
+                    # Ensure context is properly converted - convert all float values to Decimal
+                    context_converted = self._convert_to_decimal(context)
+                    # Double-check: ensure no floats remain in the converted context
+                    if isinstance(context_converted, dict):
+                        for key, value in context_converted.items():
+                            if isinstance(value, FLOAT_TYPES):
+                                context_converted[key] = Decimal(str(float(value)))
+                    item["last_context"] = context_converted
                 
                 # Put the new item
                 self.mab_table.put_item(Item=item)
@@ -275,7 +302,13 @@ class DynamoDBClient:
                 }
 
                 if context:
+                    # Ensure context is properly converted - convert all float values to Decimal
                     context_converted = self._convert_to_decimal(context)
+                    # Double-check: ensure no floats remain in the converted context
+                    if isinstance(context_converted, dict):
+                        for key, value in context_converted.items():
+                            if isinstance(value, FLOAT_TYPES):
+                                context_converted[key] = Decimal(str(float(value)))
                     update_expression += ", last_context = :lc"
                     expression_values[":lc"] = context_converted
 
