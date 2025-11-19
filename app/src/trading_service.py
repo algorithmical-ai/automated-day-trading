@@ -4,10 +4,12 @@ Trading Service with entry and exit logic
 
 import asyncio
 from typing import Dict, Any, Optional
+from datetime import datetime, date
 from loguru_logger import logger
 from mcp_client import MCPClient
 from dynamodb_client import DynamoDBClient
 from tool_discovery import ToolDiscoveryService
+from mab_service import MABService
 
 
 class TradingService:
@@ -18,6 +20,15 @@ class TradingService:
         self.mcp_client = MCPClient(tool_discovery=tool_discovery)
         self.db_client = DynamoDBClient()
         self.running = True
+        # Initialize MAB services for different indicators
+        self.mab_service_automated_trading = MABService(
+            self.db_client, indicator="Automated Trading"
+        )
+        self.mab_service_automated_workflow = MABService(
+            self.db_client, indicator="Automated workflow"
+        )
+        # Track if we've reset MAB stats today
+        self.mab_reset_date = None
 
     def stop(self):
         """Stop the trading service"""
@@ -45,6 +56,14 @@ class TradingService:
                     continue
 
                 logger.info("Market is open, proceeding with entry logic")
+
+                # Step 1b.1: Reset MAB daily stats if needed (at market open)
+                today = date.today().isoformat()
+                if self.mab_reset_date != today:
+                    logger.info("Resetting daily MAB statistics for new trading day")
+                    await self.mab_service_automated_trading.reset_daily_stats()
+                    await self.mab_service_automated_workflow.reset_daily_stats()
+                    self.mab_reset_date = today
 
                 # Step 1c: Get screened tickers
                 tickers_response = await self.mcp_client.get_alpaca_screened_tickers()
@@ -117,6 +136,50 @@ class TradingService:
                                 f"Failed to get valid quote price for {ticker}, skipping"
                             )
                             continue
+
+                        # Step 1e.1: Check MAB before entering trade
+                        # Get market data for MAB context
+                        market_data_response = await self.mcp_client.get_market_data(ticker)
+                        momentum_score = 0.0  # Default momentum for non-momentum trading
+                        if market_data_response:
+                            technical_analysis = market_data_response.get(
+                                "technical_analysis", {}
+                            )
+                            # Try to extract a simple momentum signal if available
+                            datetime_price = technical_analysis.get("datetime_price", [])
+                            if datetime_price and len(datetime_price) >= 2:
+                                prices = [
+                                    float(entry[1])
+                                    for entry in datetime_price
+                                    if len(entry) >= 2
+                                ]
+                                if len(prices) >= 2:
+                                    # Simple momentum: recent vs earlier price
+                                    momentum_score = (
+                                        (prices[-1] - prices[0]) / prices[0] * 100
+                                        if prices[0] > 0
+                                        else 0.0
+                                    )
+
+                        should_trade, mab_score, mab_reason = (
+                            await self.mab_service_automated_trading.should_trade_ticker(
+                                ticker=ticker,
+                                momentum_score=momentum_score,
+                                market_data=market_data_response,
+                            )
+                        )
+
+                        if not should_trade:
+                            logger.info(
+                                f"Skipping {ticker} - MAB filter: {mab_reason} "
+                                f"(MAB score: {mab_score:.3f} below threshold)"
+                            )
+                            continue
+
+                        logger.info(
+                            f"MAB approved {ticker} for entry: {mab_reason} "
+                            f"(MAB score: {mab_score:.3f})"
+                        )
 
                         # Step 1f: Send webhook signal
                         webhook_response = await self.mcp_client.send_webhook_signal(
@@ -199,6 +262,50 @@ class TradingService:
                                 f"Failed to get valid quote price for {ticker}, skipping"
                             )
                             continue
+
+                        # Step 1h.1: Check MAB before entering trade
+                        # Get market data for MAB context
+                        market_data_response = await self.mcp_client.get_market_data(ticker)
+                        momentum_score = 0.0  # Default momentum for non-momentum trading
+                        if market_data_response:
+                            technical_analysis = market_data_response.get(
+                                "technical_analysis", {}
+                            )
+                            # Try to extract a simple momentum signal if available
+                            datetime_price = technical_analysis.get("datetime_price", [])
+                            if datetime_price and len(datetime_price) >= 2:
+                                prices = [
+                                    float(entry[1])
+                                    for entry in datetime_price
+                                    if len(entry) >= 2
+                                ]
+                                if len(prices) >= 2:
+                                    # Simple momentum: recent vs earlier price
+                                    momentum_score = (
+                                        (prices[-1] - prices[0]) / prices[0] * 100
+                                        if prices[0] > 0
+                                        else 0.0
+                                    )
+
+                        should_trade, mab_score, mab_reason = (
+                            await self.mab_service_automated_workflow.should_trade_ticker(
+                                ticker=ticker,
+                                momentum_score=momentum_score,
+                                market_data=market_data_response,
+                            )
+                        )
+
+                        if not should_trade:
+                            logger.info(
+                                f"Skipping {ticker} - MAB filter: {mab_reason} "
+                                f"(MAB score: {mab_score:.3f} below threshold)"
+                            )
+                            continue
+
+                        logger.info(
+                            f"MAB approved {ticker} for entry: {mab_reason} "
+                            f"(MAB score: {mab_score:.3f})"
+                        )
 
                         # Step 1i: Send webhook signal
                         webhook_response = await self.mcp_client.send_webhook_signal(
@@ -294,12 +401,37 @@ class TradingService:
                         logger.info(f"Exit signal for {ticker} - {exit_action}")
 
                         reason = exit_response.get("reason", "")
+                        indicator = trade.get("indicator", "Automated Trading")
+
+                        # Step 2.1.1: Get current price for profit/loss calculation
+                        # Get market data to extract exit price
+                        market_data_response = await self.mcp_client.get_market_data(ticker)
+                        exit_price = enter_price  # Default to enter_price if we can't get current price
+                        
+                        if market_data_response:
+                            technical_analysis = market_data_response.get(
+                                "technical_analysis", {}
+                            )
+                            current_price = technical_analysis.get("close_price", 0.0)
+                            if current_price > 0:
+                                exit_price = current_price
+                            else:
+                                # Fallback: try to get quote
+                                quote_response = await self.mcp_client.get_quote(ticker)
+                                if quote_response:
+                                    quote_data = quote_response.get("quote", {})
+                                    quotes = quote_data.get("quotes", {})
+                                    ticker_quote = quotes.get(ticker, {})
+                                    if exit_action == "sell_to_close":
+                                        exit_price = ticker_quote.get("bp", enter_price)  # Bid price for sell
+                                    else:
+                                        exit_price = ticker_quote.get("ap", enter_price)  # Ask price for buy
 
                         # Step 2.2: Send webhook signal
                         webhook_response = await self.mcp_client.send_webhook_signal(
                             ticker=ticker,
                             action=exit_action,
-                            indicator="Automated Trading",
+                            indicator=indicator,
                             enter_reason=reason,
                         )
 
@@ -311,6 +443,51 @@ class TradingService:
                             logger.warning(
                                 f"Failed to send webhook signal for {ticker}"
                             )
+
+                        # Step 2.2.1: Record MAB reward (profit/loss)
+                        # Calculate profit percentage
+                        if original_action == "buy_to_open":
+                            profit_percent = (
+                                (exit_price - enter_price) / enter_price * 100
+                                if enter_price > 0
+                                else 0.0
+                            )
+                        elif original_action == "sell_to_open":
+                            profit_percent = (
+                                (enter_price - exit_price) / enter_price * 100
+                                if enter_price > 0
+                                else 0.0
+                            )
+                        else:
+                            profit_percent = 0.0
+
+                        context = {
+                            "profit_percent": profit_percent,
+                            "enter_price": enter_price,
+                            "exit_price": exit_price,
+                            "action": original_action,
+                            "indicator": indicator,
+                            "timestamp": datetime.utcnow().isoformat(),
+                        }
+
+                        # Use the appropriate MAB service based on indicator
+                        if indicator == "Automated workflow":
+                            mab_service = self.mab_service_automated_workflow
+                        else:
+                            mab_service = self.mab_service_automated_trading
+
+                        await mab_service.record_trade_outcome(
+                            ticker=ticker,
+                            enter_price=enter_price,
+                            exit_price=exit_price,
+                            action=original_action,
+                            context=context,
+                        )
+
+                        logger.info(
+                            f"Recorded MAB reward for {ticker}: {profit_percent:.2f}% profit/loss "
+                            f"(enter: {enter_price}, exit: {exit_price})"
+                        )
 
                         # Step 2.3: Delete from DynamoDB
                         await self.db_client.delete_trade(ticker)

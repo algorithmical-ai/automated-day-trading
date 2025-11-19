@@ -4,10 +4,12 @@ Momentum Trading Service with entry and exit logic based on price momentum
 
 import asyncio
 from typing import Optional, List, Tuple
+from datetime import datetime, date
 from loguru_logger import logger
 from mcp_client import MCPClient
 from dynamodb_client import DynamoDBClient
 from tool_discovery import ToolDiscoveryService
+from mab_service import MABService
 
 
 class MomentumTradingService:
@@ -24,6 +26,10 @@ class MomentumTradingService:
         self.profit_threshold = 0.5  # 0.5% profit threshold
         # Number of top tickers to trade (configurable)
         self.top_k = top_k
+        # Initialize MAB service for contextual bandit-based ticker selection
+        self.mab_service = MABService(self.db_client, indicator="Momentum Trading")
+        # Track if we've reset MAB stats today
+        self.mab_reset_date = None
 
     def stop(self):
         """Stop the trading service"""
@@ -118,6 +124,13 @@ class MomentumTradingService:
 
                 logger.info("Market is open, proceeding with momentum entry logic")
 
+                # Step 1b.1: Reset MAB daily stats if needed (at market open)
+                today = date.today().isoformat()
+                if self.mab_reset_date != today:
+                    logger.info("Resetting daily MAB statistics for new trading day")
+                    await self.mab_service.reset_daily_stats()
+                    self.mab_reset_date = today
+
                 # Step 1c: Get screened tickers
                 tickers_response = await self.mcp_client.get_alpaca_screened_tickers()
                 if not tickers_response:
@@ -161,8 +174,9 @@ class MomentumTradingService:
                     if trade.get("ticker")
                 }
 
-                # Step 1e: Collect momentum scores for all tickers
+                # Step 1e: Collect momentum scores for all tickers and market data for MAB
                 ticker_momentum_scores = []  # List of (ticker, momentum_score, reason)
+                market_data_dict = {}  # Store market data for MAB context
 
                 for ticker in filtered_tickers:
                     if not self.running:
@@ -186,6 +200,9 @@ class MomentumTradingService:
                         logger.debug(f"Failed to get market data for {ticker}")
                         continue
 
+                    # Store market data for MAB context
+                    market_data_dict[ticker] = market_data_response
+
                     technical_analysis = market_data_response.get(
                         "technical_analysis", {}
                     )
@@ -206,8 +223,7 @@ class MomentumTradingService:
                     f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers"
                 )
 
-                # Step 1f: Rank tickers by momentum and select top-k
-                # Separate upward and downward momentum
+                # Step 1f: Separate upward and downward momentum
                 upward_tickers = [
                     (t, score, reason)
                     for t, score, reason in ticker_momentum_scores
@@ -219,20 +235,22 @@ class MomentumTradingService:
                     if score < 0
                 ]
 
-                # Sort by absolute momentum score (descending) and take top-k
-                upward_tickers.sort(
-                    key=lambda x: x[1], reverse=True
-                )  # Highest positive scores first
-                downward_tickers.sort(
-                    key=lambda x: x[1]
-                )  # Most negative scores first (lowest values)
-
-                top_upward = upward_tickers[: self.top_k]
-                top_downward = downward_tickers[: self.top_k]
+                # Step 1f.1: Use MAB to select top-k tickers from each direction
+                # MAB will boost high-profitability tickers and penalize low-profitability ones
+                top_upward = await self.mab_service.select_tickers_with_mab(
+                    ticker_candidates=upward_tickers,
+                    market_data_dict=market_data_dict,
+                    top_k=self.top_k,
+                )
+                top_downward = await self.mab_service.select_tickers_with_mab(
+                    ticker_candidates=downward_tickers,
+                    market_data_dict=market_data_dict,
+                    top_k=self.top_k,
+                )
 
                 logger.info(
-                    f"Selected top {len(top_upward)} upward momentum tickers and "
-                    f"top {len(top_downward)} downward momentum tickers (top_k={self.top_k})"
+                    f"MAB selected {len(top_upward)} upward momentum tickers and "
+                    f"{len(top_downward)} downward momentum tickers (top_k={self.top_k})"
                 )
 
                 # Step 1g: Enter trades for top-k tickers
@@ -470,7 +488,24 @@ class MomentumTradingService:
                                 f"Failed to send webhook signal for {ticker}"
                             )
 
-                        # Step 2.4: Delete from DynamoDB
+                        # Step 2.4: Record MAB reward (profit/loss)
+                        context = {
+                            "profit_percent": profit_percent,
+                            "enter_price": enter_price,
+                            "exit_price": current_price,
+                            "action": original_action,
+                            "indicator": indicator,
+                            "timestamp": datetime.utcnow().isoformat(),
+                        }
+                        await self.mab_service.record_trade_outcome(
+                            ticker=ticker,
+                            enter_price=enter_price,
+                            exit_price=current_price,
+                            action=original_action,
+                            context=context,
+                        )
+
+                        # Step 2.5: Delete from DynamoDB
                         await self.db_client.delete_momentum_trade(ticker)
                         logger.info(f"Exited momentum trade for {ticker}")
                     else:
