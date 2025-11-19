@@ -8,6 +8,13 @@ from typing import Optional, Dict, Any, List
 from decimal import Decimal
 from datetime import datetime
 from loguru_logger import logger
+
+try:
+    import numpy as np
+
+    FLOAT_TYPES = (float, np.floating)
+except Exception:  # numpy might not be available
+    FLOAT_TYPES = (float,)
 from constants import (
     DYNAMODB_TABLE_NAME,
     AWS_ACCESS_KEY_ID,
@@ -45,12 +52,15 @@ class DynamoDBClient:
         self.mab_table = self.dynamodb.Table(MAB_TABLE_NAME)
 
     def _convert_to_decimal(self, obj):
-        """Convert float to Decimal for DynamoDB"""
-        if isinstance(obj, float):
-            return Decimal(str(obj))
-        elif isinstance(obj, dict):
+        """Convert float-like values to Decimal for DynamoDB"""
+        if isinstance(obj, bool):
+            return obj
+        if isinstance(obj, FLOAT_TYPES):
+            # Convert float (or numpy floating) to Decimal using string to preserve precision
+            return Decimal(str(float(obj)))
+        if isinstance(obj, dict):
             return {k: self._convert_to_decimal(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
+        if isinstance(obj, list):
             return [self._convert_to_decimal(item) for item in obj]
         return obj
 
