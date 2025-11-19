@@ -659,7 +659,7 @@ class MomentumTradingService:
                     market_data_response = await self.mcp_client.get_market_data(ticker)
                     if not market_data_response:
                         logger.warning(
-                            f"Failed to get market data for {ticker} for exit check"
+                            f"Failed to get market data for {ticker} for exit check - will retry in next cycle"
                         )
                         continue
 
