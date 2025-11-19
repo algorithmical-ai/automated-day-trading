@@ -42,3 +42,6 @@ DYNAMODB_TABLE_NAME = os.getenv(
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+
+# Momentum Trading Configuration
+MOMENTUM_TOP_K = int(os.getenv("MOMENTUM_TOP_K", "10"))  # Number of top tickers to trade per direction

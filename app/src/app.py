@@ -9,6 +9,7 @@ from loguru_logger import logger
 from trading_service import TradingService
 from momentum_trading_service import MomentumTradingService
 from tool_discovery import ToolDiscoveryService
+from constants import MOMENTUM_TOP_K
 
 
 # Global references for signal handlers
@@ -46,8 +47,11 @@ async def main():
     # Initialize trading service with tool discovery
     trading_service = TradingService(tool_discovery=tool_discovery_service)
     
-    # Initialize momentum trading service with tool discovery
-    momentum_trading_service = MomentumTradingService(tool_discovery=tool_discovery_service)
+    # Initialize momentum trading service with tool discovery and top_k configuration
+    momentum_trading_service = MomentumTradingService(
+        tool_discovery=tool_discovery_service,
+        top_k=MOMENTUM_TOP_K
+    )
     
     # Setup signal handlers
     setup_signal_handlers(trading_service, momentum_trading_service, tool_discovery_service)
