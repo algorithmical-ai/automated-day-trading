@@ -63,7 +63,7 @@ class MCPClient:
         """
         Call MCP tool using HTTP POST with JSON-RPC format (MCP protocol)
         MCP Inspector uses this format, so we should use it first
-        
+
         Args:
             tool_name: Name of the MCP tool to call
             params: Parameters for the tool
@@ -75,7 +75,7 @@ class MCPClient:
         if time_since_last < self._min_request_interval:
             await asyncio.sleep(self._min_request_interval - time_since_last)
         self._last_request_time = time.time()
-        
+
         max_retries = 3 if retry_on_503 else 1
         base_delay = 2.0  # Start with 2 second delay
 
@@ -103,9 +103,13 @@ class MCPClient:
                         if response.status == 200:
                             data = await response.json()
                             return self._extract_result_payload(data)
-                        elif response.status == 503 and retry_on_503 and attempt < max_retries - 1:
+                        elif (
+                            response.status == 503
+                            and retry_on_503
+                            and attempt < max_retries - 1
+                        ):
                             # 503 Service Unavailable - server is overloaded, retry with backoff
-                            delay = base_delay * (2 ** attempt)  # 2s, 4s, 8s
+                            delay = base_delay * (2**attempt)  # 2s, 4s, 8s
                             logger.warning(
                                 f"Server overloaded (503) calling {tool_name}, "
                                 f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
@@ -114,7 +118,9 @@ class MCPClient:
                             continue
                         else:
                             # Handle error response - check if it's HTML or JSON
-                            content_type = response.headers.get("Content-Type", "").lower()
+                            content_type = response.headers.get(
+                                "Content-Type", ""
+                            ).lower()
                             error_text = await response.text()
 
                             # Detect HTML responses (Heroku error pages)
@@ -125,7 +131,7 @@ class MCPClient:
                             ):
                                 if response.status == 503:
                                     if attempt < max_retries - 1:
-                                        delay = base_delay * (2 ** attempt)
+                                        delay = base_delay * (2**attempt)
                                         logger.warning(
                                             f"Server overloaded (503) calling {tool_name}, "
                                             f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
@@ -156,7 +162,9 @@ class MCPClient:
                                             f"JSON-RPC Error calling {tool_name}: {error_code} - {error_msg}"
                                         )
                                     else:
-                                        error_msg = str(error_json).replace("\n", " ")[:200]
+                                        error_msg = str(error_json).replace("\n", " ")[
+                                            :200
+                                        ]
                                         logger.error(
                                             f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - {error_msg}"
                                         )
@@ -168,7 +176,7 @@ class MCPClient:
                             return None
             except aiohttp.ClientError as e:
                 if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
+                    delay = base_delay * (2**attempt)
                     logger.warning(
                         f"HTTP client error calling {tool_name}, retrying in {delay}s: {str(e)}"
                     )
@@ -179,7 +187,7 @@ class MCPClient:
             except Exception as e:  # pylint: disable=broad-except
                 logger.exception(f"Unexpected exception calling {tool_name}: {str(e)}")
                 return None
-        
+
         return None
 
     async def _call_mcp_tool(
