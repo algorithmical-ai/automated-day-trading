@@ -284,11 +284,18 @@ class DynamoDBClient:
             # Get current stats or initialize
             current_stats = await self.get_mab_stats(ticker, indicator)
 
+            # Convert reward to float first (in case it's a numpy type), then to Decimal for calculation
+            reward_float = float(reward)
+            
             # Calculate new statistics
-            total_rewards = float(current_stats.get("total_rewards", 0.0) if current_stats else 0.0) + reward
+            # Get current total_rewards as float (it might be Decimal from DB)
+            current_total_rewards = current_stats.get("total_rewards", 0.0) if current_stats else 0.0
+            if isinstance(current_total_rewards, Decimal):
+                current_total_rewards = float(current_total_rewards)
+            total_rewards = current_total_rewards + reward_float
             total_pulls = (current_stats.get("total_pulls", 0) if current_stats else 0) + 1
 
-            if reward > 0:
+            if reward_float > 0:
                 successful_trades = (current_stats.get("successful_trades", 0) if current_stats else 0) + 1
                 failed_trades = current_stats.get("failed_trades", 0) if current_stats else 0
             else:
@@ -314,6 +321,9 @@ class DynamoDBClient:
                     context_converted = self._ensure_all_floats_converted(context_converted)
                     item["last_context"] = context_converted
                 
+                # Final safety check: ensure entire item has no floats
+                item = self._ensure_all_floats_converted(item)
+                
                 # Put the new item
                 self.mab_table.put_item(Item=item)
             else:
@@ -334,6 +344,9 @@ class DynamoDBClient:
                     context_converted = self._ensure_all_floats_converted(context_converted)
                     update_expression += ", last_context = :lc"
                     expression_values[":lc"] = context_converted
+
+                # Final safety check: ensure all expression values have no floats
+                expression_values = self._ensure_all_floats_converted(expression_values)
 
                 self.mab_table.update_item(
                     Key={"ticker": ticker, "indicator": indicator},
