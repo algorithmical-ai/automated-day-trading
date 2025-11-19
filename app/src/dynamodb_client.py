@@ -51,27 +51,38 @@ class DynamoDBClient:
         self.blacklist_table = self.dynamodb.Table(TICKER_BLACKLIST_TABLE_NAME)
         self.mab_table = self.dynamodb.Table(MAB_TABLE_NAME)
 
+    def _is_float_type(self, obj):
+        """Check if object is a float type that needs conversion to Decimal"""
+        if isinstance(obj, bool):
+            return False
+        if isinstance(obj, FLOAT_TYPES):
+            return True
+        # Check for numpy float types
+        try:
+            import numpy as np
+            if isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
+                return True
+            # Check if it's a numpy number that's a float
+            if hasattr(np, 'number') and isinstance(obj, np.number):
+                if isinstance(obj, np.floating):
+                    return True
+        except (ImportError, AttributeError):
+            pass
+        return False
+
     def _convert_to_decimal(self, obj):
         """Convert float-like values to Decimal for DynamoDB"""
         if isinstance(obj, bool):
             return obj
         # Check for float types (including numpy floats)
-        if isinstance(obj, FLOAT_TYPES):
+        if self._is_float_type(obj):
             # Convert float (or numpy floating) to Decimal using string to preserve precision
             return Decimal(str(float(obj)))
-        # Handle numpy scalar types that might not be caught by FLOAT_TYPES
+        # Handle numpy integer types
         try:
             import numpy as np
-            if isinstance(obj, np.floating):
-                return Decimal(str(float(obj)))
-            if isinstance(obj, np.integer):
+            if isinstance(obj, (np.integer, np.int8, np.int16, np.int32, np.int64)):
                 return int(obj)
-            # Handle numpy scalar types (numpy.float64, numpy.float32, etc.)
-            if hasattr(np, 'number') and isinstance(obj, np.number):
-                if isinstance(obj, np.floating):
-                    return Decimal(str(float(obj)))
-                elif isinstance(obj, np.integer):
-                    return int(obj)
         except (ImportError, AttributeError):
             pass
         # Also check for int types that might need conversion (numpy ints)
@@ -82,6 +93,24 @@ class DynamoDBClient:
             return {k: self._convert_to_decimal(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [self._convert_to_decimal(item) for item in obj]
+        return obj
+    
+    def _ensure_all_floats_converted(self, obj):
+        """Recursively ensure all float values in a structure are converted to Decimal"""
+        if isinstance(obj, dict):
+            converted = {}
+            for key, value in obj.items():
+                if self._is_float_type(value):
+                    converted[key] = Decimal(str(float(value)))
+                elif isinstance(value, (dict, list)):
+                    converted[key] = self._ensure_all_floats_converted(value)
+                else:
+                    converted[key] = value
+            return converted
+        elif isinstance(obj, list):
+            return [self._ensure_all_floats_converted(item) for item in obj]
+        elif self._is_float_type(obj):
+            return Decimal(str(float(obj)))
         return obj
 
     def _convert_from_decimal(self, obj):
@@ -281,11 +310,8 @@ class DynamoDBClient:
                 if context:
                     # Ensure context is properly converted - convert all float values to Decimal
                     context_converted = self._convert_to_decimal(context)
-                    # Double-check: ensure no floats remain in the converted context
-                    if isinstance(context_converted, dict):
-                        for key, value in context_converted.items():
-                            if isinstance(value, FLOAT_TYPES):
-                                context_converted[key] = Decimal(str(float(value)))
+                    # Double-check: recursively ensure no floats remain anywhere in the structure
+                    context_converted = self._ensure_all_floats_converted(context_converted)
                     item["last_context"] = context_converted
                 
                 # Put the new item
@@ -304,11 +330,8 @@ class DynamoDBClient:
                 if context:
                     # Ensure context is properly converted - convert all float values to Decimal
                     context_converted = self._convert_to_decimal(context)
-                    # Double-check: ensure no floats remain in the converted context
-                    if isinstance(context_converted, dict):
-                        for key, value in context_converted.items():
-                            if isinstance(value, FLOAT_TYPES):
-                                context_converted[key] = Decimal(str(float(value)))
+                    # Double-check: recursively ensure no floats remain anywhere in the structure
+                    context_converted = self._ensure_all_floats_converted(context_converted)
                     update_expression += ", last_context = :lc"
                     expression_values[":lc"] = context_converted
 
