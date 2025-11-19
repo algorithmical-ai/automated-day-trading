@@ -235,60 +235,62 @@ class DynamoDBClient:
             # Get current stats or initialize
             current_stats = await self.get_mab_stats(ticker, indicator)
 
+            # Calculate new statistics
+            total_rewards = float(current_stats.get("total_rewards", 0.0) if current_stats else 0.0) + reward
+            total_pulls = (current_stats.get("total_pulls", 0) if current_stats else 0) + 1
+
+            if reward > 0:
+                successful_trades = (current_stats.get("successful_trades", 0) if current_stats else 0) + 1
+                failed_trades = current_stats.get("failed_trades", 0) if current_stats else 0
+            else:
+                successful_trades = current_stats.get("successful_trades", 0) if current_stats else 0
+                failed_trades = (current_stats.get("failed_trades", 0) if current_stats else 0) + 1
+
             if current_stats is None:
-                # Initialize new entry
+                # Create new entry with calculated values
                 item = {
                     "ticker": ticker,
                     "indicator": indicator,
-                    "total_rewards": self._convert_to_decimal(0.0),
-                    "total_pulls": 0,
-                    "successful_trades": 0,
-                    "failed_trades": 0,
+                    "total_rewards": self._convert_to_decimal(total_rewards),
+                    "total_pulls": total_pulls,
+                    "successful_trades": successful_trades,
+                    "failed_trades": failed_trades,
                     "last_updated": datetime.utcnow().isoformat(),
                     "daily_reset_date": datetime.utcnow().date().isoformat(),
                 }
                 if context:
                     item["last_context"] = self._convert_to_decimal(context)
-                current_stats = item
-
-            # Update statistics
-            total_rewards = float(current_stats.get("total_rewards", 0.0)) + reward
-            total_pulls = current_stats.get("total_pulls", 0) + 1
-
-            if reward > 0:
-                successful_trades = current_stats.get("successful_trades", 0) + 1
-                failed_trades = current_stats.get("failed_trades", 0)
+                
+                # Put the new item
+                self.mab_table.put_item(Item=item)
             else:
-                successful_trades = current_stats.get("successful_trades", 0)
-                failed_trades = current_stats.get("failed_trades", 0) + 1
+                # Update existing item
+                update_expression = "SET total_rewards = :tr, total_pulls = :tp, successful_trades = :st, failed_trades = :ft, last_updated = :lu"
+                expression_values = {
+                    ":tr": self._convert_to_decimal(total_rewards),
+                    ":tp": total_pulls,
+                    ":st": successful_trades,
+                    ":ft": failed_trades,
+                    ":lu": datetime.utcnow().isoformat(),
+                }
 
-            # Update item
-            update_expression = "SET total_rewards = :tr, total_pulls = :tp, successful_trades = :st, failed_trades = :ft, last_updated = :lu"
-            expression_values = {
-                ":tr": self._convert_to_decimal(total_rewards),
-                ":tp": total_pulls,
-                ":st": successful_trades,
-                ":ft": failed_trades,
-                ":lu": datetime.utcnow().isoformat(),
-            }
+                if context:
+                    context_converted = self._convert_to_decimal(context)
+                    update_expression += ", last_context = :lc"
+                    expression_values[":lc"] = context_converted
 
-            if context:
-                context = self._convert_to_decimal(context)
-                update_expression += ", last_context = :lc"
-                expression_values[":lc"] = context
-
-            self.mab_table.update_item(
-                Key={"ticker": ticker, "indicator": indicator},
-                UpdateExpression=update_expression,
-                ExpressionAttributeValues=expression_values,
-            )
+                self.mab_table.update_item(
+                    Key={"ticker": ticker, "indicator": indicator},
+                    UpdateExpression=update_expression,
+                    ExpressionAttributeValues=expression_values,
+                )
 
             logger.debug(
                 f"Updated MAB stats for {ticker}/{indicator}: reward={reward:.4f}, total_rewards={total_rewards:.4f}, pulls={total_pulls}"
             )
             return True
         except Exception as e:
-            logger.error(
+            logger.exception(
                 f"Error updating MAB reward for {ticker}/{indicator}: {str(e)}"
             )
             return False

@@ -66,9 +66,10 @@ class MCPClient:
                     if response.status == 200:
                         data = await response.json()
                         return self._extract_result_payload(data)
-                    elif response.status in (404, 500):
-                        # If 404 or 500, try POST to /mcp with tool name in body using JSON-RPC format
+                    elif response.status in (404, 500, 503):
+                        # If 404, 500, or 503, try POST to /mcp with tool name in body using JSON-RPC format
                         # The 500 error with "Unknown method: None" suggests server expects JSON-RPC
+                        # 503 might be a temporary issue, so try fallback
                         logger.debug(
                             f"{response.status} for {url1}, trying POST to {self.base_url} with JSON-RPC format"
                         )
@@ -86,16 +87,56 @@ class MCPClient:
                                 data = await response2.json()
                                 return self._extract_result_payload(data)
                             else:
+                                # Handle error response - check if it's HTML or JSON
+                                content_type = response2.headers.get("Content-Type", "").lower()
                                 error_text = await response2.text()
-                                logger.error(
-                                    f"HTTP Error calling {tool_name} (JSON-RPC method): {response2.status} - {error_text[:200]}"
-                                )
+                                
+                                # Detect HTML responses
+                                if "text/html" in content_type or error_text.strip().startswith("<!DOCTYPE") or error_text.strip().startswith("<html"):
+                                    if response2.status == 503:
+                                        logger.warning(
+                                            f"Service temporarily unavailable (503) calling {tool_name} - MCP server returned HTML error page"
+                                        )
+                                    else:
+                                        logger.error(
+                                            f"HTTP Error calling {tool_name} (JSON-RPC method): {response2.status} - Server returned HTML error page"
+                                        )
+                                else:
+                                    # Try to extract meaningful error message from JSON response
+                                    try:
+                                        error_json = json.loads(error_text)
+                                        error_msg = str(error_json).replace("\n", " ")[:200]
+                                    except (json.JSONDecodeError, ValueError):
+                                        error_msg = error_text[:200]
+                                    logger.error(
+                                        f"HTTP Error calling {tool_name} (JSON-RPC method): {response2.status} - {error_msg}"
+                                    )
                                 return None
                     else:
+                        # Handle other error status codes
+                        content_type = response.headers.get("Content-Type", "").lower()
                         error_text = await response.text()
-                        logger.error(
-                            f"HTTP Error calling {tool_name}: {response.status} - {error_text[:200]}"
-                        )
+                        
+                        # Detect HTML responses
+                        if "text/html" in content_type or error_text.strip().startswith("<!DOCTYPE") or error_text.strip().startswith("<html"):
+                            if response.status == 503:
+                                logger.warning(
+                                    f"Service temporarily unavailable (503) calling {tool_name} - MCP server returned HTML error page"
+                                )
+                            else:
+                                logger.error(
+                                    f"HTTP Error calling {tool_name}: {response.status} - Server returned HTML error page"
+                                )
+                        else:
+                            # Try to extract meaningful error message
+                            try:
+                                error_json = json.loads(error_text)
+                                error_msg = str(error_json).replace("\n", " ")[:200]
+                            except (json.JSONDecodeError, ValueError):
+                                error_msg = error_text[:200]
+                            logger.error(
+                                f"HTTP Error calling {tool_name}: {response.status} - {error_msg}"
+                            )
                         return None
         except aiohttp.ClientError as e:
             logger.exception(f"HTTP client error calling {tool_name}: {str(e)}")
