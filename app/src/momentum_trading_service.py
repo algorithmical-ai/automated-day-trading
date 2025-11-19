@@ -26,6 +26,10 @@ class MomentumTradingService:
         self.profit_threshold = 0.5  # 0.5% profit threshold
         # Number of top tickers to trade (configurable)
         self.top_k = top_k
+        # Maximum number of active trades at any time
+        self.max_active_trades = 30
+        # Exceptional momentum threshold for preemption (higher = more selective)
+        self.exceptional_momentum_threshold = 5.0  # 5.0% momentum score
         # Initialize MAB service for contextual bandit-based ticker selection
         self.mab_service = MABService(self.db_client, indicator="Momentum Trading")
         # Track if we've reset MAB stats today
@@ -101,6 +105,157 @@ class MomentumTradingService:
             return profit_percent >= self.profit_threshold
         return False
 
+    def _calculate_profit_percent(
+        self, enter_price: float, current_price: float, action: str
+    ) -> float:
+        """
+        Calculate profit percentage for a trade
+        Returns positive for profit, negative for loss
+        """
+        if action == "buy_to_open":
+            # Long trade: profit if current price is higher
+            return ((current_price - enter_price) / enter_price) * 100
+        elif action == "sell_to_open":
+            # Short trade: profit if current price is lower
+            return ((enter_price - current_price) / enter_price) * 100
+        return 0.0
+
+    async def _find_lowest_profitable_trade(
+        self, active_trades: List[Dict[str, Any]]
+    ) -> Optional[Tuple[Dict[str, Any], float]]:
+        """
+        Find the lowest profitable trade from active trades
+        Returns (trade_dict, profit_percent) or None if no profitable trades
+        """
+        lowest_profit = None
+        lowest_trade = None
+
+        for trade in active_trades:
+            ticker = trade.get("ticker")
+            enter_price = trade.get("enter_price")
+            action = trade.get("action")
+
+            if not ticker or enter_price is None or enter_price <= 0:
+                continue
+
+            # Get current price
+            market_data_response = await self.mcp_client.get_market_data(ticker)
+            if not market_data_response:
+                continue
+
+            technical_analysis = market_data_response.get("technical_analysis", {})
+            current_price = technical_analysis.get("close_price", 0.0)
+
+            if current_price <= 0:
+                continue
+
+            profit_percent = self._calculate_profit_percent(
+                enter_price, current_price, action
+            )
+
+            # Only consider profitable trades
+            if profit_percent >= self.profit_threshold:
+                if lowest_profit is None or profit_percent < lowest_profit:
+                    lowest_profit = profit_percent
+                    lowest_trade = trade
+
+        if lowest_trade and lowest_profit is not None:
+            return (lowest_trade, lowest_profit)
+        return None
+
+    async def _preempt_low_profit_trade(
+        self, new_ticker: str, new_momentum_score: float
+    ) -> bool:
+        """
+        Preempt (exit) a low profitable trade to make room for a new exceptional trade
+        Returns True if preemption was successful, False otherwise
+        """
+        active_trades = await self.db_client.get_all_momentum_trades()
+        
+        if len(active_trades) < self.max_active_trades:
+            return False  # No need to preempt
+
+        # Find lowest profitable trade
+        result = await self._find_lowest_profitable_trade(active_trades)
+        if not result:
+            logger.debug("No profitable trades to preempt")
+            return False
+
+        lowest_trade, lowest_profit = result
+        ticker_to_exit = lowest_trade.get("ticker")
+
+        logger.info(
+            f"Preempting {ticker_to_exit} (profit: {lowest_profit:.2f}%) "
+            f"to make room for {new_ticker} (momentum: {new_momentum_score:.2f})"
+        )
+
+        # Exit the low profit trade
+        original_action = lowest_trade.get("action")
+        enter_price = lowest_trade.get("enter_price")
+        indicator = lowest_trade.get("indicator", "Momentum Trading")
+
+        # Determine exit action
+        if original_action == "buy_to_open":
+            exit_action = "sell_to_close"
+        elif original_action == "sell_to_open":
+            exit_action = "buy_to_close"
+        else:
+            logger.warning(f"Unknown action: {original_action} for {ticker_to_exit}")
+            return False
+
+        # Get current price for exit
+        market_data_response = await self.mcp_client.get_market_data(ticker_to_exit)
+        if not market_data_response:
+            logger.warning(f"Failed to get market data for {ticker_to_exit} for preemption")
+            return False
+
+        technical_analysis = market_data_response.get("technical_analysis", {})
+        exit_price = technical_analysis.get("close_price", 0.0)
+
+        if exit_price <= 0:
+            logger.warning(f"Invalid exit price for {ticker_to_exit}")
+            return False
+
+        # Send webhook signal
+        reason = f"Preempted for exceptional trade: {lowest_profit:.2f}% profit"
+        webhook_response = await self.mcp_client.send_webhook_signal(
+            ticker=ticker_to_exit,
+            action=exit_action,
+            indicator=indicator,
+            enter_reason=reason,
+        )
+
+        if webhook_response:
+            logger.info(f"Webhook signal sent for preempted {ticker_to_exit} - {exit_action}")
+        else:
+            logger.warning(f"Failed to send webhook signal for {ticker_to_exit}")
+
+        # Record MAB reward
+        profit_percent = self._calculate_profit_percent(
+            enter_price, exit_price, original_action
+        )
+        context = {
+            "profit_percent": profit_percent,
+            "enter_price": enter_price,
+            "exit_price": exit_price,
+            "action": original_action,
+            "indicator": indicator,
+            "preempted": True,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        await self.mab_service.record_trade_outcome(
+            ticker=ticker_to_exit,
+            enter_price=enter_price,
+            exit_price=exit_price,
+            action=original_action,
+            context=context,
+        )
+
+        # Delete from DynamoDB
+        await self.db_client.delete_momentum_trade(ticker_to_exit)
+        logger.info(f"Preempted and exited trade for {ticker_to_exit}")
+        return True
+
     async def entry_service(self):
         """Entry service that runs every 10 seconds - analyzes momentum and enters trades"""
         logger.info("Momentum entry service started")
@@ -168,11 +323,16 @@ class MomentumTradingService:
 
                 # Step 1d: Get active trades to filter out tickers that already have trades
                 active_trades = await self.db_client.get_all_momentum_trades()
+                active_count = len(active_trades)
                 active_ticker_set = {
                     trade.get("ticker")
                     for trade in active_trades
                     if trade.get("ticker")
                 }
+                
+                logger.info(
+                    f"Current active trades: {active_count}/{self.max_active_trades}"
+                )
 
                 # Step 1e: Collect momentum scores for all tickers and market data for MAB
                 ticker_momentum_scores = []  # List of (ticker, momentum_score, reason)
@@ -260,6 +420,36 @@ class MomentumTradingService:
                     if not self.running:
                         break
 
+                    # Check active trade count before entering
+                    active_trades = await self.db_client.get_all_momentum_trades()
+                    active_count = len(active_trades)
+
+                    # If at max capacity, check if we can preempt
+                    if active_count >= self.max_active_trades:
+                        # Only preempt if momentum is exceptional
+                        if abs(momentum_score) >= self.exceptional_momentum_threshold:
+                            logger.info(
+                                f"At max capacity ({active_count}/{self.max_active_trades}), "
+                                f"attempting to preempt for exceptional trade {ticker} "
+                                f"(momentum: {momentum_score:.2f})"
+                            )
+                            preempted = await self._preempt_low_profit_trade(
+                                ticker, momentum_score
+                            )
+                            if not preempted:
+                                logger.info(
+                                    f"Could not preempt for {ticker}, skipping entry "
+                                    f"(momentum: {momentum_score:.2f})"
+                                )
+                                continue
+                        else:
+                            logger.info(
+                                f"At max capacity ({active_count}/{self.max_active_trades}), "
+                                f"skipping {ticker} (momentum: {momentum_score:.2f} < "
+                                f"exceptional threshold: {self.exceptional_momentum_threshold})"
+                            )
+                            continue
+
                     # Upward momentum -> long trade (buy_to_open)
                     action = "buy_to_open"
 
@@ -315,6 +505,36 @@ class MomentumTradingService:
                 ):
                     if not self.running:
                         break
+
+                    # Check active trade count before entering
+                    active_trades = await self.db_client.get_all_momentum_trades()
+                    active_count = len(active_trades)
+
+                    # If at max capacity, check if we can preempt
+                    if active_count >= self.max_active_trades:
+                        # Only preempt if momentum is exceptional (use absolute value for downward)
+                        if abs(momentum_score) >= self.exceptional_momentum_threshold:
+                            logger.info(
+                                f"At max capacity ({active_count}/{self.max_active_trades}), "
+                                f"attempting to preempt for exceptional trade {ticker} "
+                                f"(momentum: {momentum_score:.2f})"
+                            )
+                            preempted = await self._preempt_low_profit_trade(
+                                ticker, abs(momentum_score)
+                            )
+                            if not preempted:
+                                logger.info(
+                                    f"Could not preempt for {ticker}, skipping entry "
+                                    f"(momentum: {momentum_score:.2f})"
+                                )
+                                continue
+                        else:
+                            logger.info(
+                                f"At max capacity ({active_count}/{self.max_active_trades}), "
+                                f"skipping {ticker} (momentum: {momentum_score:.2f} < "
+                                f"exceptional threshold: {self.exceptional_momentum_threshold})"
+                            )
+                            continue
 
                     # Downward momentum -> short trade (sell_to_open)
                     action = "sell_to_open"
@@ -403,7 +623,13 @@ class MomentumTradingService:
                     await asyncio.sleep(5)
                     continue
 
-                logger.info(f"Monitoring {len(active_trades)} active momentum trades")
+                active_count = len(active_trades)
+                logger.info(
+                    f"Monitoring {active_count}/{self.max_active_trades} active momentum trades"
+                )
+                
+                # When at capacity, be more aggressive about exiting trades
+                at_capacity = active_count >= self.max_active_trades
 
                 for trade in active_trades:
                     if not self.running:
@@ -448,28 +674,38 @@ class MomentumTradingService:
                         )
                         continue
 
-                    # Step 2.2: Check if trade is profitable
-                    is_profitable = self._is_profitable(
+                    # Step 2.2: Calculate profit percentage
+                    profit_percent = self._calculate_profit_percent(
                         enter_price, current_price, original_action
                     )
-
+                    
+                    # Step 2.2.1: Check if trade is profitable
+                    is_profitable = profit_percent >= self.profit_threshold
+                    
+                    # When at capacity, also consider exiting low profitable trades
+                    # to make room for potentially better trades
+                    should_exit = is_profitable
+                    exit_reason = None
+                    
                     if is_profitable:
-                        logger.info(
-                            f"Profitable exit signal for {ticker} - {exit_action} "
-                            f"(enter: {enter_price}, current: {current_price})"
+                        exit_reason = f"Profit target reached: {profit_percent:.2f}% profit"
+                    elif at_capacity and profit_percent > 0:
+                        # At capacity and trade has some profit (but below threshold)
+                        # Exit to make room for potentially better trades
+                        should_exit = True
+                        exit_reason = (
+                            f"Exiting low profit trade ({profit_percent:.2f}%) "
+                            f"at capacity to make room for better opportunities"
                         )
 
-                        # Calculate profit for reason
-                        if original_action == "buy_to_open":
-                            profit_percent = (
-                                (current_price - enter_price) / enter_price
-                            ) * 100
-                        else:
-                            profit_percent = (
-                                (enter_price - current_price) / enter_price
-                            ) * 100
+                    if should_exit:
+                        logger.info(
+                            f"Exit signal for {ticker} - {exit_action} "
+                            f"(enter: {enter_price}, current: {current_price}, "
+                            f"profit: {profit_percent:.2f}%)"
+                        )
 
-                        reason = f"Profit target reached: {profit_percent:.2f}% profit"
+                        reason = exit_reason
 
                         # Step 2.3: Send webhook signal
                         webhook_response = await self.mcp_client.send_webhook_signal(
@@ -510,14 +746,6 @@ class MomentumTradingService:
                         logger.info(f"Exited momentum trade for {ticker}")
                     else:
                         # Not profitable yet, continue monitoring
-                        if original_action == "buy_to_open":
-                            profit_percent = (
-                                (current_price - enter_price) / enter_price
-                            ) * 100
-                        else:
-                            profit_percent = (
-                                (enter_price - current_price) / enter_price
-                            ) * 100
                         logger.debug(
                             f"{ticker} not yet profitable: {profit_percent:.2f}% "
                             f"(threshold: {self.profit_threshold}%)"
