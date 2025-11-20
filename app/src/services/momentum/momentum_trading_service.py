@@ -873,6 +873,29 @@ class MomentumTradingService:
                         logger.info(f"Exited momentum trade for {ticker}")
                     else:
                         # Not profitable yet, continue monitoring
+                        # Determine the reason why exit was skipped
+                        if profit_percent < 0:
+                            skipped_reason = (
+                                f"Trade is losing: {profit_percent:.2f}% "
+                                f"(below profit threshold: {cls.profit_threshold}%)"
+                            )
+                        elif profit_percent < cls.profit_threshold:
+                            skipped_reason = (
+                                f"Trade not yet profitable: {profit_percent:.2f}% "
+                                f"(below profit threshold: {cls.profit_threshold}%)"
+                            )
+                        else:
+                            # This case shouldn't normally happen, but handle it anyway
+                            skipped_reason = (
+                                f"Trade not meeting exit criteria: "
+                                f"{profit_percent:.2f}% profit"
+                            )
+
+                        # Update the trade with skipped exit reason and timestamp
+                        await DynamoDBClient.update_momentum_trade_skip_reason(
+                            ticker=ticker, skipped_exit_reason=skipped_reason
+                        )
+
                         logger.debug(
                             f"{ticker} not yet profitable: {profit_percent:.2f}% "
                             f"(threshold: {cls.profit_threshold}%)"

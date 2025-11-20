@@ -7,6 +7,7 @@ import json
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
 from datetime import datetime
+import pytz
 from app.src.common.loguru_logger import logger
 
 try:
@@ -81,10 +82,11 @@ class DynamoDBClient:
         # Check for numpy float types
         try:
             import numpy as np
+
             if isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
                 return True
             # Check if it's a numpy number that's a float
-            if hasattr(np, 'number') and isinstance(obj, np.number):
+            if hasattr(np, "number") and isinstance(obj, np.number):
                 if isinstance(obj, np.floating):
                     return True
         except (ImportError, AttributeError):
@@ -103,6 +105,7 @@ class DynamoDBClient:
         # Handle numpy integer types
         try:
             import numpy as np
+
             if isinstance(obj, (np.integer, np.int8, np.int16, np.int32, np.int64)):
                 return int(obj)
         except (ImportError, AttributeError):
@@ -116,7 +119,7 @@ class DynamoDBClient:
         if isinstance(obj, list):
             return [cls._convert_to_decimal(item) for item in obj]
         return obj
-    
+
     @classmethod
     def _ensure_all_floats_converted(cls, obj):
         """Recursively ensure all float values in a structure are converted to Decimal"""
@@ -261,6 +264,40 @@ class DynamoDBClient:
             logger.error(f"Error deleting momentum trade from DynamoDB: {str(e)}")
             return False
 
+    @classmethod
+    async def update_momentum_trade_skip_reason(
+        cls, ticker: str, skipped_exit_reason: str
+    ) -> bool:
+        """Update a momentum trade with skipped exit reason and updated_at timestamp in EST"""
+        try:
+            cls._ensure_tables()
+            # Get EST timezone
+            est_tz = pytz.timezone("US/Eastern")
+            # Get current time in EST
+            est_time = datetime.now(est_tz)
+            updated_at = est_time.isoformat()
+
+            update_expression = "SET skipped_exit_reason = :ser, updated_at = :ua"
+            expression_values = {
+                ":ser": skipped_exit_reason,
+                ":ua": updated_at,
+            }
+
+            cls._momentum_table.update_item(
+                Key={"ticker": ticker},
+                UpdateExpression=update_expression,
+                ExpressionAttributeValues=expression_values,
+            )
+            logger.debug(
+                f"Updated momentum trade skip reason for {ticker}: {skipped_exit_reason}"
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                f"Error updating momentum trade skip reason for {ticker}: {str(e)}"
+            )
+            return False
+
     # Methods for TickerBlackList table
 
     @classmethod
@@ -329,21 +366,33 @@ class DynamoDBClient:
 
             # Convert reward to float first (in case it's a numpy type), then to Decimal for calculation
             reward_float = float(reward)
-            
+
             # Calculate new statistics
             # Get current total_rewards as float (it might be Decimal from DB)
-            current_total_rewards = current_stats.get("total_rewards", 0.0) if current_stats else 0.0
+            current_total_rewards = (
+                current_stats.get("total_rewards", 0.0) if current_stats else 0.0
+            )
             if isinstance(current_total_rewards, Decimal):
                 current_total_rewards = float(current_total_rewards)
             total_rewards = current_total_rewards + reward_float
-            total_pulls = (current_stats.get("total_pulls", 0) if current_stats else 0) + 1
+            total_pulls = (
+                current_stats.get("total_pulls", 0) if current_stats else 0
+            ) + 1
 
             if reward_float > 0:
-                successful_trades = (current_stats.get("successful_trades", 0) if current_stats else 0) + 1
-                failed_trades = current_stats.get("failed_trades", 0) if current_stats else 0
+                successful_trades = (
+                    current_stats.get("successful_trades", 0) if current_stats else 0
+                ) + 1
+                failed_trades = (
+                    current_stats.get("failed_trades", 0) if current_stats else 0
+                )
             else:
-                successful_trades = current_stats.get("successful_trades", 0) if current_stats else 0
-                failed_trades = (current_stats.get("failed_trades", 0) if current_stats else 0) + 1
+                successful_trades = (
+                    current_stats.get("successful_trades", 0) if current_stats else 0
+                )
+                failed_trades = (
+                    current_stats.get("failed_trades", 0) if current_stats else 0
+                ) + 1
 
             if current_stats is None:
                 # Create new entry with calculated values
@@ -359,11 +408,13 @@ class DynamoDBClient:
                 }
                 if context:
                     context_converted = cls._convert_to_decimal(context)
-                    context_converted = cls._ensure_all_floats_converted(context_converted)
+                    context_converted = cls._ensure_all_floats_converted(
+                        context_converted
+                    )
                     item["last_context"] = context_converted
-                
+
                 item = cls._ensure_all_floats_converted(item)
-                
+
                 # Put the new item
                 cls._ensure_tables()
                 cls._mab_table.put_item(Item=item)
@@ -380,7 +431,9 @@ class DynamoDBClient:
 
                 if context:
                     context_converted = cls._convert_to_decimal(context)
-                    context_converted = cls._ensure_all_floats_converted(context_converted)
+                    context_converted = cls._ensure_all_floats_converted(
+                        context_converted
+                    )
                     update_expression += ", last_context = :lc"
                     expression_values[":lc"] = context_converted
 
@@ -533,18 +586,22 @@ class DynamoDBClient:
                 # Update existing item
                 # Convert existing item from Decimal to native types
                 existing_item = cls._convert_from_decimal(existing_item)
-                
+
                 # Get current values
                 completed_trades_list = existing_item.get("completed_trades", [])
                 overall_profit_loss = existing_item.get("overall_profit_loss", 0.0)
                 completed_trade_count = existing_item.get("completed_trade_count", 0)
-                overall_profit_loss_long = existing_item.get("overall_profit_loss_long", 0.0)
-                overall_profit_loss_short = existing_item.get("overall_profit_loss_short", 0.0)
+                overall_profit_loss_long = existing_item.get(
+                    "overall_profit_loss_long", 0.0
+                )
+                overall_profit_loss_short = existing_item.get(
+                    "overall_profit_loss_short", 0.0
+                )
 
                 # Add new trade to list
                 # Note: completed_trades_list items may need conversion, but we'll convert the whole list when writing
                 completed_trades_list.append(completed_trade)
-                
+
                 # Convert the entire list to ensure all values are properly formatted
                 completed_trades_list = cls._convert_to_decimal(completed_trades_list)
 
@@ -554,11 +611,15 @@ class DynamoDBClient:
 
                 # Update long/short profit based on action
                 if action.upper() == "BUY_TO_OPEN":
-                    new_overall_profit_loss_long = overall_profit_loss_long + float(profit_or_loss)
+                    new_overall_profit_loss_long = overall_profit_loss_long + float(
+                        profit_or_loss
+                    )
                     new_overall_profit_loss_short = overall_profit_loss_short
                 elif action.upper() == "SELL_TO_OPEN":
                     new_overall_profit_loss_long = overall_profit_loss_long
-                    new_overall_profit_loss_short = overall_profit_loss_short + float(profit_or_loss)
+                    new_overall_profit_loss_short = overall_profit_loss_short + float(
+                        profit_or_loss
+                    )
                 else:
                     # Unknown action, don't update long/short
                     new_overall_profit_loss_long = overall_profit_loss_long
@@ -588,8 +649,12 @@ class DynamoDBClient:
             else:
                 # Create new item
                 # Determine initial long/short profit
-                initial_profit_loss_long = float(profit_or_loss) if action.upper() == "BUY_TO_OPEN" else 0.0
-                initial_profit_loss_short = float(profit_or_loss) if action.upper() == "SELL_TO_OPEN" else 0.0
+                initial_profit_loss_long = (
+                    float(profit_or_loss) if action.upper() == "BUY_TO_OPEN" else 0.0
+                )
+                initial_profit_loss_short = (
+                    float(profit_or_loss) if action.upper() == "SELL_TO_OPEN" else 0.0
+                )
 
                 new_item = {
                     "date": date,
@@ -597,8 +662,12 @@ class DynamoDBClient:
                     "completed_trades": [completed_trade],
                     "overall_profit_loss": cls._convert_to_decimal(profit_or_loss),
                     "completed_trade_count": 1,
-                    "overall_profit_loss_long": cls._convert_to_decimal(initial_profit_loss_long),
-                    "overall_profit_loss_short": cls._convert_to_decimal(initial_profit_loss_short),
+                    "overall_profit_loss_long": cls._convert_to_decimal(
+                        initial_profit_loss_long
+                    ),
+                    "overall_profit_loss_short": cls._convert_to_decimal(
+                        initial_profit_loss_short
+                    ),
                 }
 
                 # Ensure all floats are converted
