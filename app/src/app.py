@@ -60,7 +60,7 @@ async def main():
         # Run all services concurrently
         await asyncio.gather(
             tool_discovery_service.discovery_job(),
-            trading_service.run(),
+            # trading_service.run(),
             momentum_trading_service.run()
         )
     except Exception as e:

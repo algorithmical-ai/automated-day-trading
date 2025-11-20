@@ -28,6 +28,8 @@ MOMENTUM_TRADING_TABLE_NAME = "ActiveTickersForAutomatedDayTrader"
 TICKER_BLACKLIST_TABLE_NAME = "TickerBlackList"
 # MAB table for tracking ticker profitability
 MAB_TABLE_NAME = "MABForDayTradingService"
+# Completed trades table
+COMPLETED_TRADES_TABLE_NAME = "CompletedTradesForAutomatedDayTrading"
 
 
 class DynamoDBClient:
@@ -50,6 +52,7 @@ class DynamoDBClient:
         self.momentum_table = self.dynamodb.Table(MOMENTUM_TRADING_TABLE_NAME)
         self.blacklist_table = self.dynamodb.Table(TICKER_BLACKLIST_TABLE_NAME)
         self.mab_table = self.dynamodb.Table(MAB_TABLE_NAME)
+        self.completed_trades_table = self.dynamodb.Table(COMPLETED_TRADES_TABLE_NAME)
 
     def _is_float_type(self, obj):
         """Check if object is a float type that needs conversion to Decimal"""
@@ -426,3 +429,145 @@ class DynamoDBClient:
         except Exception as e:
             logger.error(f"Error getting MAB stats for indicator {indicator}: {str(e)}")
             return []
+
+    # Methods for CompletedTradesForAutomatedDayTrading table
+
+    async def add_completed_trade(
+        self,
+        date: str,
+        indicator: str,
+        ticker: str,
+        action: str,
+        enter_price: float,
+        enter_reason: str,
+        enter_timestamp: str,
+        exit_price: float,
+        exit_timestamp: str,
+        exit_reason: str,
+        profit_or_loss: float,
+        technical_indicators_for_enter: Optional[Dict[str, Any]] = None,
+        technical_indicators_for_exit: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Add a completed trade to CompletedTradesForAutomatedDayTrading table
+        Updates overall statistics (profit/loss, counts, etc.)
+        """
+        try:
+            # Prepare the completed trade entry
+            completed_trade = {
+                "ticker": ticker,
+                "action": action.upper(),  # Ensure uppercase (BUY_TO_OPEN, SELL_TO_OPEN)
+                "enter_price": self._convert_to_decimal(enter_price),
+                "enter_reason": enter_reason,
+                "enter_timestamp": enter_timestamp,
+                "exit_price": self._convert_to_decimal(exit_price),
+                "exit_timestamp": exit_timestamp,
+                "exit_reason": exit_reason,
+                "profit_or_loss": self._convert_to_decimal(profit_or_loss),
+                "technical_indicators_for_enter": self._convert_to_decimal(
+                    technical_indicators_for_enter or {}
+                ),
+                "technical_indicators_for_exit": self._convert_to_decimal(
+                    technical_indicators_for_exit or {}
+                ),
+            }
+
+            # Ensure all floats are converted
+            completed_trade = self._ensure_all_floats_converted(completed_trade)
+
+            # Try to get existing item
+            try:
+                response = self.completed_trades_table.get_item(
+                    Key={"date": date, "indicator": indicator}
+                )
+                existing_item = response.get("Item")
+            except Exception as e:
+                logger.warning(
+                    f"Error getting existing completed trades item: {str(e)}"
+                )
+                existing_item = None
+
+            if existing_item:
+                # Update existing item
+                # Convert existing item from Decimal to native types
+                existing_item = self._convert_from_decimal(existing_item)
+                
+                # Get current values
+                completed_trades_list = existing_item.get("completed_trades", [])
+                overall_profit_loss = existing_item.get("overall_profit_loss", 0.0)
+                completed_trade_count = existing_item.get("completed_trade_count", 0)
+                overall_profit_loss_long = existing_item.get("overall_profit_loss_long", 0.0)
+                overall_profit_loss_short = existing_item.get("overall_profit_loss_short", 0.0)
+
+                # Add new trade to list
+                # Note: completed_trades_list items may need conversion, but we'll convert the whole list when writing
+                completed_trades_list.append(completed_trade)
+                
+                # Convert the entire list to ensure all values are properly formatted
+                completed_trades_list = self._convert_to_decimal(completed_trades_list)
+
+                # Update statistics
+                new_overall_profit_loss = overall_profit_loss + float(profit_or_loss)
+                new_completed_trade_count = completed_trade_count + 1
+
+                # Update long/short profit based on action
+                if action.upper() == "BUY_TO_OPEN":
+                    new_overall_profit_loss_long = overall_profit_loss_long + float(profit_or_loss)
+                    new_overall_profit_loss_short = overall_profit_loss_short
+                elif action.upper() == "SELL_TO_OPEN":
+                    new_overall_profit_loss_long = overall_profit_loss_long
+                    new_overall_profit_loss_short = overall_profit_loss_short + float(profit_or_loss)
+                else:
+                    # Unknown action, don't update long/short
+                    new_overall_profit_loss_long = overall_profit_loss_long
+                    new_overall_profit_loss_short = overall_profit_loss_short
+
+                # Update item
+                self.completed_trades_table.update_item(
+                    Key={"date": date, "indicator": indicator},
+                    UpdateExpression=(
+                        "SET completed_trades = :ct, "
+                        "overall_profit_loss = :opl, "
+                        "completed_trade_count = :ctc, "
+                        "overall_profit_loss_long = :opll, "
+                        "overall_profit_loss_short = :opls"
+                    ),
+                    ExpressionAttributeValues={
+                        ":ct": completed_trades_list,
+                        ":opl": self._convert_to_decimal(new_overall_profit_loss),
+                        ":ctc": new_completed_trade_count,
+                        ":opll": self._convert_to_decimal(new_overall_profit_loss_long),
+                        ":opls": self._convert_to_decimal(new_overall_profit_loss_short),
+                    },
+                )
+            else:
+                # Create new item
+                # Determine initial long/short profit
+                initial_profit_loss_long = float(profit_or_loss) if action.upper() == "BUY_TO_OPEN" else 0.0
+                initial_profit_loss_short = float(profit_or_loss) if action.upper() == "SELL_TO_OPEN" else 0.0
+
+                new_item = {
+                    "date": date,
+                    "indicator": indicator,
+                    "completed_trades": [completed_trade],
+                    "overall_profit_loss": self._convert_to_decimal(profit_or_loss),
+                    "completed_trade_count": 1,
+                    "overall_profit_loss_long": self._convert_to_decimal(initial_profit_loss_long),
+                    "overall_profit_loss_short": self._convert_to_decimal(initial_profit_loss_short),
+                }
+
+                # Ensure all floats are converted
+                new_item = self._ensure_all_floats_converted(new_item)
+
+                self.completed_trades_table.put_item(Item=new_item)
+
+            logger.info(
+                f"Added completed trade for {ticker} to CompletedTradesForAutomatedDayTrading "
+                f"(date: {date}, indicator: {indicator}, profit/loss: {profit_or_loss:.2f})"
+            )
+            return True
+        except Exception as e:
+            logger.exception(
+                f"Error adding completed trade for {ticker} to CompletedTradesForAutomatedDayTrading: {str(e)}"
+            )
+            return False

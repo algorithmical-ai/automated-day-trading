@@ -171,7 +171,7 @@ class MomentumTradingService:
         Returns True if preemption was successful, False otherwise
         """
         active_trades = await self.db_client.get_all_momentum_trades()
-        
+
         if len(active_trades) < self.max_active_trades:
             return False  # No need to preempt
 
@@ -206,7 +206,9 @@ class MomentumTradingService:
         # Get current price for exit
         market_data_response = await self.mcp_client.get_market_data(ticker_to_exit)
         if not market_data_response:
-            logger.warning(f"Failed to get market data for {ticker_to_exit} for preemption")
+            logger.warning(
+                f"Failed to get market data for {ticker_to_exit} for preemption"
+            )
             return False
 
         technical_analysis = market_data_response.get("technical_analysis", {})
@@ -226,7 +228,9 @@ class MomentumTradingService:
         )
 
         if webhook_response:
-            logger.info(f"Webhook signal sent for preempted {ticker_to_exit} - {exit_action}")
+            logger.info(
+                f"Webhook signal sent for preempted {ticker_to_exit} - {exit_action}"
+            )
         else:
             logger.warning(f"Failed to send webhook signal for {ticker_to_exit}")
 
@@ -249,6 +253,53 @@ class MomentumTradingService:
             exit_price=exit_price,
             action=original_action,
             context=context,
+        )
+
+        # Get trade data before deletion for completed trades record
+        enter_reason = lowest_trade.get("enter_reason", "")
+        enter_timestamp = lowest_trade.get("created_at", datetime.utcnow().isoformat())
+        technical_indicators_for_enter = lowest_trade.get(
+            "technical_indicators_for_enter"
+        )
+
+        # Calculate profit_or_loss in dollars (assuming 1 share for calculation)
+        if original_action == "buy_to_open":
+            profit_or_loss = exit_price - enter_price
+        elif original_action == "sell_to_open":
+            profit_or_loss = enter_price - exit_price
+        else:
+            profit_or_loss = 0.0
+
+        # Get technical indicators for exit
+        technical_indicators_for_exit = technical_analysis.copy()
+        # Remove datetime_price if present (not needed for exit indicators)
+        if "datetime_price" in technical_indicators_for_exit:
+            technical_indicators_for_exit = {
+                k: v
+                for k, v in technical_indicators_for_exit.items()
+                if k != "datetime_price"
+            }
+
+        # Get current date for partition key
+        current_date = date.today().isoformat()
+        exit_timestamp = datetime.utcnow().isoformat()
+        exit_reason = reason
+
+        # Add completed trade to CompletedTradesForAutomatedDayTrading
+        await self.db_client.add_completed_trade(
+            date=current_date,
+            indicator=indicator,
+            ticker=ticker_to_exit,
+            action=original_action,
+            enter_price=enter_price,
+            enter_reason=enter_reason,
+            enter_timestamp=enter_timestamp,
+            exit_price=exit_price,
+            exit_timestamp=exit_timestamp,
+            exit_reason=exit_reason,
+            profit_or_loss=profit_or_loss,
+            technical_indicators_for_enter=technical_indicators_for_enter,
+            technical_indicators_for_exit=technical_indicators_for_exit,
         )
 
         # Delete from DynamoDB
@@ -329,7 +380,7 @@ class MomentumTradingService:
                     for trade in active_trades
                     if trade.get("ticker")
                 }
-                
+
                 logger.info(
                     f"Current active trades: {active_count}/{self.max_active_trades}"
                 )
@@ -627,7 +678,7 @@ class MomentumTradingService:
                 logger.info(
                     f"Monitoring {active_count}/{self.max_active_trades} active momentum trades"
                 )
-                
+
                 # When at capacity, be more aggressive about exiting trades
                 at_capacity = active_count >= self.max_active_trades
 
@@ -678,17 +729,19 @@ class MomentumTradingService:
                     profit_percent = self._calculate_profit_percent(
                         enter_price, current_price, original_action
                     )
-                    
+
                     # Step 2.2.1: Check if trade is profitable
                     is_profitable = profit_percent >= self.profit_threshold
-                    
+
                     # When at capacity, also consider exiting low profitable trades
                     # to make room for potentially better trades
                     should_exit = is_profitable
                     exit_reason = None
-                    
+
                     if is_profitable:
-                        exit_reason = f"Profit target reached: {profit_percent:.2f}% profit"
+                        exit_reason = (
+                            f"Profit target reached: {profit_percent:.2f}% profit"
+                        )
                     elif at_capacity and profit_percent > 0:
                         # At capacity and trade has some profit (but below threshold)
                         # Exit to make room for potentially better trades
@@ -739,6 +792,56 @@ class MomentumTradingService:
                             exit_price=current_price,
                             action=original_action,
                             context=context,
+                        )
+
+                        # Step 2.4.1: Get trade data before deletion for completed trades record
+                        enter_reason = trade.get("enter_reason", "")
+                        enter_timestamp = trade.get(
+                            "created_at", datetime.utcnow().isoformat()
+                        )
+                        technical_indicators_for_enter = trade.get(
+                            "technical_indicators_for_enter"
+                        )
+
+                        # Calculate profit_or_loss in dollars (assuming 1 share for calculation)
+                        # For long: profit = exit_price - enter_price
+                        # For short: profit = enter_price - exit_price
+                        if original_action == "buy_to_open":
+                            profit_or_loss = current_price - enter_price
+                        elif original_action == "sell_to_open":
+                            profit_or_loss = enter_price - current_price
+                        else:
+                            profit_or_loss = 0.0
+
+                        # Get technical indicators for exit
+                        technical_indicators_for_exit = technical_analysis.copy()
+                        # Remove datetime_price if present (not needed for exit indicators)
+                        if "datetime_price" in technical_indicators_for_exit:
+                            technical_indicators_for_exit = {
+                                k: v
+                                for k, v in technical_indicators_for_exit.items()
+                                if k != "datetime_price"
+                            }
+
+                        # Get current date for partition key
+                        current_date = date.today().isoformat()
+                        exit_timestamp = datetime.utcnow().isoformat()
+
+                        # Step 2.4.2: Add completed trade to CompletedTradesForAutomatedDayTrading
+                        await self.db_client.add_completed_trade(
+                            date=current_date,
+                            indicator=indicator,
+                            ticker=ticker,
+                            action=original_action,
+                            enter_price=enter_price,
+                            enter_reason=enter_reason,
+                            enter_timestamp=enter_timestamp,
+                            exit_price=current_price,
+                            exit_timestamp=exit_timestamp,
+                            exit_reason=exit_reason,
+                            profit_or_loss=profit_or_loss,
+                            technical_indicators_for_enter=technical_indicators_for_enter,
+                            technical_indicators_for_exit=technical_indicators_for_exit,
                         )
 
                         # Step 2.5: Delete from DynamoDB
