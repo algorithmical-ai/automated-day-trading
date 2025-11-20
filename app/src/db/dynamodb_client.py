@@ -7,7 +7,7 @@ import json
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
 from datetime import datetime
-from loguru_logger import logger
+from common.loguru_logger import logger
 
 try:
     import numpy as np
@@ -15,7 +15,7 @@ try:
     FLOAT_TYPES = (float, np.floating)
 except Exception:  # numpy might not be available
     FLOAT_TYPES = (float,)
-from constants import (
+from config.constants import (
     DYNAMODB_TABLE_NAME,
     AWS_ACCESS_KEY_ID,
     AWS_SECRET_ACCESS_KEY,
@@ -522,6 +522,15 @@ class DynamoDBClient:
                     new_overall_profit_loss_long = overall_profit_loss_long
                     new_overall_profit_loss_short = overall_profit_loss_short
 
+                expression_values = {
+                    ":ct": completed_trades_list,
+                    ":opl": self._convert_to_decimal(new_overall_profit_loss),
+                    ":ctc": new_completed_trade_count,
+                    ":opll": self._convert_to_decimal(new_overall_profit_loss_long),
+                    ":opls": self._convert_to_decimal(new_overall_profit_loss_short),
+                }
+                expression_values = self._ensure_all_floats_converted(expression_values)
+
                 # Update item
                 self.completed_trades_table.update_item(
                     Key={"date": date, "indicator": indicator},
@@ -532,13 +541,7 @@ class DynamoDBClient:
                         "overall_profit_loss_long = :opll, "
                         "overall_profit_loss_short = :opls"
                     ),
-                    ExpressionAttributeValues={
-                        ":ct": completed_trades_list,
-                        ":opl": self._convert_to_decimal(new_overall_profit_loss),
-                        ":ctc": new_completed_trade_count,
-                        ":opll": self._convert_to_decimal(new_overall_profit_loss_long),
-                        ":opls": self._convert_to_decimal(new_overall_profit_loss_short),
-                    },
+                    ExpressionAttributeValues=expression_values,
                 )
             else:
                 # Create new item

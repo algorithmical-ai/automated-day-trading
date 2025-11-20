@@ -6,8 +6,8 @@ Uses Thompson Sampling for contextual bandits to balance exploration and exploit
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime
-from loguru_logger import logger
-from dynamodb_client import DynamoDBClient
+from common.loguru_logger import logger
+from db.dynamodb_client import DynamoDBClient
 
 
 class MABService:

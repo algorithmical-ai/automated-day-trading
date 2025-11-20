@@ -8,14 +8,14 @@ import asyncio
 import time
 import aiohttp
 from typing import Optional, Dict, Any
-from loguru_logger import logger
-from constants import (
+from common.loguru_logger import logger
+from config.constants import (
     DEBUG_DAY_TRADING,
     MARKET_DATA_MCP_URL,
     MCP_AUTH_HEADER_NAME,
     MARKET_DATA_MCP_TOKEN,
 )
-from tool_discovery import ToolDiscoveryService
+from services.tool_discovery.tool_discovery import ToolDiscoveryService
 
 
 class MCPClient:

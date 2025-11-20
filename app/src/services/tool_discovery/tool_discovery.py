@@ -4,8 +4,8 @@ Tool Discovery Service for automatically discovering available MCP tools
 
 import asyncio
 from typing import Dict, Any, Optional, Set
-from loguru_logger import logger
-from constants import MARKET_DATA_MCP_URL, MCP_AUTH_HEADER_NAME, MARKET_DATA_MCP_TOKEN
+from common.loguru_logger import logger
+from config.constants import MARKET_DATA_MCP_URL, MCP_AUTH_HEADER_NAME, MARKET_DATA_MCP_TOKEN
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import Implementation

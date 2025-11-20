@@ -5,10 +5,10 @@ Momentum Trading Service with entry and exit logic based on price momentum
 import asyncio
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, date, timezone
-from loguru_logger import logger
-from mcp_client import MCPClient
-from dynamodb_client import DynamoDBClient
-from tool_discovery import ToolDiscoveryService
+from common.loguru_logger import logger
+from services.mcp.mcp_client import MCPClient
+from db.dynamodb_client import DynamoDBClient
+from services.tool_discovery.tool_discovery import ToolDiscoveryService
 from mab_service import MABService
 
 
