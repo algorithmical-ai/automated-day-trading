@@ -4,7 +4,7 @@ Momentum Trading Service with entry and exit logic based on price momentum
 
 import asyncio
 from typing import Optional, List, Tuple, Dict, Any
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from loguru_logger import logger
 from mcp_client import MCPClient
 from dynamodb_client import DynamoDBClient
@@ -245,7 +245,7 @@ class MomentumTradingService:
             "action": original_action,
             "indicator": indicator,
             "preempted": True,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await self.mab_service.record_trade_outcome(
             ticker=ticker_to_exit,
@@ -257,7 +257,9 @@ class MomentumTradingService:
 
         # Get trade data before deletion for completed trades record
         enter_reason = lowest_trade.get("enter_reason", "")
-        enter_timestamp = lowest_trade.get("created_at", datetime.utcnow().isoformat())
+        enter_timestamp = lowest_trade.get(
+            "created_at", datetime.now(timezone.utc).isoformat()
+        )
         technical_indicators_for_enter = lowest_trade.get(
             "technical_indicators_for_enter"
         )
@@ -282,7 +284,7 @@ class MomentumTradingService:
 
         # Get current date for partition key
         current_date = date.today().isoformat()
-        exit_timestamp = datetime.utcnow().isoformat()
+        exit_timestamp = datetime.now(timezone.utc).isoformat()
         exit_reason = reason
 
         # Add completed trade to CompletedTradesForAutomatedDayTrading
@@ -784,7 +786,7 @@ class MomentumTradingService:
                             "exit_price": current_price,
                             "action": original_action,
                             "indicator": indicator,
-                            "timestamp": datetime.utcnow().isoformat(),
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
                         await self.mab_service.record_trade_outcome(
                             ticker=ticker,
@@ -797,7 +799,7 @@ class MomentumTradingService:
                         # Step 2.4.1: Get trade data before deletion for completed trades record
                         enter_reason = trade.get("enter_reason", "")
                         enter_timestamp = trade.get(
-                            "created_at", datetime.utcnow().isoformat()
+                            "created_at", datetime.now(timezone.utc).isoformat()
                         )
                         technical_indicators_for_enter = trade.get(
                             "technical_indicators_for_enter"
@@ -825,7 +827,7 @@ class MomentumTradingService:
 
                         # Get current date for partition key
                         current_date = date.today().isoformat()
-                        exit_timestamp = datetime.utcnow().isoformat()
+                        exit_timestamp = datetime.now(timezone.utc).isoformat()
 
                         # Step 2.4.2: Add completed trade to CompletedTradesForAutomatedDayTrading
                         await self.db_client.add_completed_trade(
