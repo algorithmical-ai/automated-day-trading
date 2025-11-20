@@ -713,6 +713,9 @@ class MomentumTradingService:
                     original_action = trade.get("action")
                     enter_price = trade.get("enter_price")
                     indicator = trade.get("indicator", "Momentum Trading")
+                    # Get trailing stop and peak profit from trade (defaults if not present)
+                    trailing_stop = float(trade.get("trailing_stop", 0.5))
+                    peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
 
                     if not ticker or enter_price is None or enter_price <= 0:
                         logger.warning(f"Invalid momentum trade data: {trade}")
@@ -753,25 +756,82 @@ class MomentumTradingService:
                         enter_price, current_price, original_action
                     )
 
-                    # Step 2.2.1: Check if trade is profitable
-                    is_profitable = profit_percent >= cls.profit_threshold
-
-                    # When at capacity, also consider exiting low profitable trades
-                    # to make room for potentially better trades
-                    should_exit = is_profitable
+                    # Step 2.2.1: Trailing stop loss logic
+                    should_exit = False
                     exit_reason = None
 
-                    if is_profitable:
-                        exit_reason = (
-                            f"Profit target reached: {profit_percent:.2f}% profit"
-                        )
-                    elif at_capacity and profit_percent > 0:
-                        # At capacity and trade has some profit (but below threshold)
-                        # Exit to make room for potentially better trades
+                    # Check 1: Exit if losing more than 0.5% from enter_price
+                    if profit_percent < -0.5:
                         should_exit = True
                         exit_reason = (
-                            f"Exiting low profit trade ({profit_percent:.2f}%) "
-                            f"at capacity to make room for better opportunities"
+                            f"Trailing stop loss triggered: {profit_percent:.2f}% "
+                            f"(below -0.5% stop loss threshold)"
+                        )
+                        logger.info(
+                            f"Exit signal for {ticker} - losing trade: {profit_percent:.2f}%"
+                        )
+
+                    # Check 2: Exit if profit drops by 0.5% from peak (trailing stop)
+                    elif peak_profit_percent > 0:
+                        drop_from_peak = peak_profit_percent - profit_percent
+                        if drop_from_peak >= 0.5:
+                            should_exit = True
+                            exit_reason = (
+                                f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
+                                f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%)"
+                            )
+                            logger.info(
+                                f"Exit signal for {ticker} - trailing stop: "
+                                f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%"
+                            )
+
+                    # Check 3: Original profit target logic (if not already exiting)
+                    if not should_exit:
+                        is_profitable = profit_percent >= cls.profit_threshold
+                        if is_profitable:
+                            should_exit = True
+                            exit_reason = (
+                                f"Profit target reached: {profit_percent:.2f}% profit"
+                            )
+                        elif at_capacity and profit_percent > 0:
+                            # At capacity and trade has some profit (but below threshold)
+                            # Exit to make room for potentially better trades
+                            should_exit = True
+                            exit_reason = (
+                                f"Exiting low profit trade ({profit_percent:.2f}%) "
+                                f"at capacity to make room for better opportunities"
+                            )
+
+                    # Update peak profit and trailing stop if trade is still active
+                    if not should_exit:
+                        # Update peak profit if current profit is higher
+                        if profit_percent > peak_profit_percent:
+                            peak_profit_percent = profit_percent
+                            trailing_stop = 0.5  # Always maintain 0.5% trailing stop
+
+                        # Update database with current trailing stop and peak profit
+                        skipped_reason = None
+                        if profit_percent < 0:
+                            skipped_reason = (
+                                f"Trade is losing: {profit_percent:.2f}% "
+                                f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
+                            )
+                        elif profit_percent < cls.profit_threshold:
+                            skipped_reason = (
+                                f"Trade not yet profitable: {profit_percent:.2f}% "
+                                f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
+                            )
+                        else:
+                            skipped_reason = (
+                                f"Trade profitable: {profit_percent:.2f}% "
+                                f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
+                            )
+
+                        await DynamoDBClient.update_momentum_trade_trailing_stop(
+                            ticker=ticker,
+                            trailing_stop=trailing_stop,
+                            peak_profit_percent=peak_profit_percent,
+                            skipped_exit_reason=skipped_reason,
                         )
 
                     if should_exit:
@@ -871,35 +931,6 @@ class MomentumTradingService:
                         # Step 2.5: Delete from DynamoDB
                         await DynamoDBClient.delete_momentum_trade(ticker)
                         logger.info(f"Exited momentum trade for {ticker}")
-                    else:
-                        # Not profitable yet, continue monitoring
-                        # Determine the reason why exit was skipped
-                        if profit_percent < 0:
-                            skipped_reason = (
-                                f"Trade is losing: {profit_percent:.2f}% "
-                                f"(below profit threshold: {cls.profit_threshold}%)"
-                            )
-                        elif profit_percent < cls.profit_threshold:
-                            skipped_reason = (
-                                f"Trade not yet profitable: {profit_percent:.2f}% "
-                                f"(below profit threshold: {cls.profit_threshold}%)"
-                            )
-                        else:
-                            # This case shouldn't normally happen, but handle it anyway
-                            skipped_reason = (
-                                f"Trade not meeting exit criteria: "
-                                f"{profit_percent:.2f}% profit"
-                            )
-
-                        # Update the trade with skipped exit reason and timestamp
-                        await DynamoDBClient.update_momentum_trade_skip_reason(
-                            ticker=ticker, skipped_exit_reason=skipped_reason
-                        )
-
-                        logger.debug(
-                            f"{ticker} not yet profitable: {profit_percent:.2f}% "
-                            f"(threshold: {cls.profit_threshold}%)"
-                        )
 
                 # Wait 5 seconds before next cycle
                 await asyncio.sleep(5)

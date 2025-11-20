@@ -227,6 +227,8 @@ class DynamoDBClient:
                 "indicator": indicator,
                 "enter_price": cls._convert_to_decimal(enter_price),
                 "enter_reason": enter_reason,
+                "trailing_stop": cls._convert_to_decimal(0.5),  # Initialize to 0.5%
+                "peak_profit_percent": cls._convert_to_decimal(0.0),  # Initialize to 0%
                 "created_at": datetime.utcnow().isoformat(),
             }
             cls._momentum_table.put_item(Item=item)
@@ -295,6 +297,51 @@ class DynamoDBClient:
         except Exception as e:
             logger.error(
                 f"Error updating momentum trade skip reason for {ticker}: {str(e)}"
+            )
+            return False
+
+    @classmethod
+    async def update_momentum_trade_trailing_stop(
+        cls,
+        ticker: str,
+        trailing_stop: float,
+        peak_profit_percent: float,
+        skipped_exit_reason: Optional[str] = None,
+    ) -> bool:
+        """Update a momentum trade with trailing stop, peak profit, and optionally skipped exit reason"""
+        try:
+            cls._ensure_tables()
+            # Get EST timezone
+            est_tz = pytz.timezone("US/Eastern")
+            # Get current time in EST
+            est_time = datetime.now(est_tz)
+            updated_at = est_time.isoformat()
+
+            update_expression = (
+                "SET trailing_stop = :ts, peak_profit_percent = :ppp, updated_at = :ua"
+            )
+            expression_values = {
+                ":ts": cls._convert_to_decimal(trailing_stop),
+                ":ppp": cls._convert_to_decimal(peak_profit_percent),
+                ":ua": updated_at,
+            }
+
+            if skipped_exit_reason:
+                update_expression += ", skipped_exit_reason = :ser"
+                expression_values[":ser"] = skipped_exit_reason
+
+            cls._momentum_table.update_item(
+                Key={"ticker": ticker},
+                UpdateExpression=update_expression,
+                ExpressionAttributeValues=expression_values,
+            )
+            logger.debug(
+                f"Updated trailing stop for {ticker}: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%"
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                f"Error updating trailing stop for {ticker}: {str(e)}"
             )
             return False
 
