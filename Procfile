@@ -1,2 +1,2 @@
-worker: PYTHONPATH=. python app/src/app.py
+worker: python -m app.src.app
 
