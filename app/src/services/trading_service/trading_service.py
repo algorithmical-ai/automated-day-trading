@@ -5,42 +5,50 @@ Trading Service with entry and exit logic
 import asyncio
 from typing import Dict, Any, Optional
 from datetime import datetime, date
-from common.loguru_logger import logger
-from services.mcp.mcp_client import MCPClient
-from db.dynamodb_client import DynamoDBClient
-from services.tool_discovery.tool_discovery import ToolDiscoveryService
-from mab_service import MABService
-
+from app.src.common.loguru_logger import logger
+from app.src.services.mcp.mcp_client import MCPClient
+from app.src.db.dynamodb_client import DynamoDBClient
+from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
+from app.src.config.constants import (
+    MCP_SERVER_TRANSPORT,
+    MCP_TOOL_DISCOVERY_INTERVAL_SECONDS,
+)
+from app.src.services.mab.mab_service import MABService
+from app.src.services.mcp.server import market_client
 
 class TradingService:
     """Main trading service with entry and exit logic"""
 
-    def __init__(self, tool_discovery: Optional[ToolDiscoveryService] = None):
-        self.tool_discovery = tool_discovery
-        self.mcp_client = MCPClient(tool_discovery=tool_discovery)
-        self.db_client = DynamoDBClient()
-        self.running = True
-        # Initialize MAB services for different indicators
-        self.mab_service_automated_trading = MABService(
-            self.db_client, indicator="Automated Trading"
-        )
-        self.mab_service_automated_workflow = MABService(
-            self.db_client, indicator="Automated workflow"
-        )
-        # Track if we've reset MAB stats today
-        self.mab_reset_date = None
+    running: bool = True
+    mab_reset_date: Optional[str] = None
+    INDICATOR_AUTOMATED_TRADING = "Automated Trading"
+    INDICATOR_AUTOMATED_WORKFLOW = "Automated workflow"
+    tool_discovery_cls: Optional[type] = ToolDiscoveryService
 
-    def stop(self):
+    @classmethod
+    def configure(cls, tool_discovery_cls: Optional[type] = ToolDiscoveryService):
+        """Configure dependencies for class-based usage"""
+        if tool_discovery_cls is not None:
+            cls.tool_discovery_cls = tool_discovery_cls
+        MCPClient.configure(tool_discovery_cls=tool_discovery_cls)
+        DynamoDBClient.configure()
+        MABService.configure()
+        cls.running = True
+        cls.mab_reset_date = None
+    
+    @classmethod
+    def stop(cls):
         """Stop the trading service"""
-        self.running = False
+        cls.running = False
 
-    async def entry_service(self):
+    @classmethod
+    async def entry_service(cls):
         """Entry service that runs every 10 seconds"""
         logger.info("Entry service started")
-        while self.running:
+        while cls.running:
             try:
                 # Step 1a: Get market clock
-                clock_response = await self.mcp_client.get_market_clock()
+                clock_response = await MCPClient.get_market_clock()
                 if not clock_response:
                     logger.warning("Failed to get market clock, skipping this cycle")
                     await asyncio.sleep(10)
@@ -59,14 +67,14 @@ class TradingService:
 
                 # Step 1b.1: Reset MAB daily stats if needed (at market open)
                 today = date.today().isoformat()
-                if self.mab_reset_date != today:
+                if cls.mab_reset_date != today:
                     logger.info("Resetting daily MAB statistics for new trading day")
-                    await self.mab_service_automated_trading.reset_daily_stats()
-                    await self.mab_service_automated_workflow.reset_daily_stats()
-                    self.mab_reset_date = today
+                    await MABService.reset_daily_stats(cls.INDICATOR_AUTOMATED_TRADING)
+                    await MABService.reset_daily_stats(cls.INDICATOR_AUTOMATED_WORKFLOW)
+                    cls.mab_reset_date = today
 
                 # Step 1c: Get screened tickers
-                tickers_response = await self.mcp_client.get_alpaca_screened_tickers()
+                tickers_response = await MCPClient.get_alpaca_screened_tickers()
                 if not tickers_response:
                     logger.warning(
                         "Failed to get screened tickers, skipping this cycle"
@@ -79,7 +87,7 @@ class TradingService:
                 most_actives = tickers_response.get("most_actives", [])
 
                 # Step 1d: Get blacklisted tickers and filter them out
-                blacklisted_tickers = await self.db_client.get_blacklisted_tickers()
+                blacklisted_tickers = await DynamoDBClient.get_blacklisted_tickers()
                 blacklisted_set = set(blacklisted_tickers)
 
                 # Step 1e: Process gainers and most_actives with buy_to_open
@@ -99,11 +107,11 @@ class TradingService:
                     logger.info(f"Processing {len(buy_tickers)} buy candidates")
 
                 for ticker in buy_tickers:
-                    if not self.running:
+                    if not cls.running:
                         break
 
                     # Double-check ticker is not blacklisted before processing
-                    if await self.db_client.is_ticker_blacklisted(ticker):
+                    if await DynamoDBClient.is_ticker_blacklisted(ticker):
                         logger.debug(f"Ticker {ticker} is blacklisted, skipping")
                         continue
 
@@ -112,7 +120,7 @@ class TradingService:
                     enter_response = None
                     max_retries = 2  # Reduced to 2 since API is slow (5-10s per call)
                     for attempt in range(max_retries):
-                        enter_response = await self.mcp_client.enter(ticker, "buy_to_open")
+                        enter_response = await MCPClient.enter(ticker, "buy_to_open")
                         if enter_response:
                             break
                         # If we get None (likely 503 error), wait and retry
@@ -141,7 +149,7 @@ class TradingService:
                         reason = enter_response.get("reason", "")
 
                         # Get quote to extract enter_price (ask price for buy_to_open)
-                        quote_response = await self.mcp_client.get_quote(ticker)
+                        quote_response = await MCPClient.get_quote(ticker)
                         enter_price = 0.0
 
                         if quote_response:
@@ -159,7 +167,7 @@ class TradingService:
 
                         # Step 1e.1: Check MAB before entering trade
                         # Get market data for MAB context
-                        market_data_response = await self.mcp_client.get_market_data(ticker)
+                        market_data_response = await MCPClient.get_market_data(ticker)
                         momentum_score = 0.0  # Default momentum for non-momentum trading
                         if market_data_response:
                             technical_analysis = market_data_response.get(
@@ -182,7 +190,8 @@ class TradingService:
                                     )
 
                         should_trade, mab_score, mab_reason = (
-                            await self.mab_service_automated_trading.should_trade_ticker(
+                            await MABService.should_trade_ticker(
+                                indicator=cls.INDICATOR_AUTOMATED_TRADING,
                                 ticker=ticker,
                                 momentum_score=momentum_score,
                                 market_data=market_data_response,
@@ -202,7 +211,7 @@ class TradingService:
                         )
 
                         # Step 1f: Send webhook signal
-                        webhook_response = await self.mcp_client.send_webhook_signal(
+                        webhook_response = await MCPClient.send_webhook_signal(
                             ticker=ticker,
                             action="buy_to_open",
                             indicator="Automated Trading",
@@ -219,7 +228,7 @@ class TradingService:
                             )
 
                         # Step 1g: Add to DynamoDB
-                        await self.db_client.add_trade(
+                        await DynamoDBClient.add_trade(
                             ticker=ticker,
                             action="buy_to_open",
                             indicator="Automated Trading",
@@ -245,11 +254,11 @@ class TradingService:
                     logger.info(f"Processing {len(sell_tickers)} sell candidates")
 
                 for ticker in sell_tickers:
-                    if not self.running:
+                    if not cls.running:
                         break
 
                     # Double-check ticker is not blacklisted before processing
-                    if await self.db_client.is_ticker_blacklisted(ticker):
+                    if await DynamoDBClient.is_ticker_blacklisted(ticker):
                         logger.debug(f"Ticker {ticker} is blacklisted, skipping")
                         continue
 
@@ -258,7 +267,7 @@ class TradingService:
                     enter_response = None
                     max_retries = 2  # Reduced to 2 since API is slow (5-10s per call)
                     for attempt in range(max_retries):
-                        enter_response = await self.mcp_client.enter(ticker, "sell_to_open")
+                        enter_response = await MCPClient.enter(ticker, "sell_to_open")
                         if enter_response:
                             break
                         # If we get None (likely 503 error), wait and retry
@@ -287,7 +296,7 @@ class TradingService:
                         reason = enter_response.get("reason", "")
 
                         # Get quote to extract enter_price (bid price for sell_to_open)
-                        quote_response = await self.mcp_client.get_quote(ticker)
+                        quote_response = await MCPClient.get_quote(ticker)
                         enter_price = 0.0
 
                         if quote_response:
@@ -305,7 +314,7 @@ class TradingService:
 
                         # Step 1h.1: Check MAB before entering trade
                         # Get market data for MAB context
-                        market_data_response = await self.mcp_client.get_market_data(ticker)
+                        market_data_response = await MCPClient.get_market_data(ticker)
                         momentum_score = 0.0  # Default momentum for non-momentum trading
                         if market_data_response:
                             technical_analysis = market_data_response.get(
@@ -328,7 +337,8 @@ class TradingService:
                                     )
 
                         should_trade, mab_score, mab_reason = (
-                            await self.mab_service_automated_workflow.should_trade_ticker(
+                            await MABService.should_trade_ticker(
+                                indicator=cls.INDICATOR_AUTOMATED_WORKFLOW,
                                 ticker=ticker,
                                 momentum_score=momentum_score,
                                 market_data=market_data_response,
@@ -348,7 +358,7 @@ class TradingService:
                         )
 
                         # Step 1i: Send webhook signal
-                        webhook_response = await self.mcp_client.send_webhook_signal(
+                        webhook_response = await MCPClient.send_webhook_signal(
                             ticker=ticker,
                             action="sell_to_open",
                             indicator="Automated workflow",
@@ -365,7 +375,7 @@ class TradingService:
                             )
 
                         # Step 1j: Add to DynamoDB
-                        await self.db_client.add_trade(
+                        await DynamoDBClient.add_trade(
                             ticker=ticker,
                             action="sell_to_open",
                             indicator="Automated workflow",
@@ -381,13 +391,14 @@ class TradingService:
                 logger.exception(f"Error in entry service: {str(e)}")
                 await asyncio.sleep(10)
 
-    async def exit_service(self):
+    @classmethod
+    async def exit_service(cls):
         """Exit service that runs every 5 seconds"""
         logger.info("Exit service started")
-        while self.running:
+        while cls.running:
             try:
                 # Step 2: Get all active trades from DynamoDB
-                active_trades = await self.db_client.get_all_active_trades()
+                active_trades = await DynamoDBClient.get_all_active_trades()
 
                 if not active_trades:
                     logger.debug("No active trades to monitor")
@@ -397,7 +408,7 @@ class TradingService:
                 logger.info(f"Monitoring {len(active_trades)} active trades")
 
                 for trade in active_trades:
-                    if not self.running:
+                    if not cls.running:
                         break
 
                     ticker = trade.get("ticker")
@@ -409,7 +420,7 @@ class TradingService:
                         continue
 
                     # Skip blacklisted tickers - don't call exit() for them
-                    if await self.db_client.is_ticker_blacklisted(ticker):
+                    if await DynamoDBClient.is_ticker_blacklisted(ticker):
                         logger.debug(
                             f"Ticker {ticker} is blacklisted, skipping exit check"
                         )
@@ -431,7 +442,7 @@ class TradingService:
                     exit_response = None
                     max_retries = 2  # Reduced to 2 since API is slow (5-10s per call)
                     for attempt in range(max_retries):
-                        exit_response = await self.mcp_client.exit(
+                        exit_response = await MCPClient.exit(
                             ticker=ticker, enter_price=enter_price, action=exit_action
                         )
                         if exit_response:
@@ -463,7 +474,7 @@ class TradingService:
 
                         # Step 2.1.1: Get current price for profit/loss calculation
                         # Get market data to extract exit price
-                        market_data_response = await self.mcp_client.get_market_data(ticker)
+                        market_data_response = await MCPClient.get_market_data(ticker)
                         exit_price = enter_price  # Default to enter_price if we can't get current price
                         
                         if market_data_response:
@@ -475,7 +486,7 @@ class TradingService:
                                 exit_price = current_price
                             else:
                                 # Fallback: try to get quote
-                                quote_response = await self.mcp_client.get_quote(ticker)
+                                quote_response = await MCPClient.get_quote(ticker)
                                 if quote_response:
                                     quote_data = quote_response.get("quote", {})
                                     quotes = quote_data.get("quotes", {})
@@ -486,7 +497,7 @@ class TradingService:
                                         exit_price = ticker_quote.get("ap", enter_price)  # Ask price for buy
 
                         # Step 2.2: Send webhook signal
-                        webhook_response = await self.mcp_client.send_webhook_signal(
+                        webhook_response = await MCPClient.send_webhook_signal(
                             ticker=ticker,
                             action=exit_action,
                             indicator=indicator,
@@ -528,13 +539,14 @@ class TradingService:
                             "timestamp": datetime.utcnow().isoformat(),
                         }
 
-                        # Use the appropriate MAB service based on indicator
-                        if indicator == "Automated workflow":
-                            mab_service = self.mab_service_automated_workflow
-                        else:
-                            mab_service = self.mab_service_automated_trading
+                        indicator_name = (
+                            cls.INDICATOR_AUTOMATED_WORKFLOW
+                            if indicator == "Automated workflow"
+                            else cls.INDICATOR_AUTOMATED_TRADING
+                        )
 
-                        await mab_service.record_trade_outcome(
+                        await MABService.record_trade_outcome(
+                            indicator=indicator_name,
                             ticker=ticker,
                             enter_price=enter_price,
                             exit_price=exit_price,
@@ -548,7 +560,7 @@ class TradingService:
                         )
 
                         # Step 2.3: Delete from DynamoDB
-                        await self.db_client.delete_trade(ticker)
+                        await DynamoDBClient.delete_trade(ticker)
 
                 # Wait 5 seconds before next cycle
                 await asyncio.sleep(5)
@@ -557,9 +569,10 @@ class TradingService:
                 logger.exception(f"Error in exit service: {str(e)}")
                 await asyncio.sleep(5)
 
-    async def run(self):
+    @classmethod
+    async def run(cls):
         """Run both entry and exit services concurrently"""
         logger.info("Starting trading service...")
 
         # Run both services concurrently
-        await asyncio.gather(self.entry_service(), self.exit_service())
+        await asyncio.gather(cls.entry_service(), cls.exit_service())

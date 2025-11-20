@@ -6,8 +6,8 @@ Uses Thompson Sampling for contextual bandits to balance exploration and exploit
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime
-from common.loguru_logger import logger
-from db.dynamodb_client import DynamoDBClient
+from app.src.common.loguru_logger import logger
+from app.src.db.dynamodb_client import DynamoDBClient
 
 
 class MABService:
@@ -20,20 +20,20 @@ class MABService:
     - Balances exploration vs exploitation
     - Resets daily at market open
     """
+
+    alpha: float = 1.0
+    beta: float = 1.0
+    exploration_rate: float = 0.1
+    min_pulls_for_penalty: int = 3
+
+    @classmethod
+    def configure(cls):
+        """Ensure DynamoDB client resources are ready"""
+        DynamoDBClient.configure()
     
-    def __init__(self, db_client: DynamoDBClient, indicator: str = "Momentum Trading"):
-        self.db_client = db_client
-        self.indicator = indicator
-        # Thompson Sampling parameters
-        self.alpha = 1.0  # Prior parameter for success
-        self.beta = 1.0   # Prior parameter for failure
-        # Exploration-exploitation balance
-        self.exploration_rate = 0.1  # 10% exploration, 90% exploitation
-        # Minimum pulls before penalizing
-        self.min_pulls_for_penalty = 3
-    
+    @classmethod
     def _extract_context_features(
-        self,
+        cls,
         momentum_score: float,
         market_data: Optional[Dict[str, Any]] = None,
         time_of_day: Optional[float] = None
@@ -82,8 +82,9 @@ class MABService:
         
         return np.array(features)
     
+    @classmethod
     def _calculate_thompson_score(
-        self,
+        cls,
         ticker: str,
         context_features: np.ndarray,
         mab_stats: Optional[Dict[str, Any]] = None
@@ -95,7 +96,7 @@ class MABService:
         if mab_stats is None:
             # New ticker: use prior (exploration)
             # Sample from Beta(alpha, beta) which is uniform when alpha=beta=1
-            prior_mean = self.alpha / (self.alpha + self.beta)
+            prior_mean = cls.alpha / (cls.alpha + cls.beta)
             # Add context-based adjustment for new tickers
             context_bias = np.dot(context_features[:3], [0.1, 0.05, 0.05])  # Small context influence
             return prior_mean + context_bias
@@ -107,14 +108,14 @@ class MABService:
         
         if total_pulls == 0:
             # No history, use prior
-            prior_mean = self.alpha / (self.alpha + self.beta)
+            prior_mean = cls.alpha / (cls.alpha + cls.beta)
             context_bias = np.dot(context_features[:3], [0.1, 0.05, 0.05])
             return prior_mean + context_bias
         
         # Thompson Sampling: sample from Beta distribution
         # Posterior: Beta(alpha + successes, beta + failures)
-        alpha_posterior = self.alpha + successful_trades
-        beta_posterior = self.beta + failed_trades
+        alpha_posterior = cls.alpha + successful_trades
+        beta_posterior = cls.beta + failed_trades
         
         # Sample from Beta distribution
         # Using approximation: mean + small random noise
@@ -125,7 +126,7 @@ class MABService:
         context_adjustment = np.dot(context_features[:3], [0.15, 0.1, 0.1])
         
         # Penalize tickers with many failed trades relative to successful ones
-        if total_pulls >= self.min_pulls_for_penalty:
+        if total_pulls >= cls.min_pulls_for_penalty:
             failure_penalty = (failed_trades / total_pulls) * 0.3  # Up to 30% penalty
             mean_success_rate -= failure_penalty
         
@@ -135,15 +136,17 @@ class MABService:
             mean_success_rate += success_boost
         
         # Add some exploration noise (Thompson Sampling naturally does this via sampling)
-        exploration_noise = np.random.normal(0, 0.05) if np.random.random() < self.exploration_rate else 0
+        exploration_noise = np.random.normal(0, 0.05) if np.random.random() < cls.exploration_rate else 0
         
         final_score = mean_success_rate + context_adjustment + exploration_noise
         
         # Ensure score is in [0, 1] range
         return np.clip(final_score, 0.0, 1.0)
     
+    @classmethod
     async def select_tickers_with_mab(
-        self,
+        cls,
+        indicator: str,
         ticker_candidates: List[Tuple[str, float, str]],  # (ticker, momentum_score, reason)
         market_data_dict: Optional[Dict[str, Dict[str, Any]]] = None,
         top_k: int = 10
@@ -166,17 +169,17 @@ class MABService:
         
         for ticker, momentum_score, reason in ticker_candidates:
             # Get MAB stats for this ticker
-            mab_stats = await self.db_client.get_mab_stats(ticker, self.indicator)
+            mab_stats = await DynamoDBClient.get_mab_stats(ticker, indicator)
             
             # Extract context features
             market_data = market_data_dict.get(ticker) if market_data_dict else None
-            context_features = self._extract_context_features(
+            context_features = cls._extract_context_features(
                 momentum_score=momentum_score,
                 market_data=market_data
             )
             
             # Calculate MAB score
-            mab_score = self._calculate_thompson_score(
+            mab_score = cls._calculate_thompson_score(
                 ticker=ticker,
                 context_features=context_features,
                 mab_stats=mab_stats
@@ -198,8 +201,10 @@ class MABService:
         # Return in original format (ticker, momentum_score, reason)
         return [(ticker, momentum, reason) for ticker, momentum, reason, _ in selected]
     
+    @classmethod
     async def record_trade_outcome(
-        self,
+        cls,
+        indicator: str,
         ticker: str,
         enter_price: float,
         exit_price: float,
@@ -246,9 +251,9 @@ class MABService:
             }
         
         # Update MAB stats
-        success = await self.db_client.update_mab_reward(
+        success = await DynamoDBClient.update_mab_reward(
             ticker=ticker,
-            indicator=self.indicator,
+            indicator=indicator,
             reward=reward,
             context=context
         )
@@ -263,8 +268,10 @@ class MABService:
         
         return success
     
+    @classmethod
     async def should_trade_ticker(
-        self,
+        cls,
+        indicator: str,
         ticker: str,
         momentum_score: float,
         market_data: Optional[Dict[str, Any]] = None
@@ -276,16 +283,16 @@ class MABService:
             (should_trade, mab_score, reason)
         """
         # Get MAB stats
-        mab_stats = await self.db_client.get_mab_stats(ticker, self.indicator)
+        mab_stats = await DynamoDBClient.get_mab_stats(ticker, indicator)
         
         # Extract context
-        context_features = self._extract_context_features(
+        context_features = cls._extract_context_features(
             momentum_score=momentum_score,
             market_data=market_data
         )
         
         # Calculate MAB score
-        mab_score = self._calculate_thompson_score(
+        mab_score = cls._calculate_thompson_score(
             ticker=ticker,
             context_features=context_features,
             mab_stats=mab_stats
@@ -311,7 +318,8 @@ class MABService:
         
         return should_trade, mab_score, reason
     
-    async def reset_daily_stats(self) -> bool:
+    @classmethod
+    async def reset_daily_stats(cls, indicator: str) -> bool:
         """Reset daily MAB statistics (call at market open)"""
-        return await self.db_client.reset_daily_mab_stats(self.indicator)
+        return await DynamoDBClient.reset_daily_mab_stats(indicator)
 

@@ -5,41 +5,53 @@ Momentum Trading Service with entry and exit logic based on price momentum
 import asyncio
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, date, timezone
-from common.loguru_logger import logger
-from services.mcp.mcp_client import MCPClient
-from db.dynamodb_client import DynamoDBClient
-from services.tool_discovery.tool_discovery import ToolDiscoveryService
-from mab_service import MABService
+from app.src.common.loguru_logger import logger
+from app.src.services.mcp.mcp_client import MCPClient
+from app.src.db.dynamodb_client import DynamoDBClient
+from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
+from app.src.services.mab.mab_service import MABService
+from app.src.config.constants import (
+    MCP_SERVER_TRANSPORT,
+    MCP_TOOL_DISCOVERY_INTERVAL_SECONDS,
+)
 
 
 class MomentumTradingService:
     """Momentum-based trading service with entry and exit logic"""
 
-    def __init__(
-        self, tool_discovery: Optional[ToolDiscoveryService] = None, top_k: int = 10
+    running: bool = True
+    profit_threshold: float = 0.5  # 0.5% profit threshold
+    top_k: int = 10
+    max_active_trades: int = 30
+    exceptional_momentum_threshold: float = 5.0
+    tool_discovery_cls: Optional[type] = ToolDiscoveryService
+    indicator_name: str = "Momentum Trading"
+    mab_reset_date: Optional[str] = None
+
+    @classmethod
+    def configure(
+        cls,
+        *,
+        tool_discovery_cls: Optional[type] = ToolDiscoveryService,
+        top_k: int = 10,
     ):
-        self.tool_discovery = tool_discovery
-        self.mcp_client = MCPClient(tool_discovery=tool_discovery)
-        self.db_client = DynamoDBClient()
-        self.running = True
-        # Threshold for profitability (percentage)
-        self.profit_threshold = 0.5  # 0.5% profit threshold
-        # Number of top tickers to trade (configurable)
-        self.top_k = top_k
-        # Maximum number of active trades at any time
-        self.max_active_trades = 30
-        # Exceptional momentum threshold for preemption (higher = more selective)
-        self.exceptional_momentum_threshold = 5.0  # 5.0% momentum score
-        # Initialize MAB service for contextual bandit-based ticker selection
-        self.mab_service = MABService(self.db_client, indicator="Momentum Trading")
-        # Track if we've reset MAB stats today
-        self.mab_reset_date = None
+        """Configure dependencies and runtime parameters"""
+        if tool_discovery_cls is not None:
+            cls.tool_discovery_cls = tool_discovery_cls
+        cls.top_k = top_k
+        MCPClient.configure(tool_discovery_cls=tool_discovery_cls)
+        DynamoDBClient.configure()
+        MABService.configure()
+        cls.running = True
+        cls.mab_reset_date = None
 
-    def stop(self):
+    @classmethod
+    def stop(cls):
         """Stop the trading service"""
-        self.running = False
+        cls.running = False
 
-    def _calculate_momentum(self, datetime_price: List[List]) -> Tuple[float, str]:
+    @classmethod
+    def _calculate_momentum(cls, datetime_price: List[List]) -> Tuple[float, str]:
         """
         Calculate price momentum score from datetime_price array
         Returns: (momentum_score, reason)
@@ -87,8 +99,9 @@ class MomentumTradingService:
 
         return momentum_score, reason
 
+    @classmethod
     def _is_profitable(
-        self, enter_price: float, current_price: float, action: str
+        cls, enter_price: float, current_price: float, action: str
     ) -> bool:
         """
         Check if trade is profitable based on enter price, current price, and action
@@ -98,15 +111,16 @@ class MomentumTradingService:
         if action == "buy_to_open":
             # Long trade: profitable if current price is higher
             profit_percent = ((current_price - enter_price) / enter_price) * 100
-            return profit_percent >= self.profit_threshold
+            return profit_percent >= cls.profit_threshold
         elif action == "sell_to_open":
             # Short trade: profitable if current price is lower
             profit_percent = ((enter_price - current_price) / enter_price) * 100
-            return profit_percent >= self.profit_threshold
+            return profit_percent >= cls.profit_threshold
         return False
 
+    @classmethod
     def _calculate_profit_percent(
-        self, enter_price: float, current_price: float, action: str
+        cls, enter_price: float, current_price: float, action: str
     ) -> float:
         """
         Calculate profit percentage for a trade
@@ -120,8 +134,9 @@ class MomentumTradingService:
             return ((enter_price - current_price) / enter_price) * 100
         return 0.0
 
+    @classmethod
     async def _find_lowest_profitable_trade(
-        self, active_trades: List[Dict[str, Any]]
+        cls, active_trades: List[Dict[str, Any]]
     ) -> Optional[Tuple[Dict[str, Any], float]]:
         """
         Find the lowest profitable trade from active trades
@@ -139,7 +154,7 @@ class MomentumTradingService:
                 continue
 
             # Get current price
-            market_data_response = await self.mcp_client.get_market_data(ticker)
+            market_data_response = await MCPClient.get_market_data(ticker)
             if not market_data_response:
                 continue
 
@@ -149,12 +164,12 @@ class MomentumTradingService:
             if current_price <= 0:
                 continue
 
-            profit_percent = self._calculate_profit_percent(
+            profit_percent = cls._calculate_profit_percent(
                 enter_price, current_price, action
             )
 
             # Only consider profitable trades
-            if profit_percent >= self.profit_threshold:
+            if profit_percent >= cls.profit_threshold:
                 if lowest_profit is None or profit_percent < lowest_profit:
                     lowest_profit = profit_percent
                     lowest_trade = trade
@@ -163,20 +178,21 @@ class MomentumTradingService:
             return (lowest_trade, lowest_profit)
         return None
 
+    @classmethod
     async def _preempt_low_profit_trade(
-        self, new_ticker: str, new_momentum_score: float
+        cls, new_ticker: str, new_momentum_score: float
     ) -> bool:
         """
         Preempt (exit) a low profitable trade to make room for a new exceptional trade
         Returns True if preemption was successful, False otherwise
         """
-        active_trades = await self.db_client.get_all_momentum_trades()
+        active_trades = await DynamoDBClient.get_all_momentum_trades()
 
-        if len(active_trades) < self.max_active_trades:
+        if len(active_trades) < cls.max_active_trades:
             return False  # No need to preempt
 
         # Find lowest profitable trade
-        result = await self._find_lowest_profitable_trade(active_trades)
+        result = await cls._find_lowest_profitable_trade(active_trades)
         if not result:
             logger.debug("No profitable trades to preempt")
             return False
@@ -192,7 +208,7 @@ class MomentumTradingService:
         # Exit the low profit trade
         original_action = lowest_trade.get("action")
         enter_price = lowest_trade.get("enter_price")
-        indicator = lowest_trade.get("indicator", "Momentum Trading")
+        indicator = lowest_trade.get("indicator", cls.indicator_name)
 
         # Determine exit action
         if original_action == "buy_to_open":
@@ -204,7 +220,7 @@ class MomentumTradingService:
             return False
 
         # Get current price for exit
-        market_data_response = await self.mcp_client.get_market_data(ticker_to_exit)
+        market_data_response = await MCPClient.get_market_data(ticker_to_exit)
         if not market_data_response:
             logger.warning(
                 f"Failed to get market data for {ticker_to_exit} for preemption"
@@ -220,7 +236,7 @@ class MomentumTradingService:
 
         # Send webhook signal
         reason = f"Preempted for exceptional trade: {lowest_profit:.2f}% profit"
-        webhook_response = await self.mcp_client.send_webhook_signal(
+        webhook_response = await MCPClient.send_webhook_signal(
             ticker=ticker_to_exit,
             action=exit_action,
             indicator=indicator,
@@ -235,7 +251,7 @@ class MomentumTradingService:
             logger.warning(f"Failed to send webhook signal for {ticker_to_exit}")
 
         # Record MAB reward
-        profit_percent = self._calculate_profit_percent(
+        profit_percent = cls._calculate_profit_percent(
             enter_price, exit_price, original_action
         )
         context = {
@@ -247,7 +263,8 @@ class MomentumTradingService:
             "preempted": True,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        await self.mab_service.record_trade_outcome(
+        await MABService.record_trade_outcome(
+            indicator=cls.indicator_name,
             ticker=ticker_to_exit,
             enter_price=enter_price,
             exit_price=exit_price,
@@ -288,7 +305,7 @@ class MomentumTradingService:
         exit_reason = reason
 
         # Add completed trade to CompletedTradesForAutomatedDayTrading
-        await self.db_client.add_completed_trade(
+        await DynamoDBClient.add_completed_trade(
             date=current_date,
             indicator=indicator,
             ticker=ticker_to_exit,
@@ -305,17 +322,18 @@ class MomentumTradingService:
         )
 
         # Delete from DynamoDB
-        await self.db_client.delete_momentum_trade(ticker_to_exit)
+        await DynamoDBClient.delete_momentum_trade(ticker_to_exit)
         logger.info(f"Preempted and exited trade for {ticker_to_exit}")
         return True
 
-    async def entry_service(self):
+    @classmethod
+    async def entry_service(cls):
         """Entry service that runs every 10 seconds - analyzes momentum and enters trades"""
         logger.info("Momentum entry service started")
-        while self.running:
+        while cls.running:
             try:
                 # Step 1a: Get market clock
-                clock_response = await self.mcp_client.get_market_clock()
+                clock_response = await MCPClient.get_market_clock()
                 if not clock_response:
                     logger.warning("Failed to get market clock, skipping this cycle")
                     await asyncio.sleep(10)
@@ -334,13 +352,13 @@ class MomentumTradingService:
 
                 # Step 1b.1: Reset MAB daily stats if needed (at market open)
                 today = date.today().isoformat()
-                if self.mab_reset_date != today:
+                if cls.mab_reset_date != today:
                     logger.info("Resetting daily MAB statistics for new trading day")
-                    await self.mab_service.reset_daily_stats()
-                    self.mab_reset_date = today
+                    await MABService.reset_daily_stats(cls.indicator_name)
+                    cls.mab_reset_date = today
 
                 # Step 1c: Get screened tickers
-                tickers_response = await self.mcp_client.get_alpaca_screened_tickers()
+                tickers_response = await MCPClient.get_alpaca_screened_tickers()
                 if not tickers_response:
                     logger.warning(
                         "Failed to get screened tickers, skipping this cycle"
@@ -356,7 +374,7 @@ class MomentumTradingService:
                 all_tickers = list(set(gainers + losers + most_actives))
 
                 # Step 1c.1: Get blacklisted tickers and filter them out
-                blacklisted_tickers = await self.db_client.get_blacklisted_tickers()
+                blacklisted_tickers = await DynamoDBClient.get_blacklisted_tickers()
                 blacklisted_set = set(blacklisted_tickers)
 
                 # Filter out blacklisted tickers
@@ -375,7 +393,7 @@ class MomentumTradingService:
                     )
 
                 # Step 1d: Get active trades to filter out tickers that already have trades
-                active_trades = await self.db_client.get_all_momentum_trades()
+                active_trades = await DynamoDBClient.get_all_momentum_trades()
                 active_count = len(active_trades)
                 active_ticker_set = {
                     trade.get("ticker")
@@ -384,7 +402,7 @@ class MomentumTradingService:
                 }
 
                 logger.info(
-                    f"Current active trades: {active_count}/{self.max_active_trades}"
+                    f"Current active trades: {active_count}/{cls.max_active_trades}"
                 )
 
                 # Step 1e: Collect momentum scores for all tickers and market data for MAB
@@ -392,11 +410,11 @@ class MomentumTradingService:
                 market_data_dict = {}  # Store market data for MAB context
 
                 for ticker in filtered_tickers:
-                    if not self.running:
+                    if not cls.running:
                         break
 
                     # Double-check ticker is not blacklisted before processing
-                    if await self.db_client.is_ticker_blacklisted(ticker):
+                    if await DynamoDBClient.is_ticker_blacklisted(ticker):
                         logger.debug(f"Ticker {ticker} is blacklisted, skipping")
                         continue
 
@@ -408,7 +426,7 @@ class MomentumTradingService:
                         continue
 
                     # Get market data for ticker
-                    market_data_response = await self.mcp_client.get_market_data(ticker)
+                    market_data_response = await MCPClient.get_market_data(ticker)
                     if not market_data_response:
                         logger.debug(f"Failed to get market data for {ticker}")
                         continue
@@ -426,7 +444,7 @@ class MomentumTradingService:
                         continue
 
                     # Calculate momentum score
-                    momentum_score, reason = self._calculate_momentum(datetime_price)
+                    momentum_score, reason = cls._calculate_momentum(datetime_price)
 
                     # Only include tickers with meaningful momentum (non-zero score)
                     if momentum_score != 0.0:
@@ -450,43 +468,45 @@ class MomentumTradingService:
 
                 # Step 1f.1: Use MAB to select top-k tickers from each direction
                 # MAB will boost high-profitability tickers and penalize low-profitability ones
-                top_upward = await self.mab_service.select_tickers_with_mab(
+                top_upward = await MABService.select_tickers_with_mab(
+                    cls.indicator_name,
                     ticker_candidates=upward_tickers,
                     market_data_dict=market_data_dict,
-                    top_k=self.top_k,
+                    top_k=cls.top_k,
                 )
-                top_downward = await self.mab_service.select_tickers_with_mab(
+                top_downward = await MABService.select_tickers_with_mab(
+                    cls.indicator_name,
                     ticker_candidates=downward_tickers,
                     market_data_dict=market_data_dict,
-                    top_k=self.top_k,
+                    top_k=cls.top_k,
                 )
 
                 logger.info(
                     f"MAB selected {len(top_upward)} upward momentum tickers and "
-                    f"{len(top_downward)} downward momentum tickers (top_k={self.top_k})"
+                    f"{len(top_downward)} downward momentum tickers (top_k={cls.top_k})"
                 )
 
                 # Step 1g: Enter trades for top-k tickers
                 for rank, (ticker, momentum_score, reason) in enumerate(
                     top_upward, start=1
                 ):
-                    if not self.running:
+                    if not cls.running:
                         break
 
                     # Check active trade count before entering
-                    active_trades = await self.db_client.get_all_momentum_trades()
+                    active_trades = await DynamoDBClient.get_all_momentum_trades()
                     active_count = len(active_trades)
 
                     # If at max capacity, check if we can preempt
-                    if active_count >= self.max_active_trades:
+                    if active_count >= cls.max_active_trades:
                         # Only preempt if momentum is exceptional
-                        if abs(momentum_score) >= self.exceptional_momentum_threshold:
+                        if abs(momentum_score) >= cls.exceptional_momentum_threshold:
                             logger.info(
-                                f"At max capacity ({active_count}/{self.max_active_trades}), "
+                                f"At max capacity ({active_count}/{cls.max_active_trades}), "
                                 f"attempting to preempt for exceptional trade {ticker} "
                                 f"(momentum: {momentum_score:.2f})"
                             )
-                            preempted = await self._preempt_low_profit_trade(
+                            preempted = await cls._preempt_low_profit_trade(
                                 ticker, momentum_score
                             )
                             if not preempted:
@@ -497,9 +517,9 @@ class MomentumTradingService:
                                 continue
                         else:
                             logger.info(
-                                f"At max capacity ({active_count}/{self.max_active_trades}), "
+                                f"At max capacity ({active_count}/{cls.max_active_trades}), "
                                 f"skipping {ticker} (momentum: {momentum_score:.2f} < "
-                                f"exceptional threshold: {self.exceptional_momentum_threshold})"
+                                f"exceptional threshold: {cls.exceptional_momentum_threshold})"
                             )
                             continue
 
@@ -507,7 +527,7 @@ class MomentumTradingService:
                     action = "buy_to_open"
 
                     # Get quote for ask price (buy price)
-                    quote_response = await self.mcp_client.get_quote(ticker)
+                    quote_response = await MCPClient.get_quote(ticker)
                     if not quote_response:
                         logger.warning(f"Failed to get quote for {ticker}, skipping")
                         continue
@@ -524,9 +544,9 @@ class MomentumTradingService:
                         continue
 
                     # Send webhook signal
-                    indicator = "Momentum Trading"
+                    indicator = cls.indicator_name
                     ranked_reason = f"{reason} (ranked #{rank} upward momentum)"
-                    webhook_response = await self.mcp_client.send_webhook_signal(
+                    webhook_response = await MCPClient.send_webhook_signal(
                         ticker=ticker,
                         action=action,
                         indicator=indicator,
@@ -541,7 +561,7 @@ class MomentumTradingService:
                         logger.warning(f"Failed to send webhook signal for {ticker}")
 
                     # Add to DynamoDB
-                    await self.db_client.add_momentum_trade(
+                    await DynamoDBClient.add_momentum_trade(
                         ticker=ticker,
                         action=action,
                         indicator=indicator,
@@ -556,23 +576,23 @@ class MomentumTradingService:
                 for rank, (ticker, momentum_score, reason) in enumerate(
                     top_downward, start=1
                 ):
-                    if not self.running:
+                    if not cls.running:
                         break
 
                     # Check active trade count before entering
-                    active_trades = await self.db_client.get_all_momentum_trades()
+                    active_trades = await DynamoDBClient.get_all_momentum_trades()
                     active_count = len(active_trades)
 
                     # If at max capacity, check if we can preempt
-                    if active_count >= self.max_active_trades:
+                    if active_count >= cls.max_active_trades:
                         # Only preempt if momentum is exceptional (use absolute value for downward)
-                        if abs(momentum_score) >= self.exceptional_momentum_threshold:
+                        if abs(momentum_score) >= cls.exceptional_momentum_threshold:
                             logger.info(
-                                f"At max capacity ({active_count}/{self.max_active_trades}), "
+                                f"At max capacity ({active_count}/{cls.max_active_trades}), "
                                 f"attempting to preempt for exceptional trade {ticker} "
                                 f"(momentum: {momentum_score:.2f})"
                             )
-                            preempted = await self._preempt_low_profit_trade(
+                            preempted = await cls._preempt_low_profit_trade(
                                 ticker, abs(momentum_score)
                             )
                             if not preempted:
@@ -583,9 +603,9 @@ class MomentumTradingService:
                                 continue
                         else:
                             logger.info(
-                                f"At max capacity ({active_count}/{self.max_active_trades}), "
+                                f"At max capacity ({active_count}/{cls.max_active_trades}), "
                                 f"skipping {ticker} (momentum: {momentum_score:.2f} < "
-                                f"exceptional threshold: {self.exceptional_momentum_threshold})"
+                                f"exceptional threshold: {cls.exceptional_momentum_threshold})"
                             )
                             continue
 
@@ -593,7 +613,7 @@ class MomentumTradingService:
                     action = "sell_to_open"
 
                     # Get quote for bid price (sell price)
-                    quote_response = await self.mcp_client.get_quote(ticker)
+                    quote_response = await MCPClient.get_quote(ticker)
                     if not quote_response:
                         logger.warning(f"Failed to get quote for {ticker}, skipping")
                         continue
@@ -610,9 +630,9 @@ class MomentumTradingService:
                         continue
 
                     # Send webhook signal
-                    indicator = "Momentum Trading"
+                    indicator = cls.indicator_name
                     ranked_reason = f"{reason} (ranked #{rank} downward momentum)"
-                    webhook_response = await self.mcp_client.send_webhook_signal(
+                    webhook_response = await MCPClient.send_webhook_signal(
                         ticker=ticker,
                         action=action,
                         indicator=indicator,
@@ -627,7 +647,7 @@ class MomentumTradingService:
                         logger.warning(f"Failed to send webhook signal for {ticker}")
 
                     # Add to DynamoDB
-                    await self.db_client.add_momentum_trade(
+                    await DynamoDBClient.add_momentum_trade(
                         ticker=ticker,
                         action=action,
                         indicator=indicator,
@@ -646,13 +666,14 @@ class MomentumTradingService:
                 logger.exception(f"Error in momentum entry service: {str(e)}")
                 await asyncio.sleep(10)
 
-    async def exit_service(self):
+    @classmethod
+    async def exit_service(cls):
         """Exit service that runs every 5 seconds - checks profitability and exits trades"""
         logger.info("Momentum exit service started")
-        while self.running:
+        while cls.running:
             try:
                 # Step 2a: Check if market is open - don't do momentum trading when market is closed
-                clock_response = await self.mcp_client.get_market_clock()
+                clock_response = await MCPClient.get_market_clock()
                 if not clock_response:
                     logger.warning(
                         "Failed to get market clock, skipping momentum exit check"
@@ -669,7 +690,7 @@ class MomentumTradingService:
                     continue
 
                 # Step 2: Get all active momentum trades from DynamoDB
-                active_trades = await self.db_client.get_all_momentum_trades()
+                active_trades = await DynamoDBClient.get_all_momentum_trades()
 
                 if not active_trades:
                     logger.debug("No active momentum trades to monitor")
@@ -678,14 +699,14 @@ class MomentumTradingService:
 
                 active_count = len(active_trades)
                 logger.info(
-                    f"Monitoring {active_count}/{self.max_active_trades} active momentum trades"
+                    f"Monitoring {active_count}/{cls.max_active_trades} active momentum trades"
                 )
 
                 # When at capacity, be more aggressive about exiting trades
-                at_capacity = active_count >= self.max_active_trades
+                at_capacity = active_count >= cls.max_active_trades
 
                 for trade in active_trades:
-                    if not self.running:
+                    if not cls.running:
                         break
 
                     ticker = trade.get("ticker")
@@ -709,7 +730,7 @@ class MomentumTradingService:
                         continue
 
                     # Step 2.1: Get current market data to check profitability
-                    market_data_response = await self.mcp_client.get_market_data(ticker)
+                    market_data_response = await MCPClient.get_market_data(ticker)
                     if not market_data_response:
                         logger.warning(
                             f"Failed to get market data for {ticker} for exit check - will retry in next cycle"
@@ -728,12 +749,12 @@ class MomentumTradingService:
                         continue
 
                     # Step 2.2: Calculate profit percentage
-                    profit_percent = self._calculate_profit_percent(
+                    profit_percent = cls._calculate_profit_percent(
                         enter_price, current_price, original_action
                     )
 
                     # Step 2.2.1: Check if trade is profitable
-                    is_profitable = profit_percent >= self.profit_threshold
+                    is_profitable = profit_percent >= cls.profit_threshold
 
                     # When at capacity, also consider exiting low profitable trades
                     # to make room for potentially better trades
@@ -763,7 +784,7 @@ class MomentumTradingService:
                         reason = exit_reason
 
                         # Step 2.3: Send webhook signal
-                        webhook_response = await self.mcp_client.send_webhook_signal(
+                        webhook_response = await MCPClient.send_webhook_signal(
                             ticker=ticker,
                             action=exit_action,
                             indicator=indicator,
@@ -788,7 +809,8 @@ class MomentumTradingService:
                             "indicator": indicator,
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
-                        await self.mab_service.record_trade_outcome(
+                        await MABService.record_trade_outcome(
+                            indicator=cls.indicator_name,
                             ticker=ticker,
                             enter_price=enter_price,
                             exit_price=current_price,
@@ -830,7 +852,7 @@ class MomentumTradingService:
                         exit_timestamp = datetime.now(timezone.utc).isoformat()
 
                         # Step 2.4.2: Add completed trade to CompletedTradesForAutomatedDayTrading
-                        await self.db_client.add_completed_trade(
+                        await DynamoDBClient.add_completed_trade(
                             date=current_date,
                             indicator=indicator,
                             ticker=ticker,
@@ -847,13 +869,13 @@ class MomentumTradingService:
                         )
 
                         # Step 2.5: Delete from DynamoDB
-                        await self.db_client.delete_momentum_trade(ticker)
+                        await DynamoDBClient.delete_momentum_trade(ticker)
                         logger.info(f"Exited momentum trade for {ticker}")
                     else:
                         # Not profitable yet, continue monitoring
                         logger.debug(
                             f"{ticker} not yet profitable: {profit_percent:.2f}% "
-                            f"(threshold: {self.profit_threshold}%)"
+                            f"(threshold: {cls.profit_threshold}%)"
                         )
 
                 # Wait 5 seconds before next cycle
@@ -863,9 +885,10 @@ class MomentumTradingService:
                 logger.exception(f"Error in momentum exit service: {str(e)}")
                 await asyncio.sleep(5)
 
-    async def run(self):
+    @classmethod
+    async def run(cls):
         """Run both entry and exit services concurrently"""
         logger.info("Starting momentum trading service...")
 
         # Run both services concurrently
-        await asyncio.gather(self.entry_service(), self.exit_service())
+        await asyncio.gather(cls.entry_service(), cls.exit_service())

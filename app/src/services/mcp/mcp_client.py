@@ -8,29 +8,47 @@ import asyncio
 import time
 import aiohttp
 from typing import Optional, Dict, Any
-from common.loguru_logger import logger
-from config.constants import (
+from app.src.common.loguru_logger import logger
+from app.src.config.constants import (
     DEBUG_DAY_TRADING,
     MARKET_DATA_MCP_URL,
     MCP_AUTH_HEADER_NAME,
     MARKET_DATA_MCP_TOKEN,
 )
-from services.tool_discovery.tool_discovery import ToolDiscoveryService
+from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
 
 
 class MCPClient:
     """Client for interacting with MCP tools using MCP protocol"""
 
-    def __init__(self, tool_discovery: Optional[ToolDiscoveryService] = None):
-        self.base_url = MARKET_DATA_MCP_URL
-        self.auth_header_name = MCP_AUTH_HEADER_NAME
-        self.auth_token = MARKET_DATA_MCP_TOKEN
-        self.tool_discovery = tool_discovery
-        # Rate limiting: small delay between requests to avoid overwhelming server
-        self._last_request_time = 0.0
-        self._min_request_interval = 0.1  # 100ms minimum between requests
+    _base_url: str = MARKET_DATA_MCP_URL
+    _auth_header_name: str = MCP_AUTH_HEADER_NAME
+    _auth_token: Optional[str] = MARKET_DATA_MCP_TOKEN
+    _tool_discovery_cls: Optional[type] = ToolDiscoveryService
+    _last_request_time: float = 0.0
+    _min_request_interval: float = 0.1  # 100ms minimum between requests
 
-    def _extract_result_payload(self, data: Any) -> Any:
+    @classmethod
+    def configure(
+        cls,
+        *,
+        tool_discovery_cls: Optional[type] = ToolDiscoveryService,
+        base_url: Optional[str] = None,
+        auth_header_name: Optional[str] = None,
+        auth_token: Optional[str] = None,
+    ):
+        """Configure MCP client for classmethod-only usage"""
+        if base_url:
+            cls._base_url = base_url
+        if auth_header_name:
+            cls._auth_header_name = auth_header_name
+        if auth_token is not None:
+            cls._auth_token = auth_token
+        if tool_discovery_cls is not None:
+            cls._tool_discovery_cls = tool_discovery_cls
+
+    @classmethod
+    def _extract_result_payload(cls, data: Any) -> Any:
         """Unwrap MCP JSON-RPC responses to expose the underlying tool payload."""
         if not isinstance(data, dict):
             return data
@@ -57,8 +75,9 @@ class MCPClient:
                         return {"content_text": text}
         return result
 
+    @classmethod
     async def _call_mcp_tool_http(
-        self, tool_name: str, params: Dict[str, Any], retry_on_503: bool = True
+        cls, tool_name: str, params: Dict[str, Any], retry_on_503: bool = True
     ) -> Optional[Dict[str, Any]]:
         """
         Call MCP tool using HTTP POST with JSON-RPC format (MCP protocol)
@@ -71,10 +90,10 @@ class MCPClient:
         """
         # Rate limiting: ensure minimum interval between requests
         current_time = time.time()
-        time_since_last = current_time - self._last_request_time
-        if time_since_last < self._min_request_interval:
-            await asyncio.sleep(self._min_request_interval - time_since_last)
-        self._last_request_time = time.time()
+        time_since_last = current_time - cls._last_request_time
+        if time_since_last < cls._min_request_interval:
+            await asyncio.sleep(cls._min_request_interval - time_since_last)
+        cls._last_request_time = time.time()
 
         max_retries = 3 if retry_on_503 else 1
         base_delay = 2.0  # Start with 2 second delay
@@ -82,8 +101,8 @@ class MCPClient:
         for attempt in range(max_retries):
             try:
                 headers = {"Content-Type": "application/json"}
-                if self.auth_token:
-                    headers[self.auth_header_name] = self.auth_token
+                if cls._auth_token:
+                    headers[cls._auth_header_name] = cls._auth_token
 
                 # Use MCP JSON-RPC format (same as MCP Inspector)
                 # POST to base_url with tools/call method
@@ -98,11 +117,11 @@ class MCPClient:
                 timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(
-                        self.base_url, json=jsonrpc_body, headers=headers
+                        cls._base_url, json=jsonrpc_body, headers=headers
                     ) as response:
                         if response.status == 200:
                             data = await response.json()
-                            return self._extract_result_payload(data)
+                            return cls._extract_result_payload(data)
                         elif (
                             response.status == 503
                             and retry_on_503
@@ -174,6 +193,23 @@ class MCPClient:
                                         f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - {error_msg}"
                                     )
                             return None
+            except asyncio.TimeoutError as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2**attempt)
+                    logger.warning(
+                        f"Timeout calling {tool_name} (30s timeout exceeded), retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(
+                    f"Timeout calling {tool_name} after {max_retries} attempts - external server may be overloaded or slow"
+                )
+                return None
+            except asyncio.CancelledError:
+                logger.warning(
+                    f"Request to {tool_name} was cancelled (likely due to timeout or shutdown)"
+                )
+                raise  # Re-raise CancelledError so it propagates properly
             except aiohttp.ClientError as e:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2**attempt)
@@ -190,13 +226,14 @@ class MCPClient:
 
         return None
 
+    @classmethod
     async def _call_mcp_tool(
-        self, tool_name: str, params: Dict[str, Any]
+        cls, tool_name: str, params: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """Generic method to call MCP tools - uses HTTP directly since MCP protocol fails with 500 errors"""
         # Check if tool is available via discovery service
-        if self.tool_discovery:
-            is_available = await self.tool_discovery.is_tool_available(tool_name)
+        if cls._tool_discovery_cls:
+            is_available = await cls._tool_discovery_cls.is_tool_available(tool_name)
             if not is_available:
                 logger.debug(
                     f"Tool {tool_name} not found in discovered tools list, trying anyway..."
@@ -205,43 +242,50 @@ class MCPClient:
         # Since MCP protocol is consistently failing with 500 errors, use HTTP directly
         # The server appears to not be handling our MCP protocol requests correctly
         # MCP Inspector might be using a different approach or version
-        return await self._call_mcp_tool_http(tool_name, params)
+        return await cls._call_mcp_tool_http(tool_name, params)
 
+    @classmethod
     async def call_tool(
-        self, tool_name: str, params: Dict[str, Any]
+        cls, tool_name: str, params: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """Generic method to call any discovered MCP tool by name"""
-        return await self._call_mcp_tool(tool_name, params)
+        return await cls._call_mcp_tool(tool_name, params)
 
-    async def get_market_clock(self) -> Optional[Dict[str, Any]]:
+    @classmethod
+    async def get_market_clock(cls) -> Optional[Dict[str, Any]]:
         """Get market clock status"""
         if DEBUG_DAY_TRADING:
             return {"clock": {"is_open": True}}
-        return await self._call_mcp_tool("get_market_clock", {})
+        return await cls._call_mcp_tool("get_market_clock", {})
 
-    async def get_alpaca_screened_tickers(self) -> Optional[Dict[str, Any]]:
+    @classmethod
+    async def get_alpaca_screened_tickers(cls) -> Optional[Dict[str, Any]]:
         """Get screened tickers (gainers, losers, most_actives)"""
-        return await self._call_mcp_tool("get_alpaca_screened_tickers", {})
+        return await cls._call_mcp_tool("get_alpaca_screened_tickers", {})
 
-    async def get_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
+    @classmethod
+    async def get_quote(cls, ticker: str) -> Optional[Dict[str, Any]]:
         """Get quote for a ticker"""
         params = {"ticker": ticker}
-        return await self._call_mcp_tool("get_quote", params)
+        return await cls._call_mcp_tool("get_quote", params)
 
-    async def enter(self, ticker: str, action: str) -> Optional[Dict[str, Any]]:
+    @classmethod
+    async def enter(cls, ticker: str, action: str) -> Optional[Dict[str, Any]]:
         """Call enter() MCP tool"""
         params = {"ticker": ticker, "action": action}
-        return await self._call_mcp_tool("enter", params)
+        return await cls._call_mcp_tool("enter", params)
 
+    @classmethod
     async def exit(
-        self, ticker: str, enter_price: float, action: str
+        cls, ticker: str, enter_price: float, action: str
     ) -> Optional[Dict[str, Any]]:
         """Call exit() MCP tool"""
         params = {"ticker": ticker, "enter_price": enter_price, "action": action}
-        return await self._call_mcp_tool("exit", params)
+        return await cls._call_mcp_tool("exit", params)
 
+    @classmethod
     async def send_webhook_signal(
-        self, ticker: str, action: str, indicator: str, enter_reason: str
+        cls, ticker: str, action: str, indicator: str, enter_reason: str
     ) -> Optional[Dict[str, Any]]:
         """Send webhook signal"""
         params = {
@@ -250,9 +294,10 @@ class MCPClient:
             "indicator": indicator,
             "enter_reason": enter_reason,
         }
-        return await self._call_mcp_tool("send_webhook_signal", params)
+        return await cls._call_mcp_tool("send_webhook_signal", params)
 
-    async def get_market_data(self, ticker: str) -> Optional[Dict[str, Any]]:
+    @classmethod
+    async def get_market_data(cls, ticker: str) -> Optional[Dict[str, Any]]:
         """Get market data for a ticker including technical analysis and datetime_price"""
         params = {"ticker": ticker}
-        return await self._call_mcp_tool("get_market_data", params)
+        return await cls._call_mcp_tool("get_market_data", params)
