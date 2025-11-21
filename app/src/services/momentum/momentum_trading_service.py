@@ -17,16 +17,45 @@ from app.src.config.constants import (
 
 
 class MomentumTradingService:
-    """Momentum-based trading service with entry and exit logic"""
+    """Momentum-based trading service with entry and exit logic - HIGHLY SELECTIVE"""
 
     running: bool = True
-    profit_threshold: float = 0.5  # 0.5% profit threshold
-    top_k: int = 10
-    max_active_trades: int = 30
+    profit_threshold: float = 1.5  # 1.5% profit threshold (increased from 0.5%)
+    top_k: int = 2  # Maximum 2 tickers per direction per cycle (reduced from 10)
+    max_active_trades: int = 5  # Maximum 5 active trades (reduced from 30)
     exceptional_momentum_threshold: float = 5.0
+    # New: Minimum momentum threshold - only trade strong momentum
+    min_momentum_threshold: float = 3.0  # Only trade if |momentum| >= 3%
+    # New: Stock quality filters
+    min_stock_price: float = 1.0  # Minimum stock price $1.00
+    min_daily_volume: int = 100000  # Minimum daily volume (100k shares)
+    # New: Daily trade limits
+    max_daily_trades: int = 5  # Maximum 5 trades per day total
+    # New: Cooldown periods
+    ticker_cooldown_minutes: int = (
+        60  # Don't re-enter same ticker for 60 minutes after exit
+    )
+    # New: Trailing stop loss (wider than before)
+    stop_loss_threshold: float = -1.5  # Exit if losing 1.5% (increased from 0.5%)
+    trailing_stop_percent: float = 1.5  # Trail 1.5% from peak (increased from 0.5%)
+    # New: ADX filter - only trade when trend is strong
+    min_adx_threshold: float = 20.0  # Only trade if ADX >= 20 (strong trend)
+    # New: RSI filters - avoid overbought/oversold entries
+    rsi_oversold_for_long: float = 35.0  # Longs only when RSI < 35 (oversold)
+    rsi_overbought_for_short: float = 65.0  # Shorts only when RSI > 65 (overbought)
+    # New: Let winners run - higher profit target for strong momentum
+    profit_target_strong_momentum: float = 5.0  # 5% target for strong momentum (>5%)
+    # New: Cycle time (check less frequently)
+    entry_cycle_seconds: int = 60  # Check every 60 seconds (increased from 10)
+
     tool_discovery_cls: Optional[type] = ToolDiscoveryService
     indicator_name: str = "Momentum Trading"
     mab_reset_date: Optional[str] = None
+    daily_trades_count: int = 0  # Track daily trades
+    daily_trades_date: Optional[str] = None  # Track which date
+    ticker_exit_timestamps: Dict[str, datetime] = (
+        {}
+    )  # Track when tickers were exited for cooldown
 
     @classmethod
     def configure(
@@ -51,6 +80,139 @@ class MomentumTradingService:
         cls.running = False
 
     @classmethod
+    def _is_ticker_in_cooldown(cls, ticker: str) -> bool:
+        """
+        Check if ticker is in cooldown period (recently exited)
+        Returns True if ticker should not be traded yet
+        """
+        if ticker not in cls.ticker_exit_timestamps:
+            return False
+
+        exit_time = cls.ticker_exit_timestamps[ticker]
+        elapsed_minutes = (
+            datetime.now(timezone.utc) - exit_time
+        ).total_seconds() / 60.0
+
+        if elapsed_minutes >= cls.ticker_cooldown_minutes:
+            # Cooldown expired, remove from dict
+            del cls.ticker_exit_timestamps[ticker]
+            return False
+
+        return True  # Still in cooldown
+
+    @classmethod
+    def _has_reached_daily_trade_limit(cls) -> bool:
+        """Check if daily trade limit has been reached"""
+        today = date.today().isoformat()
+
+        # Reset daily count if new day
+        if cls.daily_trades_date != today:
+            cls.daily_trades_count = 0
+            cls.daily_trades_date = today
+
+        return cls.daily_trades_count >= cls.max_daily_trades
+
+    @classmethod
+    def _increment_daily_trade_count(cls):
+        """Increment daily trade counter"""
+        today = date.today().isoformat()
+
+        # Reset daily count if new day
+        if cls.daily_trades_date != today:
+            cls.daily_trades_count = 0
+            cls.daily_trades_date = today
+
+        cls.daily_trades_count += 1
+
+    @classmethod
+    def _is_warrant_or_option(cls, ticker: str) -> bool:
+        """
+        Check if ticker is a warrant or option based on suffix
+        Warrants typically have suffixes like W, WS, WT, etc.
+        Options are not typically traded directly in this system, but check anyway
+        """
+        ticker_upper = ticker.upper()
+        # Common warrant/rights suffixes
+        warrant_suffixes = ["W", "WS", "WT", "WTS", "R", "RT"]
+
+        # Check if ticker ends with a warrant suffix (case insensitive)
+        for suffix in warrant_suffixes:
+            if ticker_upper.endswith(suffix):
+                # Make sure it's actually a suffix (at least 3 chars before it)
+                if len(ticker_upper) > len(suffix) + 2:
+                    return True
+
+        return False
+
+    @classmethod
+    async def _passes_stock_quality_filters(
+        cls, ticker: str, market_data: Dict[str, Any], momentum_score: float = 0.0
+    ) -> Tuple[bool, str]:
+        """
+        Check if ticker passes stock quality filters including ADX and RSI
+        Returns: (passes_filter, reason)
+        """
+        # Filter 1: Exclude warrants and options
+        if cls._is_warrant_or_option(ticker):
+            return (
+                False,
+                f"Excluded: {ticker} is a warrant/option (ends with W/R/RT/etc)",
+            )
+
+        technical_analysis = market_data.get("technical_analysis", {})
+        current_price = technical_analysis.get("close_price", 0.0)
+
+        # Filter 2: Minimum stock price
+        if current_price <= 0:
+            return False, f"Invalid price data for {ticker}"
+
+        if current_price < cls.min_stock_price:
+            return (
+                False,
+                f"Price too low: ${current_price:.2f} < ${cls.min_stock_price} minimum",
+            )
+
+        # Filter 3: Minimum volume
+        volume = technical_analysis.get("volume", 0)
+        volume_sma = technical_analysis.get("volume_sma", 0)
+        avg_volume = volume_sma if volume_sma > 0 else volume
+
+        if avg_volume < cls.min_daily_volume:
+            return (
+                False,
+                f"Volume too low: {avg_volume:,} < {cls.min_daily_volume:,} minimum",
+            )
+
+        # Filter 4: ADX - require strong trend (ADX >= 20)
+        adx = technical_analysis.get("adx", 0.0)
+        if adx < cls.min_adx_threshold:
+            return (
+                False,
+                f"ADX too low: {adx:.2f} < {cls.min_adx_threshold} (no strong trend)",
+            )
+
+        # Filter 5: RSI - avoid overbought/oversold entries
+        rsi = technical_analysis.get("rsi", 50.0)  # Default to neutral if not available
+
+        # Determine trade direction from momentum
+        is_long = momentum_score > 0
+        is_short = momentum_score < 0
+
+        if is_long and rsi >= cls.rsi_oversold_for_long:
+            return (
+                False,
+                f"RSI too high for long: {rsi:.2f} >= {cls.rsi_oversold_for_long} (not oversold enough)",
+            )
+
+        if is_short and rsi <= cls.rsi_overbought_for_short:
+            return (
+                False,
+                f"RSI too low for short: {rsi:.2f} <= {cls.rsi_overbought_for_short} (not overbought enough)",
+            )
+
+        return True, f"Passed all quality filters (ADX: {adx:.2f}, RSI: {rsi:.2f})"
+
+    @classmethod
     def _calculate_momentum(cls, datetime_price: List[Any]) -> Tuple[float, str]:
         """
         Calculate price momentum score from datetime_price array
@@ -72,7 +234,11 @@ class MomentumTradingService:
                         prices.append(float(entry[1]))
                 elif isinstance(entry, dict):
                     # Handle dict format: try common price keys
-                    price = entry.get("price") or entry.get("close") or entry.get("close_price")
+                    price = (
+                        entry.get("price")
+                        or entry.get("close")
+                        or entry.get("close_price")
+                    )
                     if price is not None:
                         prices.append(float(price))
             except (ValueError, TypeError, KeyError, IndexError):
@@ -342,15 +508,15 @@ class MomentumTradingService:
 
     @classmethod
     async def entry_service(cls):
-        """Entry service that runs every 10 seconds - analyzes momentum and enters trades"""
-        logger.info("Momentum entry service started")
+        """Entry service that runs every 60 seconds - analyzes momentum and enters trades (HIGHLY SELECTIVE)"""
+        logger.info("Momentum entry service started (HIGHLY SELECTIVE MODE)")
         while cls.running:
             try:
                 # Step 1a: Get market clock
                 clock_response = await MCPClient.get_market_clock()
                 if not clock_response:
                     logger.warning("Failed to get market clock, skipping this cycle")
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(cls.entry_cycle_seconds)
                     continue
 
                 clock = clock_response.get("clock", {})
@@ -359,17 +525,31 @@ class MomentumTradingService:
                 # Step 1b: Check if market is open
                 if not is_open:
                     logger.info("Market is closed, skipping momentum entry logic")
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(cls.entry_cycle_seconds)
                     continue
 
-                logger.info("Market is open, proceeding with momentum entry logic")
+                logger.info(
+                    "Market is open, proceeding with momentum entry logic (HIGHLY SELECTIVE)"
+                )
 
-                # Step 1b.1: Reset MAB daily stats if needed (at market open)
+                # Step 1b.1: Reset MAB daily stats and daily trade count if needed (at market open)
                 today = date.today().isoformat()
                 if cls.mab_reset_date != today:
                     logger.info("Resetting daily MAB statistics for new trading day")
                     await MABService.reset_daily_stats(cls.indicator_name)
                     cls.mab_reset_date = today
+                    cls.daily_trades_count = 0
+                    cls.daily_trades_date = today
+                    cls.ticker_exit_timestamps.clear()  # Clear cooldown timestamps for new day
+
+                # Step 1b.2: Check daily trade limit
+                if cls._has_reached_daily_trade_limit():
+                    logger.info(
+                        f"Daily trade limit reached: {cls.daily_trades_count}/{cls.max_daily_trades}. "
+                        "Skipping entry logic this cycle."
+                    )
+                    await asyncio.sleep(cls.entry_cycle_seconds)
+                    continue
 
                 # Step 1c: Get screened tickers
                 tickers_response = await MCPClient.get_alpaca_screened_tickers()
@@ -460,9 +640,39 @@ class MomentumTradingService:
                     # Calculate momentum score
                     momentum_score, reason = cls._calculate_momentum(datetime_price)
 
-                    # Only include tickers with meaningful momentum (non-zero score)
-                    if momentum_score != 0.0:
-                        ticker_momentum_scores.append((ticker, momentum_score, reason))
+                    # Filter 1: Only include tickers with strong momentum (above minimum threshold)
+                    abs_momentum = abs(momentum_score)
+                    if abs_momentum < cls.min_momentum_threshold:
+                        logger.debug(
+                            f"Skipping {ticker}: momentum {momentum_score:.2f}% < "
+                            f"minimum threshold {cls.min_momentum_threshold}%"
+                        )
+                        continue
+
+                    # Filter 2: Check stock quality filters (including ADX and RSI)
+                    passes_filter, filter_reason = (
+                        await cls._passes_stock_quality_filters(
+                            ticker, market_data_response, momentum_score
+                        )
+                    )
+                    if not passes_filter:
+                        logger.debug(f"Skipping {ticker}: {filter_reason}")
+                        continue
+
+                    # Filter 3: Check cooldown period
+                    if cls._is_ticker_in_cooldown(ticker):
+                        logger.debug(
+                            f"Skipping {ticker}: still in cooldown period "
+                            f"({cls.ticker_cooldown_minutes} minutes after exit)"
+                        )
+                        continue
+
+                    # Passed all filters - add to candidates
+                    ticker_momentum_scores.append((ticker, momentum_score, reason))
+                    logger.info(
+                        f"{ticker} passed all filters: momentum={momentum_score:.2f}%, "
+                        f"{filter_reason}"
+                    )
 
                 logger.info(
                     f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers"
@@ -500,11 +710,19 @@ class MomentumTradingService:
                     f"{len(top_downward)} downward momentum tickers (top_k={cls.top_k})"
                 )
 
-                # Step 1g: Enter trades for top-k tickers
+                # Step 1g: Enter trades for top-k tickers (HIGHLY SELECTIVE - max 2 per direction)
                 for rank, (ticker, momentum_score, reason) in enumerate(
                     top_upward, start=1
                 ):
                     if not cls.running:
+                        break
+
+                    # Check daily trade limit before entering
+                    if cls._has_reached_daily_trade_limit():
+                        logger.info(
+                            f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                            f"Skipping remaining candidates."
+                        )
                         break
 
                     # Check active trade count before entering
@@ -583,13 +801,28 @@ class MomentumTradingService:
                         enter_reason=ranked_reason,
                     )
 
+                    # Increment daily trade count
+                    cls._increment_daily_trade_count()
+
                     logger.info(
-                        f"Entered momentum trade for {ticker} - {action} at {enter_price} (momentum score: {momentum_score:.2f}, rank: #{rank})"
+                        f"Entered momentum trade for {ticker} - {action} at {enter_price} "
+                        f"(momentum score: {momentum_score:.2f}, rank: #{rank}, "
+                        f"daily trades: {cls.daily_trades_count}/{cls.max_daily_trades})"
                     )
 
                 for rank, (ticker, momentum_score, reason) in enumerate(
                     top_downward, start=1
                 ):
+                    if not cls.running:
+                        break
+
+                    # Check daily trade limit before entering
+                    if cls._has_reached_daily_trade_limit():
+                        logger.info(
+                            f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                            f"Skipping remaining candidates."
+                        )
+                        break
                     if not cls.running:
                         break
 
@@ -669,12 +902,17 @@ class MomentumTradingService:
                         enter_reason=ranked_reason,
                     )
 
+                    # Increment daily trade count
+                    cls._increment_daily_trade_count()
+
                     logger.info(
-                        f"Entered momentum trade for {ticker} - {action} at {enter_price} (momentum score: {momentum_score:.2f}, rank: #{rank})"
+                        f"Entered momentum trade for {ticker} - {action} at {enter_price} "
+                        f"(momentum score: {momentum_score:.2f}, rank: #{rank}, "
+                        f"daily trades: {cls.daily_trades_count}/{cls.max_daily_trades})"
                     )
 
-                # Wait 10 seconds before next cycle
-                await asyncio.sleep(10)
+                # Wait 60 seconds before next cycle (reduced frequency)
+                await asyncio.sleep(cls.entry_cycle_seconds)
 
             except Exception as e:
                 logger.exception(f"Error in momentum entry service: {str(e)}")
@@ -715,9 +953,6 @@ class MomentumTradingService:
                 logger.info(
                     f"Monitoring {active_count}/{cls.max_active_trades} active momentum trades"
                 )
-
-                # When at capacity, be more aggressive about exiting trades
-                at_capacity = active_count >= cls.max_active_trades
 
                 for trade in active_trades:
                     if not cls.running:
@@ -770,25 +1005,25 @@ class MomentumTradingService:
                         enter_price, current_price, original_action
                     )
 
-                    # Step 2.2.1: Trailing stop loss logic
+                    # Step 2.2.1: Trailing stop loss logic (WIDER STOPS - 1.5% instead of 0.5%)
                     should_exit = False
                     exit_reason = None
 
-                    # Check 1: Exit if losing more than 0.5% from enter_price
-                    if profit_percent < -0.5:
+                    # Check 1: Exit if losing more than 1.5% from enter_price (wider stop loss)
+                    if profit_percent < cls.stop_loss_threshold:
                         should_exit = True
                         exit_reason = (
                             f"Trailing stop loss triggered: {profit_percent:.2f}% "
-                            f"(below -0.5% stop loss threshold)"
+                            f"(below {cls.stop_loss_threshold}% stop loss threshold)"
                         )
                         logger.info(
                             f"Exit signal for {ticker} - losing trade: {profit_percent:.2f}%"
                         )
 
-                    # Check 2: Exit if profit drops by 0.5% from peak (trailing stop)
+                    # Check 2: Exit if profit drops by 1.5% from peak (trailing stop - wider)
                     elif peak_profit_percent > 0:
                         drop_from_peak = peak_profit_percent - profit_percent
-                        if drop_from_peak >= 0.5:
+                        if drop_from_peak >= cls.trailing_stop_percent:
                             should_exit = True
                             exit_reason = (
                                 f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
@@ -799,29 +1034,32 @@ class MomentumTradingService:
                                 f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%"
                             )
 
-                    # Check 3: Original profit target logic (if not already exiting)
+                    # Check 3: Dynamic profit target logic (if not already exiting)
+                    # Use higher target to let winners run, avoid premature exits
                     if not should_exit:
-                        is_profitable = profit_percent >= cls.profit_threshold
+                        # Use higher profit target - let winners run to 5% before fixed exit
+                        # Primary exit mechanism is trailing stop (1.5% from peak), not fixed target
+                        # Only exit at fixed target if we've already hit a good profit
+                        profit_target_to_exit = cls.profit_target_strong_momentum  # 5%
+
+                        is_profitable = profit_percent >= profit_target_to_exit
                         if is_profitable:
                             should_exit = True
                             exit_reason = (
-                                f"Profit target reached: {profit_percent:.2f}% profit"
+                                f"Profit target reached: {profit_percent:.2f}% profit "
+                                f"(target: {profit_target_to_exit:.2f}%)"
                             )
-                        elif at_capacity and profit_percent > 0:
-                            # At capacity and trade has some profit (but below threshold)
-                            # Exit to make room for potentially better trades
-                            should_exit = True
-                            exit_reason = (
-                                f"Exiting low profit trade ({profit_percent:.2f}%) "
-                                f"at capacity to make room for better opportunities"
-                            )
+                        # REMOVED: Capacity-based low-profit exits - they're killing performance
+                        # Let trailing stops handle exits instead of exiting at 0.06-0.19% to free capacity
 
                     # Update peak profit and trailing stop if trade is still active
                     if not should_exit:
                         # Update peak profit if current profit is higher
                         if profit_percent > peak_profit_percent:
                             peak_profit_percent = profit_percent
-                            trailing_stop = 0.5  # Always maintain 0.5% trailing stop
+                            trailing_stop = (
+                                cls.trailing_stop_percent
+                            )  # Always maintain 1.5% trailing stop
 
                         # Update database with current trailing stop and peak profit
                         skipped_reason = None
@@ -944,7 +1182,12 @@ class MomentumTradingService:
 
                         # Step 2.5: Delete from DynamoDB
                         await DynamoDBClient.delete_momentum_trade(ticker)
-                        logger.info(f"Exited momentum trade for {ticker}")
+
+                        # Track exit timestamp for cooldown period
+                        cls.ticker_exit_timestamps[ticker] = datetime.now(timezone.utc)
+                        logger.info(
+                            f"Exited momentum trade for {ticker}. Cooldown period: {cls.ticker_cooldown_minutes} minutes."
+                        )
 
                 # Wait 5 seconds before next cycle
                 await asyncio.sleep(5)
