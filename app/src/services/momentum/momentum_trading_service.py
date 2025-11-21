@@ -51,7 +51,7 @@ class MomentumTradingService:
         cls.running = False
 
     @classmethod
-    def _calculate_momentum(cls, datetime_price: List[List]) -> Tuple[float, str]:
+    def _calculate_momentum(cls, datetime_price: List[Any]) -> Tuple[float, str]:
         """
         Calculate price momentum score from datetime_price array
         Returns: (momentum_score, reason)
@@ -62,8 +62,22 @@ class MomentumTradingService:
         if not datetime_price or len(datetime_price) < 3:
             return 0.0, "Insufficient price data"
 
-        # Extract prices (datetime_price is list of [datetime, price])
-        prices = [float(entry[1]) for entry in datetime_price if len(entry) >= 2]
+        # Extract prices (datetime_price can be list of [datetime, price] or list of dicts)
+        prices = []
+        for entry in datetime_price:
+            try:
+                if isinstance(entry, list):
+                    # Handle list format: [datetime, price]
+                    if len(entry) >= 2:
+                        prices.append(float(entry[1]))
+                elif isinstance(entry, dict):
+                    # Handle dict format: try common price keys
+                    price = entry.get("price") or entry.get("close") or entry.get("close_price")
+                    if price is not None:
+                        prices.append(float(price))
+            except (ValueError, TypeError, KeyError, IndexError):
+                # Skip invalid entries
+                continue
 
         if len(prices) < 3:
             return 0.0, "Insufficient price data"
