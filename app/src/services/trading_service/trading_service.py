@@ -176,11 +176,21 @@ class TradingService:
                             # Try to extract a simple momentum signal if available
                             datetime_price = technical_analysis.get("datetime_price", [])
                             if datetime_price and len(datetime_price) >= 2:
-                                prices = [
-                                    float(entry[1])
-                                    for entry in datetime_price
-                                    if len(entry) >= 2
-                                ]
+                                prices = []
+                                for entry in datetime_price:
+                                    try:
+                                        if isinstance(entry, list):
+                                            # Handle list format: [datetime, price]
+                                            if len(entry) >= 2:
+                                                prices.append(float(entry[1]))
+                                        elif isinstance(entry, dict):
+                                            # Handle dict format: try common price keys
+                                            price = entry.get("price") or entry.get("close") or entry.get("close_price")
+                                            if price is not None:
+                                                prices.append(float(price))
+                                    except (ValueError, TypeError, KeyError, IndexError):
+                                        # Skip invalid entries
+                                        continue
                                 if len(prices) >= 2:
                                     # Simple momentum: recent vs earlier price
                                     momentum_score = (
@@ -323,11 +333,21 @@ class TradingService:
                             # Try to extract a simple momentum signal if available
                             datetime_price = technical_analysis.get("datetime_price", [])
                             if datetime_price and len(datetime_price) >= 2:
-                                prices = [
-                                    float(entry[1])
-                                    for entry in datetime_price
-                                    if len(entry) >= 2
-                                ]
+                                prices = []
+                                for entry in datetime_price:
+                                    try:
+                                        if isinstance(entry, list):
+                                            # Handle list format: [datetime, price]
+                                            if len(entry) >= 2:
+                                                prices.append(float(entry[1]))
+                                        elif isinstance(entry, dict):
+                                            # Handle dict format: try common price keys
+                                            price = entry.get("price") or entry.get("close") or entry.get("close_price")
+                                            if price is not None:
+                                                prices.append(float(price))
+                                    except (ValueError, TypeError, KeyError, IndexError):
+                                        # Skip invalid entries
+                                        continue
                                 if len(prices) >= 2:
                                     # Simple momentum: recent vs earlier price
                                     momentum_score = (
