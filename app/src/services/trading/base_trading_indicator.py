@@ -136,19 +136,13 @@ class BaseTradingIndicator(ABC):
 
     @classmethod
     async def _filter_blacklisted_tickers(cls, tickers: List[str]) -> List[str]:
-        """Filter out blacklisted tickers"""
-        blacklisted_tickers = await DynamoDBClient.get_blacklisted_tickers()
-        blacklisted_set = set(blacklisted_tickers)
-
-        filtered = [t for t in tickers if t not in blacklisted_set]
-
-        if blacklisted_set:
-            logger.info(
-                f"Filtered out {len(tickers) - len(filtered)} blacklisted tickers. "
-                f"Analyzing {len(filtered)} tickers for {cls.indicator_name()}"
-            )
-
-        return filtered
+        """Return all tickers without filtering (blacklist disabled)"""
+        # Blacklist filtering is disabled - use all tickers from Alpaca
+        logger.debug(
+            f"Using all {len(tickers)} tickers from Alpaca for {cls.indicator_name()} "
+            "(blacklist filtering disabled)"
+        )
+        return tickers
 
     @classmethod
     async def _get_active_trades(cls) -> List[Dict[str, Any]]:

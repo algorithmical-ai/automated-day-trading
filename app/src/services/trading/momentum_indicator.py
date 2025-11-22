@@ -313,10 +313,6 @@ class MomentumIndicator(BaseTradingIndicator):
                     if not cls.running:
                         break
 
-                    if await DynamoDBClient.is_ticker_blacklisted(ticker):
-                        logger.debug(f"Ticker {ticker} is blacklisted, skipping")
-                        continue
-
                     if ticker in active_ticker_set:
                         logger.debug(
                             f"Ticker {ticker} already has an active momentum trade, skipping"
