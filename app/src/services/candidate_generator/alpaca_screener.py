@@ -208,7 +208,7 @@ class AlpacaScreenerService(metaclass=SingletonMeta):
                     f"This might indicate the market is closed or API issue."
                 )
             else:
-                logger.info(
+                logger.debug(
                     f"✅ Updated screener cache: {len(most_actives)} most actives, "
                     f"{len(gainers)} gainers, {len(losers)} losers "
                     f"(total unique: {len(all_screened)})"
@@ -239,7 +239,7 @@ class AlpacaScreenerService(metaclass=SingletonMeta):
         await self._update_cache()
         # Start background task
         self._update_task = asyncio.create_task(self._background_cache_updater())
-        logger.info("🚀 Started background screener cache updater (updates every 10 seconds)")
+        logger.debug("🚀 Started background screener cache updater (updates every 10 seconds)")
 
     async def stop_background_updates(self):
         """Stop the background cache updater"""
@@ -253,7 +253,7 @@ class AlpacaScreenerService(metaclass=SingletonMeta):
                 await self._update_task
             except asyncio.CancelledError:
                 pass
-        logger.info("Stopped background screener cache updater")
+        logger.debug("Stopped background screener cache updater")
 
     async def get_all_screened_tickers(self) -> Dict[str, Set[str]]:
         """
@@ -279,7 +279,7 @@ class AlpacaScreenerService(metaclass=SingletonMeta):
 
         # If cache is empty, trigger an immediate update
         if cache_empty:
-            logger.info("Cache is empty, triggering immediate screener data fetch...")
+            logger.debug("Cache is empty, triggering immediate screener data fetch...")
             await self._update_cache()
 
         async with self._cache_lock:
