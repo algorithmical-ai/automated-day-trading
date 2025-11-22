@@ -239,11 +239,16 @@ class DynamoDBClient:
             return False
 
     @classmethod
-    async def get_all_momentum_trades(cls) -> List[Dict[str, Any]]:
-        """Get all active momentum trades from ActiveTickersForAutomatedDayTrader table"""
+    async def get_all_momentum_trades(cls, indicator: str) -> List[Dict[str, Any]]:
+        """Get all active momentum trades from ActiveTickersForAutomatedDayTrader table filtered by indicator"""
         try:
             cls._ensure_tables()
-            response = cls._momentum_table.scan()
+            # Use FilterExpression to filter by indicator
+            response = cls._momentum_table.scan(
+                FilterExpression="#ind = :ind",
+                ExpressionAttributeNames={"#ind": "indicator"},
+                ExpressionAttributeValues={":ind": indicator},
+            )
             trades = []
             for item in response.get("Items", []):
                 # Convert Decimal back to float
@@ -255,12 +260,25 @@ class DynamoDBClient:
             return []
 
     @classmethod
-    async def delete_momentum_trade(cls, ticker: str) -> bool:
+    async def delete_momentum_trade(cls, ticker: str, indicator: str) -> bool:
         """Delete a momentum trade from ActiveTickersForAutomatedDayTrader table"""
         try:
             cls._ensure_tables()
+            # First verify the indicator matches
+            response = cls._momentum_table.get_item(Key={"ticker": ticker})
+            if "Item" not in response:
+                logger.warning(f"Momentum trade not found for ticker: {ticker}")
+                return False
+            
+            item_indicator = response["Item"].get("indicator")
+            if item_indicator != indicator:
+                logger.warning(
+                    f"Indicator mismatch for {ticker}: expected {indicator}, got {item_indicator}"
+                )
+                return False
+            
             cls._momentum_table.delete_item(Key={"ticker": ticker})
-            logger.info(f"Deleted momentum trade from DynamoDB: {ticker}")
+            logger.info(f"Deleted momentum trade from DynamoDB: {ticker} (indicator: {indicator})")
             return True
         except Exception as e:
             logger.error(f"Error deleting momentum trade from DynamoDB: {str(e)}")
@@ -268,11 +286,24 @@ class DynamoDBClient:
 
     @classmethod
     async def update_momentum_trade_skip_reason(
-        cls, ticker: str, skipped_exit_reason: str
+        cls, ticker: str, indicator: str, skipped_exit_reason: str
     ) -> bool:
         """Update a momentum trade with skipped exit reason and updated_at timestamp in EST"""
         try:
             cls._ensure_tables()
+            # First verify the indicator matches
+            response = cls._momentum_table.get_item(Key={"ticker": ticker})
+            if "Item" not in response:
+                logger.warning(f"Momentum trade not found for ticker: {ticker}")
+                return False
+            
+            item_indicator = response["Item"].get("indicator")
+            if item_indicator != indicator:
+                logger.warning(
+                    f"Indicator mismatch for {ticker}: expected {indicator}, got {item_indicator}"
+                )
+                return False
+            
             # Get EST timezone
             est_tz = pytz.timezone("US/Eastern")
             # Get current time in EST
@@ -291,7 +322,7 @@ class DynamoDBClient:
                 ExpressionAttributeValues=expression_values,
             )
             logger.debug(
-                f"Updated momentum trade skip reason for {ticker}: {skipped_exit_reason}"
+                f"Updated momentum trade skip reason for {ticker} (indicator: {indicator}): {skipped_exit_reason}"
             )
             return True
         except Exception as e:
@@ -304,6 +335,7 @@ class DynamoDBClient:
     async def update_momentum_trade_trailing_stop(
         cls,
         ticker: str,
+        indicator: str,
         trailing_stop: float,
         peak_profit_percent: float,
         skipped_exit_reason: Optional[str] = None,
@@ -311,6 +343,19 @@ class DynamoDBClient:
         """Update a momentum trade with trailing stop, peak profit, and optionally skipped exit reason"""
         try:
             cls._ensure_tables()
+            # First verify the indicator matches
+            response = cls._momentum_table.get_item(Key={"ticker": ticker})
+            if "Item" not in response:
+                logger.warning(f"Momentum trade not found for ticker: {ticker}")
+                return False
+            
+            item_indicator = response["Item"].get("indicator")
+            if item_indicator != indicator:
+                logger.warning(
+                    f"Indicator mismatch for {ticker}: expected {indicator}, got {item_indicator}"
+                )
+                return False
+            
             # Get EST timezone
             est_tz = pytz.timezone("US/Eastern")
             # Get current time in EST
@@ -336,7 +381,7 @@ class DynamoDBClient:
                 ExpressionAttributeValues=expression_values,
             )
             logger.debug(
-                f"Updated trailing stop for {ticker}: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%"
+                f"Updated trailing stop for {ticker} (indicator: {indicator}): {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%"
             )
             return True
         except Exception as e:

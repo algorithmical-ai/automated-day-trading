@@ -4,11 +4,9 @@ Main entry point for the Heroku worker process
 """
 
 import asyncio
-import os
 import signal
 import sys
 from app.src.common.loguru_logger import logger
-from app.src.services.trading_service.trading_service import TradingService
 from app.src.services.momentum.momentum_trading_service import MomentumTradingService
 from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
 from app.src.config.constants import MOMENTUM_TOP_K, MCP_SERVER_TRANSPORT
@@ -20,7 +18,6 @@ def setup_signal_handlers():
 
     def signal_handler(sig, frame):
         logger.info("Received shutdown signal, stopping services...")
-        TradingService.stop()
         MomentumTradingService.stop()
         ToolDiscoveryService.stop()
         sys.exit(0)
@@ -48,9 +45,6 @@ async def main():
     # Initialize tool discovery service
     ToolDiscoveryService.configure(refresh_interval=300)
 
-    # Initialize trading service with tool discovery
-    TradingService.configure(tool_discovery_cls=ToolDiscoveryService)
-
     # Initialize momentum trading service with tool discovery and top_k configuration
     MomentumTradingService.configure(
         tool_discovery_cls=ToolDiscoveryService, top_k=MOMENTUM_TOP_K
@@ -67,7 +61,6 @@ async def main():
         # Prepare tasks list
         tasks = [
             ToolDiscoveryService.discovery_job(),
-            # TradingService.run(),
             MomentumTradingService.run(),
         ]
         
@@ -81,7 +74,6 @@ async def main():
     except Exception as e:
         logger.exception(f"Fatal error in application: {str(e)}")
         ToolDiscoveryService.stop()
-        TradingService.stop()
         MomentumTradingService.stop()
         sys.exit(1)
 

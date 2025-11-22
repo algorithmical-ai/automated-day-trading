@@ -1,4 +1,0 @@
-"""
-Automated Day Trading Application
-"""
-

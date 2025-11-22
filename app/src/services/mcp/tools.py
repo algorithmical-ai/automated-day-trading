@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 from app.src.common.loguru_logger import logger
 from app.src.services.mcp.clients import MarketDataClient
+from app.src.services.webhook.send_signal import send_signal_to_webhook
 
 
 async def list_discovered_tools(tool_registry: Any) -> Dict[str, Any]:
@@ -68,9 +69,71 @@ def register_tools(
     #     return {"result": "value"}
 
     @app.tool()
-    async def get_market_clock() -> Dict[str, Any]:
-        """Get the current market clock."""
-        # Implementation here
-        return await market_client.get_market_clock()
+    async def send_webhook_signal(
+            ticker: str,
+            action: str,
+            indicator: str,
+            enter_reason: str = "",
+            is_golden_exception: bool = False,
+            portfolio_allocation_percent: float | None = None,
+        ) -> dict[str, Any]:
+        """
+            Send a trading signal to configured webhook(s).
+            This allows external applications to send their own signals using their own indicators.
+
+            Args:
+                ticker: Stock ticker symbol (e.g., AAPL, MSFT)
+                action: Trading action - must be one of:
+                    - "BUY_TO_OPEN" (open long position)
+                    - "SELL_TO_OPEN" (open short position)
+                    - "BUY_TO_CLOSE" (close short position)
+                    - "SELL_TO_CLOSE" (close long position)
+                indicator: Name/identifier of the indicator/strategy sending the signal
+                enter_reason: Optional reason for entry (used for BUY_TO_OPEN/SELL_TO_OPEN)
+                is_golden_exception: Optional flag indicating if this is a golden/exceptional entry
+                portfolio_allocation_percent: Optional portfolio allocation percentage (0.0 to 1.0)
+
+            Returns:
+                Dict containing success status and message
+
+            Raises:
+                ValueError: If ticker, action, or indicator is invalid
+            """
+        ticker = ticker.upper()
+        action = action.upper().strip()
+        indicator = indicator.strip()
+
+        logger.debug(
+                f"send_webhook_signal tool called for ticker: {ticker}, " f"action: {action}, indicator: {indicator}"
+            )
+
+        try:
+            # Call the webhook signal sender
+            await send_signal_to_webhook(
+                    ticker=ticker,
+                    action=action,
+                    indicator=indicator,
+                    enter_reason=enter_reason,
+                    is_golden_exception=is_golden_exception,
+                    portfolio_allocation_percent=portfolio_allocation_percent,
+                )
+
+            return {
+                    "success": True,
+                    "ticker": ticker,
+                    "action": action,
+                    "indicator": indicator,
+                    "message": f"Signal sent successfully for {ticker} {action}",
+                }
+
+        except ValueError as e:
+            logger.error(f"Validation error sending signal: {str(e)}", exc_info=True)
+            raise ValueError(f"Invalid signal parameters: {str(e)}") from e
+        except Exception as e:
+            logger.error(
+                    f"Error sending webhook signal for {ticker} {action}: {str(e)}",
+                    exc_info=True,
+                )
+            raise ValueError(f"Error sending webhook signal: {str(e)}") from e
 
     logger.info("Registered MCP tools")
