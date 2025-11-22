@@ -518,7 +518,7 @@ class MomentumTradingService:
 
                 # Step 1b: Check if market is open
                 if not is_open:
-                    logger.info("Market is closed, skipping momentum entry logic")
+                    logger.debug("Market is closed, skipping momentum entry logic")
                     await asyncio.sleep(cls.entry_cycle_seconds)
                     continue
 
@@ -917,7 +917,7 @@ class MomentumTradingService:
                 is_open = clock.get("is_open", False)
 
                 if not is_open:
-                    logger.info("Market is closed, skipping momentum exit logic")
+                    logger.debug("Market is closed, skipping momentum exit logic")
                     await asyncio.sleep(5)
                     continue
 
