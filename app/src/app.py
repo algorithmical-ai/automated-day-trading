@@ -53,9 +53,10 @@ async def main():
     # Setup signal handlers
     setup_signal_handlers()
 
-    # Check if MCP server should be started
-    # Only start MCP server if transport is not stdio (which needs stdin/stdout)
-    start_mcp_server = MCP_SERVER_TRANSPORT in ("sse", "streamable-http")
+    # MCP server is now running as a separate web process on Heroku
+    # Only start MCP server in worker if explicitly needed (e.g., for local development)
+    # For Heroku, the web process handles MCP server via app.src.web
+    start_mcp_server = False  # Disabled - web process handles MCP server
     
     try:
         # Prepare tasks list
@@ -64,10 +65,12 @@ async def main():
             MomentumTradingService.run(),
         ]
         
-        # Add MCP server task if applicable
+        # Add MCP server task if applicable (typically only for local dev)
         if start_mcp_server:
             tasks.append(_run_mcp_server())
             logger.info(f"MCP server will start with transport: {MCP_SERVER_TRANSPORT}")
+        else:
+            logger.info("MCP server is running as separate web process (not in worker)")
         
         # Run all services concurrently
         await asyncio.gather(*tasks)
