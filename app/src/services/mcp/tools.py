@@ -6,29 +6,12 @@ Add new tools here to expose them via the MCP server.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from app.src.common.loguru_logger import logger
 from app.src.services.mcp.clients import MarketDataClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.market_data.market_data_service import MarketDataService
-
-
-async def list_discovered_tools(tool_registry: Any) -> Dict[str, Any]:
-    """
-    List all discovered tools from upstream MCP servers.
-
-    Args:
-        tool_registry: The tool registry instance to query
-
-    Returns:
-        Dictionary containing tools grouped by source
-    """
-    snapshot = await tool_registry.snapshot()
-    if not snapshot:
-        # If no tools discovered yet, return empty result
-        return {"sources": {}}
-    return {"sources": snapshot}
 
 
 def register_tools(
@@ -47,19 +30,6 @@ def register_tools(
         tool_registry: Tool registry instance
         market_client: Optional market data client for tool implementations
     """
-
-    @app.tool()
-    async def list_tools() -> Dict[str, Any]:
-        """
-        List all discovered tools from upstream MCP servers.
-
-        This tool allows clients to discover what tools are available
-        from connected MCP servers.
-
-        Returns:
-            Dictionary with 'sources' key containing tools grouped by source name
-        """
-        return await list_discovered_tools(tool_registry)
 
     # Add more tools here as needed
     # Example:
