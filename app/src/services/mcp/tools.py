@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from app.src.common.loguru_logger import logger
+from app.src.services.candidate_generator.alpaca_screener import AlpacaScreenerService
 from app.src.services.mcp.clients import MarketDataClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.market_data.market_data_service import MarketDataService
@@ -229,4 +230,39 @@ def register_tools(
                 f"Error analyzing ticker {ticker} for {action}: {str(e)}"
             ) from e
 
+    @app.tool()
+    async def get_alpaca_screened_tickers() -> dict[str, Any]:
+        """
+        Get all screened tickers from Alpaca (most actives, gainers, losers).
+        This provides the current market movers that could be used for placing trades.
+
+        Returns:
+            Dict containing:
+                - most_actives: List of most active ticker symbols
+                - gainers: List of top gaining ticker symbols
+                - losers: List of top losing ticker symbols
+                - all: Combined list of all screened tickers (unique)
+        """
+        logger.debug("get_alpaca_screened_tickers tool called")
+
+        try:
+            screened_data = await AlpacaScreenerService().get_all_screened_tickers()
+
+            # Convert sets to sorted lists for JSON serialization
+            return {
+                "most_actives": sorted(list(screened_data.get("most_actives", set()))),
+                "gainers": sorted(list(screened_data.get("gainers", set()))),
+                "losers": sorted(list(screened_data.get("losers", set()))),
+                "all": sorted(list(screened_data.get("all", set()))),
+                "count": {
+                    "most_actives": len(screened_data.get("most_actives", set())),
+                    "gainers": len(screened_data.get("gainers", set())),
+                    "losers": len(screened_data.get("losers", set())),
+                    "all": len(screened_data.get("all", set())),
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error getting screened tickers: {str(e)}", exc_info=True)
+            raise ValueError(f"Error fetching screened tickers: {str(e)}") from e
+            
     logger.info("Registered MCP tools")
