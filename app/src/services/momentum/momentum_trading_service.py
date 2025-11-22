@@ -8,6 +8,7 @@ from datetime import datetime, date, timezone
 from app.src.common.loguru_logger import logger
 from app.src.services.mcp.mcp_client import MCPClient
 from app.src.db.dynamodb_client import DynamoDBClient
+from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
 from app.src.services.mab.mab_service import MABService
 from app.src.config.constants import (
@@ -27,8 +28,8 @@ class MomentumTradingService:
     # New: Minimum momentum threshold - only trade strong momentum
     min_momentum_threshold: float = 3.0  # Only trade if |momentum| >= 3%
     # New: Stock quality filters
-    min_stock_price: float = 1.0  # Minimum stock price $1.00
-    min_daily_volume: int = 100000  # Minimum daily volume (100k shares)
+    # min_stock_price: float = 1.0  # Minimum stock price $1.00
+    min_daily_volume: int = 1000  # Minimum daily volume (100k shares)
     # New: Daily trade limits
     max_daily_trades: int = 5  # Maximum 5 trades per day total
     # New: Cooldown periods
@@ -46,7 +47,7 @@ class MomentumTradingService:
     # New: Let winners run - higher profit target for strong momentum
     profit_target_strong_momentum: float = 5.0  # 5% target for strong momentum (>5%)
     # New: Cycle time (check less frequently)
-    entry_cycle_seconds: int = 60  # Check every 60 seconds (increased from 10)
+    entry_cycle_seconds: int = 5  # Check every 5 seconds
 
     tool_discovery_cls: Optional[type] = ToolDiscoveryService
     indicator_name: str = "Momentum Trading"
@@ -162,15 +163,15 @@ class MomentumTradingService:
         technical_analysis = market_data.get("technical_analysis", {})
         current_price = technical_analysis.get("close_price", 0.0)
 
-        # Filter 2: Minimum stock price
-        if current_price <= 0:
-            return False, f"Invalid price data for {ticker}"
+        # # Filter 2: Minimum stock price
+        # if current_price <= 0:
+        #     return False, f"Invalid price data for {ticker}"
 
-        if current_price < cls.min_stock_price:
-            return (
-                False,
-                f"Price too low: ${current_price:.2f} < ${cls.min_stock_price} minimum",
-            )
+        # if current_price < cls.min_stock_price:
+        #     return (
+        #         False,
+        #         f"Price too low: ${current_price:.2f} < ${cls.min_stock_price} minimum",
+        #     )
 
         # Filter 3: Minimum volume
         volume = technical_analysis.get("volume", 0)
@@ -366,7 +367,7 @@ class MomentumTradingService:
         Preempt (exit) a low profitable trade to make room for a new exceptional trade
         Returns True if preemption was successful, False otherwise
         """
-        active_trades = await DynamoDBClient.get_all_momentum_trades()
+        active_trades = await DynamoDBClient.get_all_momentum_trades(cls.indicator_name)
 
         if len(active_trades) < cls.max_active_trades:
             return False  # No need to preempt
@@ -416,19 +417,12 @@ class MomentumTradingService:
 
         # Send webhook signal
         reason = f"Preempted for exceptional trade: {lowest_profit:.2f}% profit"
-        webhook_response = await MCPClient.send_webhook_signal(
+        await send_signal_to_webhook(
             ticker=ticker_to_exit,
             action=exit_action,
             indicator=indicator,
             enter_reason=reason,
         )
-
-        if webhook_response:
-            logger.info(
-                f"Webhook signal sent for preempted {ticker_to_exit} - {exit_action}"
-            )
-        else:
-            logger.warning(f"Failed to send webhook signal for {ticker_to_exit}")
 
         # Record MAB reward
         profit_percent = cls._calculate_profit_percent(
@@ -502,7 +496,7 @@ class MomentumTradingService:
         )
 
         # Delete from DynamoDB
-        await DynamoDBClient.delete_momentum_trade(ticker_to_exit)
+        await DynamoDBClient.delete_momentum_trade(ticker_to_exit, indicator)
         logger.info(f"Preempted and exited trade for {ticker_to_exit}")
         return True
 
@@ -587,7 +581,7 @@ class MomentumTradingService:
                     )
 
                 # Step 1d: Get active trades to filter out tickers that already have trades
-                active_trades = await DynamoDBClient.get_all_momentum_trades()
+                active_trades = await DynamoDBClient.get_all_momentum_trades(cls.indicator_name)
                 active_count = len(active_trades)
                 active_ticker_set = {
                     trade.get("ticker")
@@ -726,7 +720,7 @@ class MomentumTradingService:
                         break
 
                     # Check active trade count before entering
-                    active_trades = await DynamoDBClient.get_all_momentum_trades()
+                    active_trades = await DynamoDBClient.get_all_momentum_trades(cls.indicator_name)
                     active_count = len(active_trades)
 
                     # If at max capacity, check if we can preempt
@@ -778,19 +772,12 @@ class MomentumTradingService:
                     # Send webhook signal
                     indicator = cls.indicator_name
                     ranked_reason = f"{reason} (ranked #{rank} upward momentum)"
-                    webhook_response = await MCPClient.send_webhook_signal(
+                    await send_signal_to_webhook(
                         ticker=ticker,
                         action=action,
                         indicator=indicator,
                         enter_reason=ranked_reason,
                     )
-
-                    if webhook_response:
-                        logger.info(
-                            f"Webhook signal sent for {ticker} - {action} (momentum score: {momentum_score:.2f}, rank: #{rank})"
-                        )
-                    else:
-                        logger.warning(f"Failed to send webhook signal for {ticker}")
 
                     # Add to DynamoDB
                     await DynamoDBClient.add_momentum_trade(
@@ -827,7 +814,7 @@ class MomentumTradingService:
                         break
 
                     # Check active trade count before entering
-                    active_trades = await DynamoDBClient.get_all_momentum_trades()
+                    active_trades = await DynamoDBClient.get_all_momentum_trades(cls.indicator_name)
                     active_count = len(active_trades)
 
                     # If at max capacity, check if we can preempt
@@ -879,19 +866,12 @@ class MomentumTradingService:
                     # Send webhook signal
                     indicator = cls.indicator_name
                     ranked_reason = f"{reason} (ranked #{rank} downward momentum)"
-                    webhook_response = await MCPClient.send_webhook_signal(
+                    await send_signal_to_webhook(
                         ticker=ticker,
                         action=action,
                         indicator=indicator,
                         enter_reason=ranked_reason,
                     )
-
-                    if webhook_response:
-                        logger.info(
-                            f"Webhook signal sent for {ticker} - {action} (momentum score: {momentum_score:.2f}, rank: #{rank})"
-                        )
-                    else:
-                        logger.warning(f"Failed to send webhook signal for {ticker}")
 
                     # Add to DynamoDB
                     await DynamoDBClient.add_momentum_trade(
@@ -942,7 +922,7 @@ class MomentumTradingService:
                     continue
 
                 # Step 2: Get all active momentum trades from DynamoDB
-                active_trades = await DynamoDBClient.get_all_momentum_trades()
+                active_trades = await DynamoDBClient.get_all_momentum_trades(cls.indicator_name)
 
                 if not active_trades:
                     logger.debug("No active momentum trades to monitor")
@@ -1081,6 +1061,7 @@ class MomentumTradingService:
 
                         await DynamoDBClient.update_momentum_trade_trailing_stop(
                             ticker=ticker,
+                            indicator=indicator,
                             trailing_stop=trailing_stop,
                             peak_profit_percent=peak_profit_percent,
                             skipped_exit_reason=skipped_reason,
@@ -1096,21 +1077,12 @@ class MomentumTradingService:
                         reason = exit_reason
 
                         # Step 2.3: Send webhook signal
-                        webhook_response = await MCPClient.send_webhook_signal(
+                        await send_signal_to_webhook(
                             ticker=ticker,
                             action=exit_action,
                             indicator=indicator,
                             enter_reason=reason,
                         )
-
-                        if webhook_response:
-                            logger.info(
-                                f"Webhook signal sent for {ticker} - {exit_action}"
-                            )
-                        else:
-                            logger.warning(
-                                f"Failed to send webhook signal for {ticker}"
-                            )
 
                         # Step 2.4: Record MAB reward (profit/loss)
                         context = {
@@ -1181,7 +1153,7 @@ class MomentumTradingService:
                         )
 
                         # Step 2.5: Delete from DynamoDB
-                        await DynamoDBClient.delete_momentum_trade(ticker)
+                        await DynamoDBClient.delete_momentum_trade(ticker, indicator)
 
                         # Track exit timestamp for cooldown period
                         cls.ticker_exit_timestamps[ticker] = datetime.now(timezone.utc)
