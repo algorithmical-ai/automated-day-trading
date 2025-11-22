@@ -9,6 +9,7 @@ import sys
 from app.src.common.loguru_logger import logger
 from app.src.services.momentum.momentum_trading_service import MomentumTradingService
 from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
+from app.src.services.candidate_generator.screener_monitor_service import ScreenerMonitorService
 from app.src.config.constants import MOMENTUM_TOP_K, MCP_SERVER_TRANSPORT
 from app.src.services.mcp.server import main as mcp_server_main
 
@@ -20,6 +21,7 @@ def setup_signal_handlers():
         logger.info("Received shutdown signal, stopping services...")
         MomentumTradingService.stop()
         ToolDiscoveryService.stop()
+        ScreenerMonitorService().stop()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -63,6 +65,7 @@ async def main():
         tasks = [
             ToolDiscoveryService.discovery_job(),
             MomentumTradingService.run(),
+            ScreenerMonitorService().start(),
         ]
         
         # Add MCP server task if applicable (typically only for local dev)
@@ -78,6 +81,7 @@ async def main():
         logger.exception(f"Fatal error in application: {str(e)}")
         ToolDiscoveryService.stop()
         MomentumTradingService.stop()
+        ScreenerMonitorService().stop()
         sys.exit(1)
 
 

@@ -2,6 +2,7 @@
 DynamoDB Client for managing active trades
 """
 
+from typing_extensions import Set
 import boto3
 import json
 from typing import Optional, Dict, Any, List
@@ -31,7 +32,8 @@ TICKER_BLACKLIST_TABLE_NAME = "TickerBlackList"
 MAB_TABLE_NAME = "MABForDayTradingService"
 # Completed trades table
 COMPLETED_TRADES_TABLE_NAME = "CompletedTradesForAutomatedDayTrading"
-
+# Inactive tickers table
+INACTIVE_TICKERS_TABLE_NAME = "InactiveTickers"
 
 class DynamoDBClient:
     """Client for DynamoDB operations"""
@@ -42,7 +44,13 @@ class DynamoDBClient:
     _blacklist_table = None
     _mab_table = None
     _completed_trades_table = None
-
+    _inactive_tickers_table = None
+    
+    @classmethod
+    def configure(cls):
+        """Configure and pre-initialize DynamoDB client resources"""
+        cls._ensure_tables()
+    
     @classmethod
     def _ensure_tables(cls):
         if cls._table:
@@ -61,16 +69,9 @@ class DynamoDBClient:
         cls._table = cls._dynamodb.Table(DYNAMODB_TABLE_NAME)
         cls._momentum_table = cls._dynamodb.Table(MOMENTUM_TRADING_TABLE_NAME)
         cls._blacklist_table = cls._dynamodb.Table(TICKER_BLACKLIST_TABLE_NAME)
-        cls._mab_table = cls._dynamodb.Table(MAB_TABLE_NAME)
+        cls._mab_table = cls._dynamodb.Table(MAB_TABLE_NAME)    
         cls._completed_trades_table = cls._dynamodb.Table(COMPLETED_TRADES_TABLE_NAME)
-
-    @classmethod
-    def configure(cls, **kwargs):
-        """
-        Optional configuration hook. Currently acts as a no-op but ensures
-        resources are initialized eagerly when invoked.
-        """
-        cls._ensure_tables()
+        cls._inactive_tickers_table = cls._dynamodb.Table(INACTIVE_TICKERS_TABLE_NAME)
 
     @classmethod
     def _is_float_type(cls, obj):
@@ -777,3 +778,88 @@ class DynamoDBClient:
                 f"Error adding completed trade for {ticker} to CompletedTradesForAutomatedDayTrading: {str(e)}"
             )
             return False
+
+    @classmethod
+    async def ticker_exists_in_inactive(cls, ticker: str) -> bool:
+        """
+        Check if a ticker exists in InactiveTickers table
+
+        Args:
+            ticker: Ticker symbol
+
+        Returns:
+            True if ticker exists, False otherwise
+        """
+        try:
+            cls._ensure_tables()
+            response = cls._inactive_tickers_table.get_item(
+                Key={"ticker": ticker},
+            )
+            return response.get("Item") is not None
+        except Exception as e:
+            logger.error(f"Error checking ticker in InactiveTickers: {str(e)}")
+            return False
+
+    @classmethod
+    async def add_ticker_to_inactive(cls, ticker: str, reason: str = "Auto-added from Alpaca screener (most actives/movers)") -> bool:
+        """
+        Add a ticker to InactiveTickers table if it doesn't exist
+
+        Args:
+            ticker: Ticker symbol
+            reason: Reason for adding the ticker
+
+        Returns:
+            True if ticker was added, False if it already exists or error occurred
+        """
+        try:
+            # Check if ticker already exists
+            if await cls.ticker_exists_in_inactive(ticker):
+                logger.debug(f"Ticker {ticker.upper()} already exists in InactiveTickers")
+                return False
+
+            # Add ticker with minimal structure
+            # Set TTL to 30 days from now (optional, can be removed if TTL not needed)
+            from datetime import datetime, timedelta
+
+            # Use EST timezone for timestamps (NYSE trading timezone)
+            est_tz = pytz.timezone("America/New_York")
+            last_updated_est = datetime.now(est_tz).isoformat()
+            ttl_timestamp = int((datetime.now(est_tz) + timedelta(days=30)).timestamp())
+
+            item = {
+                "ticker": ticker,
+                "reason": reason,
+                "last_updated": last_updated_est,
+                "ttl": ttl_timestamp,
+                # Add minimal details structure to match expected format
+                "details": {
+                        "checks": {},
+                        "conditions_met": "0/5",
+                        "trend_analysis": { # noqa: C0301
+                                "description": "Auto-added from screener",
+                                "favorable": False,
+                                "strength": 0.0,
+                            } # noqa: C0301
+                },
+            }
+
+            cls._ensure_tables()
+            cls._inactive_tickers_table.put_item(Item=item)
+            logger.debug(f"Added ticker {ticker} to InactiveTickers: {reason}")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding ticker to InactiveTickers: {str(e)}")
+            return False
+        
+    @classmethod
+    async def get_all_inactive_tickers(cls) -> List[str]:
+        """Get all inactive tickers from InactiveTickers table"""
+        try:
+            cls._ensure_tables()
+            response = cls._inactive_tickers_table.scan()
+            tickers = [item.get("ticker") for item in response.get("Items", []) if item.get("ticker")]
+            return tickers
+        except Exception as e:
+            logger.error(f"Error getting all inactive tickers from DynamoDB: {str(e)}")
+            return []
