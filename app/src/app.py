@@ -7,9 +7,11 @@ import asyncio
 import signal
 import sys
 from app.src.common.loguru_logger import logger
-from app.src.services.momentum.momentum_trading_service import MomentumTradingService
+from app.src.services.trading.trading_service import TradingService
 from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
-from app.src.services.candidate_generator.screener_monitor_service import ScreenerMonitorService
+from app.src.services.candidate_generator.screener_monitor_service import (
+    ScreenerMonitorService,
+)
 from app.src.config.constants import MOMENTUM_TOP_K, MCP_SERVER_TRANSPORT
 from app.src.services.mcp.server import main as mcp_server_main
 
@@ -19,7 +21,7 @@ def setup_signal_handlers():
 
     def signal_handler(sig, frame):
         logger.info("Received shutdown signal, stopping services...")
-        MomentumTradingService.stop()
+        TradingService.stop()
         ToolDiscoveryService.stop()
         ScreenerMonitorService().stop()
         sys.exit(0)
@@ -48,7 +50,7 @@ async def main():
     ToolDiscoveryService.configure(refresh_interval=300)
 
     # Initialize momentum trading service with tool discovery and top_k configuration
-    MomentumTradingService.configure(
+    TradingService.configure(
         tool_discovery_cls=ToolDiscoveryService, top_k=MOMENTUM_TOP_K
     )
 
@@ -59,28 +61,28 @@ async def main():
     # Only start MCP server in worker if explicitly needed (e.g., for local development)
     # For Heroku, the web process handles MCP server via app.src.web
     start_mcp_server = False  # Disabled - web process handles MCP server
-    
+
     try:
         # Prepare tasks list
         tasks = [
             ToolDiscoveryService.discovery_job(),
-            MomentumTradingService.run(),
+            TradingService.run(),
             ScreenerMonitorService().start(),
         ]
-        
+
         # Add MCP server task if applicable (typically only for local dev)
         if start_mcp_server:
             tasks.append(_run_mcp_server())
             logger.info(f"MCP server will start with transport: {MCP_SERVER_TRANSPORT}")
         else:
             logger.info("MCP server is running as separate web process (not in worker)")
-        
+
         # Run all services concurrently
         await asyncio.gather(*tasks)
     except Exception as e:
         logger.exception(f"Fatal error in application: {str(e)}")
         ToolDiscoveryService.stop()
-        MomentumTradingService.stop()
+        TradingService.stop()
         ScreenerMonitorService().stop()
         sys.exit(1)
 
