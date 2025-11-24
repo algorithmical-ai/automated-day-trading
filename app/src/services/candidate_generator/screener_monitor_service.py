@@ -138,8 +138,25 @@ class ScreenerMonitorService(metaclass=SingletonMeta):
         logger.info("Starting ScreenerMonitorService...")
         self._running = True
 
-        # Initial check
-        await self._check_and_add_tickers()
+        # Initial check (only if market is open)
+        try:
+            clock_response = await MCPClient.get_market_clock()
+            if clock_response:
+                clock = clock_response.get("clock", {})
+                is_open = clock.get("is_open", False)
+                if is_open:
+                    await self._check_and_add_tickers()
+                else:
+                    next_open = clock.get("next_open")
+                    logger.info(
+                        f"⏸️  Market closed. Skipping initial screener check. Next open: {next_open}"
+                    )
+        except Exception as e:
+            logger.warning(
+                f"Could not retrieve market clock for initial check, proceeding cautiously: {e}"
+            )
+            # Proceed with initial check if we can't determine market status
+            await self._check_and_add_tickers()
 
         # Periodic checks
         while self._running:

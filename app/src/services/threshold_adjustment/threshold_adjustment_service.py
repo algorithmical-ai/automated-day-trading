@@ -12,6 +12,7 @@ from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.bedrock.bedrock_client import BedrockClient
 from app.src.services.trading.momentum_indicator import MomentumIndicator
 from app.src.services.trading.deep_analyzer_indicator import DeepAnalyzerIndicator
+from app.src.services.mcp.mcp_client import MCPClient
 
 
 class ThresholdAdjustmentService:
@@ -48,6 +49,26 @@ class ThresholdAdjustmentService:
         """Main service loop"""
         while cls.running:
             try:
+                # Check market open status before running analysis
+                try:
+                    clock_response = await MCPClient.get_market_clock()
+                    if clock_response:
+                        clock = clock_response.get("clock", {})
+                        is_open = clock.get("is_open", False)
+                        if not is_open:
+                            next_open = clock.get("next_open")
+                            logger.debug(
+                                f"⏸️  Market closed. Skipping threshold adjustment. Next open: {next_open}"
+                            )
+                            # Sleep for a shorter interval when market is closed (check every 5 minutes)
+                            await asyncio.sleep(cls.analysis_interval_seconds)
+                            continue
+                except Exception as e:
+                    logger.warning(
+                        f"Could not retrieve market clock, proceeding cautiously: {e}"
+                    )
+                    # Proceed with analysis if we can't determine market status
+
                 await cls._analyze_and_adjust_thresholds()
                 await asyncio.sleep(cls.analysis_interval_seconds)
             except asyncio.CancelledError:
