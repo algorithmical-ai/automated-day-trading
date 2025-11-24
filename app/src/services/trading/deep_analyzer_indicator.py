@@ -189,11 +189,8 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
         all_tickers = await cls._get_screened_tickers()
         if not all_tickers:
             logger.warning("Failed to get screened tickers, skipping this cycle")
-            await asyncio.sleep(10)
+            await asyncio.sleep(2)
             return
-
-        # Filter blacklisted tickers
-        filtered_tickers = await cls._filter_blacklisted_tickers(all_tickers)
 
         # Get active trades
         active_trades = await cls._get_active_trades()
@@ -205,8 +202,9 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
         # Filter out tickers that are already active or in cooldown before fetching market data
         candidates_to_fetch = [
             ticker
-            for ticker in filtered_tickers
-            if ticker not in active_ticker_set and not cls._is_ticker_in_cooldown(ticker)
+            for ticker in all_tickers
+            if ticker not in active_ticker_set
+            and not cls._is_ticker_in_cooldown(ticker)
         ]
 
         logger.info(
@@ -215,7 +213,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
 
         # Fetch market data in parallel batches
         market_data_dict = await cls._fetch_market_data_batch(
-            candidates_to_fetch, max_concurrent=10
+            candidates_to_fetch, max_concurrent=100
         )
 
         # Evaluate all tickers for entry

@@ -132,15 +132,6 @@ class BaseTradingIndicator(ABC):
         # Combine all unique tickers
         return list(set(most_actives + gainers + losers))
 
-    @classmethod
-    async def _filter_blacklisted_tickers(cls, tickers: List[str]) -> List[str]:
-        """Return all tickers without filtering (blacklist disabled)"""
-        # Blacklist filtering is disabled - use all tickers from Alpaca
-        logger.debug(
-            f"Using all {len(tickers)} tickers from Alpaca for {cls.indicator_name()} "
-            "(blacklist filtering disabled)"
-        )
-        return tickers
 
     @classmethod
     async def _fetch_market_data_batch(
