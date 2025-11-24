@@ -3,6 +3,7 @@ Common utility functions
 """
 
 import functools
+import inspect
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Union
@@ -104,7 +105,16 @@ def measure_latency(func: Callable) -> Callable:
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
         start_time = time.perf_counter()
         func_name = func.__name__
-        class_name = args[0].__class__.__name__ if args and hasattr(args[0], "__class__") else ""
+        # Handle both classmethods (args[0] is a class) and instance methods (args[0] is an instance)
+        if args and hasattr(args[0], "__class__"):
+            if inspect.isclass(args[0]):
+                # For classmethods, args[0] is the class itself
+                class_name = args[0].__name__
+            else:
+                # For instance methods, args[0] is an instance
+                class_name = args[0].__class__.__name__
+        else:
+            class_name = ""
         display_name = f"{class_name}.{func_name}" if class_name else func_name
 
         try:
@@ -121,7 +131,16 @@ def measure_latency(func: Callable) -> Callable:
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
         start_time = time.perf_counter()
         func_name = func.__name__
-        class_name = args[0].__class__.__name__ if args and hasattr(args[0], "__class__") else ""
+        # Handle both classmethods (args[0] is a class) and instance methods (args[0] is an instance)
+        if args and hasattr(args[0], "__class__"):
+            if inspect.isclass(args[0]):
+                # For classmethods, args[0] is the class itself
+                class_name = args[0].__name__
+            else:
+                # For instance methods, args[0] is an instance
+                class_name = args[0].__class__.__name__
+        else:
+            class_name = ""
         display_name = f"{class_name}.{func_name}" if class_name else func_name
 
         try:
