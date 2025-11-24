@@ -185,7 +185,7 @@ class MCPClient:
                                         if "Unknown tool" in str(error_msg):
                                             extra_hint = " (tool not registered on MCP server; redeploy or restart MCP service)"
 
-                                        logger.error(
+                                        logger.debug(
                                             f"JSON-RPC Error calling {tool_name}: {error_code} - {error_msg}{extra_hint}"
                                         )
                                     else:

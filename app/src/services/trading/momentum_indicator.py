@@ -8,6 +8,7 @@ from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, date, timezone
 
 from app.src.common.loguru_logger import logger
+from app.src.common.utils import measure_latency
 from app.src.services.mcp.mcp_client import MCPClient
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
@@ -267,321 +268,305 @@ class MomentumIndicator(BaseTradingIndicator):
         logger.info("Momentum entry service started (HIGHLY SELECTIVE MODE)")
         while cls.running:
             try:
-                # Check market open
-                if not await cls._check_market_open():
-                    logger.debug("Market is closed, skipping momentum entry logic")
-                    await asyncio.sleep(cls.entry_cycle_seconds)
-                    continue
-
-                logger.info(
-                    "Market is open, proceeding with momentum entry logic (HIGHLY SELECTIVE)"
-                )
-
-                # Reset daily stats if needed
-                await cls._reset_daily_stats_if_needed()
-
-                # Check daily trade limit
-                if cls._has_reached_daily_trade_limit():
-                    logger.info(
-                        f"Daily trade limit reached: {cls.daily_trades_count}/{cls.max_daily_trades}. "
-                        "Skipping entry logic this cycle."
-                    )
-                    await asyncio.sleep(cls.entry_cycle_seconds)
-                    continue
-
-                # Get screened tickers
-                all_tickers = await cls._get_screened_tickers()
-                if not all_tickers:
-                    logger.warning("Failed to get screened tickers, skipping this cycle")
-                    await asyncio.sleep(10)
-                    continue
-
-                # Filter blacklisted tickers
-                filtered_tickers = await cls._filter_blacklisted_tickers(all_tickers)
-
-                # Get active trades
-                active_trades = await cls._get_active_trades()
-                active_count = len(active_trades)
-                active_ticker_set = await cls._get_active_ticker_set()
-
-                logger.info(
-                    f"Current active trades: {active_count}/{cls.max_active_trades}"
-                )
-
-                # Collect momentum scores
-                ticker_momentum_scores = []
-                market_data_dict = {}
-
-                for ticker in filtered_tickers:
-                    if not cls.running:
-                        break
-
-                    if ticker in active_ticker_set:
-                        logger.debug(
-                            f"Ticker {ticker} already has an active momentum trade, skipping"
-                        )
-                        continue
-
-                    market_data_response = await MCPClient.get_market_data(ticker)
-                    if not market_data_response:
-                        logger.debug(f"Failed to get market data for {ticker}")
-                        continue
-
-                    market_data_dict[ticker] = market_data_response
-
-                    technical_analysis = market_data_response.get(
-                        "technical_analysis", {}
-                    )
-                    datetime_price = technical_analysis.get("datetime_price", [])
-
-                    if not datetime_price:
-                        logger.debug(f"No datetime_price data for {ticker}")
-                        continue
-
-                    momentum_score, reason = cls._calculate_momentum(datetime_price)
-
-                    abs_momentum = abs(momentum_score)
-                    if abs_momentum < cls.min_momentum_threshold:
-                        logger.debug(
-                            f"Skipping {ticker}: momentum {momentum_score:.2f}% < "
-                            f"minimum threshold {cls.min_momentum_threshold}%"
-                        )
-                        continue
-
-                    passes_filter, filter_reason = (
-                        await cls._passes_stock_quality_filters(
-                            ticker, market_data_response, momentum_score
-                        )
-                    )
-                    if not passes_filter:
-                        logger.debug(f"Skipping {ticker}: {filter_reason}")
-                        continue
-
-                    if cls._is_ticker_in_cooldown(ticker):
-                        logger.debug(
-                            f"Skipping {ticker}: still in cooldown period "
-                            f"({cls.ticker_cooldown_minutes} minutes after exit)"
-                        )
-                        continue
-
-                    ticker_momentum_scores.append((ticker, momentum_score, reason))
-                    logger.info(
-                        f"{ticker} passed all filters: momentum={momentum_score:.2f}%, "
-                        f"{filter_reason}"
-                    )
-
-                logger.info(
-                    f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers"
-                )
-
-                # Separate upward and downward momentum
-                upward_tickers = [
-                    (t, score, reason)
-                    for t, score, reason in ticker_momentum_scores
-                    if score > 0
-                ]
-                downward_tickers = [
-                    (t, score, reason)
-                    for t, score, reason in ticker_momentum_scores
-                    if score < 0
-                ]
-
-                # Use MAB to select top-k tickers
-                top_upward = await MABService.select_tickers_with_mab(
-                    cls.indicator_name(),
-                    ticker_candidates=upward_tickers,
-                    market_data_dict=market_data_dict,
-                    top_k=cls.top_k,
-                )
-                top_downward = await MABService.select_tickers_with_mab(
-                    cls.indicator_name(),
-                    ticker_candidates=downward_tickers,
-                    market_data_dict=market_data_dict,
-                    top_k=cls.top_k,
-                )
-
-                logger.info(
-                    f"MAB selected {len(top_upward)} upward momentum tickers and "
-                    f"{len(top_downward)} downward momentum tickers (top_k={cls.top_k})"
-                )
-
-                # Enter trades for upward momentum (long)
-                for rank, (ticker, momentum_score, reason) in enumerate(
-                    top_upward, start=1
-                ):
-                    if not cls.running:
-                        break
-
-                    if cls._has_reached_daily_trade_limit():
-                        logger.info(
-                            f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                            f"Skipping remaining candidates."
-                        )
-                        break
-
-                    active_trades = await cls._get_active_trades()
-                    active_count = len(active_trades)
-
-                    if active_count >= cls.max_active_trades:
-                        if abs(momentum_score) >= cls.exceptional_momentum_threshold:
-                            logger.info(
-                                f"At max capacity ({active_count}/{cls.max_active_trades}), "
-                                f"attempting to preempt for exceptional trade {ticker} "
-                                f"(momentum: {momentum_score:.2f})"
-                            )
-                            preempted = await cls._preempt_low_profit_trade(
-                                ticker, momentum_score
-                            )
-                            if not preempted:
-                                logger.info(
-                                    f"Could not preempt for {ticker}, skipping entry "
-                                    f"(momentum: {momentum_score:.2f})"
-                                )
-                                continue
-                        else:
-                            logger.info(
-                                f"At max capacity ({active_count}/{cls.max_active_trades}), "
-                                f"skipping {ticker} (momentum: {momentum_score:.2f} < "
-                                f"exceptional threshold: {cls.exceptional_momentum_threshold})"
-                            )
-                            continue
-
-                    action = "buy_to_open"
-
-                    quote_response = await MCPClient.get_quote(ticker)
-                    if not quote_response:
-                        logger.warning(f"Failed to get quote for {ticker}, skipping")
-                        continue
-
-                    quote_data = quote_response.get("quote", {})
-                    quotes = quote_data.get("quotes", {})
-                    ticker_quote = quotes.get(ticker, {})
-                    enter_price = ticker_quote.get("ap", 0.0)
-
-                    if enter_price <= 0:
-                        logger.warning(
-                            f"Failed to get valid quote price for {ticker}, skipping"
-                        )
-                        continue
-
-                    ranked_reason = f"{reason} (ranked #{rank} upward momentum)"
-                    await send_signal_to_webhook(
-                        ticker=ticker,
-                        action=action,
-                        indicator=cls.indicator_name(),
-                        enter_reason=ranked_reason,
-                    )
-
-                    technical_indicators = market_data_dict.get(ticker, {}).get(
-                        "technical_analysis", {}
-                    )
-                    technical_indicators_for_enter = technical_indicators.copy()
-                    if "datetime_price" in technical_indicators_for_enter:
-                        technical_indicators_for_enter = {
-                            k: v
-                            for k, v in technical_indicators_for_enter.items()
-                            if k != "datetime_price"
-                        }
-
-                    await cls._enter_trade(
-                        ticker=ticker,
-                        action=action,
-                        enter_price=enter_price,
-                        enter_reason=ranked_reason,
-                        technical_indicators=technical_indicators_for_enter,
-                    )
-
-                # Enter trades for downward momentum (short)
-                for rank, (ticker, momentum_score, reason) in enumerate(
-                    top_downward, start=1
-                ):
-                    if not cls.running:
-                        break
-
-                    if cls._has_reached_daily_trade_limit():
-                        logger.info(
-                            f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                            f"Skipping remaining candidates."
-                        )
-                        break
-
-                    active_trades = await cls._get_active_trades()
-                    active_count = len(active_trades)
-
-                    if active_count >= cls.max_active_trades:
-                        if abs(momentum_score) >= cls.exceptional_momentum_threshold:
-                            logger.info(
-                                f"At max capacity ({active_count}/{cls.max_active_trades}), "
-                                f"attempting to preempt for exceptional trade {ticker} "
-                                f"(momentum: {momentum_score:.2f})"
-                            )
-                            preempted = await cls._preempt_low_profit_trade(
-                                ticker, abs(momentum_score)
-                            )
-                            if not preempted:
-                                logger.info(
-                                    f"Could not preempt for {ticker}, skipping entry "
-                                    f"(momentum: {momentum_score:.2f})"
-                                )
-                                continue
-                        else:
-                            logger.info(
-                                f"At max capacity ({active_count}/{cls.max_active_trades}), "
-                                f"skipping {ticker} (momentum: {momentum_score:.2f} < "
-                                f"exceptional threshold: {cls.exceptional_momentum_threshold})"
-                            )
-                            continue
-
-                    action = "sell_to_open"
-
-                    quote_response = await MCPClient.get_quote(ticker)
-                    if not quote_response:
-                        logger.warning(f"Failed to get quote for {ticker}, skipping")
-                        continue
-
-                    quote_data = quote_response.get("quote", {})
-                    quotes = quote_data.get("quotes", {})
-                    ticker_quote = quotes.get(ticker, {})
-                    enter_price = ticker_quote.get("bp", 0.0)
-
-                    if enter_price <= 0:
-                        logger.warning(
-                            f"Failed to get valid quote price for {ticker}, skipping"
-                        )
-                        continue
-
-                    ranked_reason = f"{reason} (ranked #{rank} downward momentum)"
-                    await send_signal_to_webhook(
-                        ticker=ticker,
-                        action=action,
-                        indicator=cls.indicator_name(),
-                        enter_reason=ranked_reason,
-                    )
-
-                    technical_indicators = market_data_dict.get(ticker, {}).get(
-                        "technical_analysis", {}
-                    )
-                    technical_indicators_for_enter = technical_indicators.copy()
-                    if "datetime_price" in technical_indicators_for_enter:
-                        technical_indicators_for_enter = {
-                            k: v
-                            for k, v in technical_indicators_for_enter.items()
-                            if k != "datetime_price"
-                        }
-
-                    await cls._enter_trade(
-                        ticker=ticker,
-                        action=action,
-                        enter_price=enter_price,
-                        enter_reason=ranked_reason,
-                        technical_indicators=technical_indicators_for_enter,
-                    )
-
-                await asyncio.sleep(cls.entry_cycle_seconds)
-
+                await cls._run_entry_cycle()
             except Exception as e:
                 logger.exception(f"Error in momentum entry service: {str(e)}")
                 await asyncio.sleep(10)
+
+    @classmethod
+    @measure_latency
+    async def _run_entry_cycle(cls):
+        """Execute a single momentum entry cycle."""
+        if not await cls._check_market_open():
+            logger.debug("Market is closed, skipping momentum entry logic")
+            await asyncio.sleep(cls.entry_cycle_seconds)
+            return
+
+        logger.info(
+            "Market is open, proceeding with momentum entry logic (HIGHLY SELECTIVE)"
+        )
+
+        await cls._reset_daily_stats_if_needed()
+
+        if cls._has_reached_daily_trade_limit():
+            logger.info(
+                f"Daily trade limit reached: {cls.daily_trades_count}/{cls.max_daily_trades}. "
+                "Skipping entry logic this cycle."
+            )
+            await asyncio.sleep(cls.entry_cycle_seconds)
+            return
+
+        all_tickers = await cls._get_screened_tickers()
+        if not all_tickers:
+            logger.warning("Failed to get screened tickers, skipping this cycle")
+            await asyncio.sleep(10)
+            return
+
+        filtered_tickers = await cls._filter_blacklisted_tickers(all_tickers)
+
+        active_trades = await cls._get_active_trades()
+        active_count = len(active_trades)
+        active_ticker_set = await cls._get_active_ticker_set()
+
+        logger.info(f"Current active trades: {active_count}/{cls.max_active_trades}")
+
+        ticker_momentum_scores = []
+        market_data_dict = {}
+
+        for ticker in filtered_tickers:
+            if not cls.running:
+                break
+
+            if ticker in active_ticker_set:
+                logger.debug(
+                    f"Ticker {ticker} already has an active momentum trade, skipping"
+                )
+                continue
+
+            market_data_response = await MCPClient.get_market_data(ticker)
+            if not market_data_response:
+                logger.debug(f"Failed to get market data for {ticker}")
+                continue
+
+            market_data_dict[ticker] = market_data_response
+
+            technical_analysis = market_data_response.get("technical_analysis", {})
+            datetime_price = technical_analysis.get("datetime_price", [])
+
+            if not datetime_price:
+                logger.debug(f"No datetime_price data for {ticker}")
+                continue
+
+            momentum_score, reason = cls._calculate_momentum(datetime_price)
+
+            abs_momentum = abs(momentum_score)
+            if abs_momentum < cls.min_momentum_threshold:
+                logger.debug(
+                    f"Skipping {ticker}: momentum {momentum_score:.2f}% < "
+                    f"minimum threshold {cls.min_momentum_threshold}%"
+                )
+                continue
+
+            passes_filter, filter_reason = await cls._passes_stock_quality_filters(
+                ticker, market_data_response, momentum_score
+            )
+            if not passes_filter:
+                logger.debug(f"Skipping {ticker}: {filter_reason}")
+                continue
+
+            if cls._is_ticker_in_cooldown(ticker):
+                logger.debug(
+                    f"Skipping {ticker}: still in cooldown period "
+                    f"({cls.ticker_cooldown_minutes} minutes after exit)"
+                )
+                continue
+
+            ticker_momentum_scores.append((ticker, momentum_score, reason))
+            logger.info(
+                f"{ticker} passed all filters: momentum={momentum_score:.2f}%, "
+                f"{filter_reason}"
+            )
+
+        logger.info(
+            f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers"
+        )
+
+        upward_tickers = [
+            (t, score, reason)
+            for t, score, reason in ticker_momentum_scores
+            if score > 0
+        ]
+        downward_tickers = [
+            (t, score, reason)
+            for t, score, reason in ticker_momentum_scores
+            if score < 0
+        ]
+
+        top_upward = await MABService.select_tickers_with_mab(
+            cls.indicator_name(),
+            ticker_candidates=upward_tickers,
+            market_data_dict=market_data_dict,
+            top_k=cls.top_k,
+        )
+        top_downward = await MABService.select_tickers_with_mab(
+            cls.indicator_name(),
+            ticker_candidates=downward_tickers,
+            market_data_dict=market_data_dict,
+            top_k=cls.top_k,
+        )
+
+        logger.info(
+            f"MAB selected {len(top_upward)} upward momentum tickers and "
+            f"{len(top_downward)} downward momentum tickers (top_k={cls.top_k})"
+        )
+
+        for rank, (ticker, momentum_score, reason) in enumerate(top_upward, start=1):
+            if not cls.running:
+                break
+
+            if cls._has_reached_daily_trade_limit():
+                logger.info(
+                    f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                    f"Skipping remaining candidates."
+                )
+                break
+
+            active_trades = await cls._get_active_trades()
+            active_count = len(active_trades)
+
+            if active_count >= cls.max_active_trades:
+                if abs(momentum_score) >= cls.exceptional_momentum_threshold:
+                    logger.info(
+                        f"At max capacity ({active_count}/{cls.max_active_trades}), "
+                        f"attempting to preempt for exceptional trade {ticker} "
+                        f"(momentum: {momentum_score:.2f})"
+                    )
+                    preempted = await cls._preempt_low_profit_trade(
+                        ticker, momentum_score
+                    )
+                    if not preempted:
+                        logger.info(
+                            f"Could not preempt for {ticker}, skipping entry "
+                            f"(momentum: {momentum_score:.2f})"
+                        )
+                        continue
+                else:
+                    logger.info(
+                        f"At max capacity ({active_count}/{cls.max_active_trades}), "
+                        f"skipping {ticker} (momentum: {momentum_score:.2f} < "
+                        f"exceptional threshold: {cls.exceptional_momentum_threshold})"
+                    )
+                    continue
+
+            action = "buy_to_open"
+
+            quote_response = await MCPClient.get_quote(ticker)
+            if not quote_response:
+                logger.warning(f"Failed to get quote for {ticker}, skipping")
+                continue
+
+            quote_data = quote_response.get("quote", {})
+            quotes = quote_data.get("quotes", {})
+            ticker_quote = quotes.get(ticker, {})
+            enter_price = ticker_quote.get("ap", 0.0)
+
+            if enter_price <= 0:
+                logger.warning(
+                    f"Failed to get valid quote price for {ticker}, skipping"
+                )
+                continue
+
+            ranked_reason = f"{reason} (ranked #{rank} upward momentum)"
+            await send_signal_to_webhook(
+                ticker=ticker,
+                action=action,
+                indicator=cls.indicator_name(),
+                enter_reason=ranked_reason,
+            )
+
+            technical_indicators = market_data_dict.get(ticker, {}).get(
+                "technical_analysis", {}
+            )
+            technical_indicators_for_enter = technical_indicators.copy()
+            if "datetime_price" in technical_indicators_for_enter:
+                technical_indicators_for_enter = {
+                    k: v
+                    for k, v in technical_indicators_for_enter.items()
+                    if k != "datetime_price"
+                }
+
+            await cls._enter_trade(
+                ticker=ticker,
+                action=action,
+                enter_price=enter_price,
+                enter_reason=ranked_reason,
+                technical_indicators=technical_indicators_for_enter,
+            )
+
+        for rank, (ticker, momentum_score, reason) in enumerate(top_downward, start=1):
+            if not cls.running:
+                break
+
+            if cls._has_reached_daily_trade_limit():
+                logger.info(
+                    f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                    f"Skipping remaining candidates."
+                )
+                break
+
+            active_trades = await cls._get_active_trades()
+            active_count = len(active_trades)
+
+            if active_count >= cls.max_active_trades:
+                if abs(momentum_score) >= cls.exceptional_momentum_threshold:
+                    logger.info(
+                        f"At max capacity ({active_count}/{cls.max_active_trades}), "
+                        f"attempting to preempt for exceptional trade {ticker} "
+                        f"(momentum: {momentum_score:.2f})"
+                    )
+                    preempted = await cls._preempt_low_profit_trade(
+                        ticker, abs(momentum_score)
+                    )
+                    if not preempted:
+                        logger.info(
+                            f"Could not preempt for {ticker}, skipping entry "
+                            f"(momentum: {momentum_score:.2f})"
+                        )
+                        continue
+                else:
+                    logger.info(
+                        f"At max capacity ({active_count}/{cls.max_active_trades}), "
+                        f"skipping {ticker} (momentum: {momentum_score:.2f} < "
+                        f"exceptional threshold: {cls.exceptional_momentum_threshold})"
+                    )
+                    continue
+
+            action = "sell_to_open"
+
+            quote_response = await MCPClient.get_quote(ticker)
+            if not quote_response:
+                logger.warning(f"Failed to get quote for {ticker}, skipping")
+                continue
+
+            quote_data = quote_response.get("quote", {})
+            quotes = quote_data.get("quotes", {})
+            ticker_quote = quotes.get(ticker, {})
+            enter_price = ticker_quote.get("bp", 0.0)
+
+            if enter_price <= 0:
+                logger.warning(
+                    f"Failed to get valid quote price for {ticker}, skipping"
+                )
+                continue
+
+            ranked_reason = f"{reason} (ranked #{rank} downward momentum)"
+            await send_signal_to_webhook(
+                ticker=ticker,
+                action=action,
+                indicator=cls.indicator_name(),
+                enter_reason=ranked_reason,
+            )
+
+            technical_indicators = market_data_dict.get(ticker, {}).get(
+                "technical_analysis", {}
+            )
+            technical_indicators_for_enter = technical_indicators.copy()
+            if "datetime_price" in technical_indicators_for_enter:
+                technical_indicators_for_enter = {
+                    k: v
+                    for k, v in technical_indicators_for_enter.items()
+                    if k != "datetime_price"
+                }
+
+            await cls._enter_trade(
+                ticker=ticker,
+                action=action,
+                enter_price=enter_price,
+                enter_reason=ranked_reason,
+                technical_indicators=technical_indicators_for_enter,
+            )
+
+        await asyncio.sleep(cls.entry_cycle_seconds)
 
     @classmethod
     async def exit_service(cls):
@@ -589,157 +574,157 @@ class MomentumIndicator(BaseTradingIndicator):
         logger.info("Momentum exit service started")
         while cls.running:
             try:
-                if not await cls._check_market_open():
-                    logger.debug("Market is closed, skipping momentum exit logic")
-                    await asyncio.sleep(cls.exit_cycle_seconds)
-                    continue
-
-                active_trades = await cls._get_active_trades()
-
-                if not active_trades:
-                    logger.debug("No active momentum trades to monitor")
-                    await asyncio.sleep(cls.exit_cycle_seconds)
-                    continue
-
-                active_count = len(active_trades)
-                logger.info(
-                    f"Monitoring {active_count}/{cls.max_active_trades} active momentum trades"
-                )
-
-                for trade in active_trades:
-                    if not cls.running:
-                        break
-
-                    ticker = trade.get("ticker")
-                    original_action = trade.get("action")
-                    enter_price = trade.get("enter_price")
-                    trailing_stop = float(trade.get("trailing_stop", 0.5))
-                    peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
-
-                    if not ticker or enter_price is None or enter_price <= 0:
-                        logger.warning(f"Invalid momentum trade data: {trade}")
-                        continue
-
-                    market_data_response = await MCPClient.get_market_data(ticker)
-                    if not market_data_response:
-                        logger.warning(
-                            f"Failed to get market data for {ticker} for exit check - will retry in next cycle"
-                        )
-                        continue
-
-                    technical_analysis = market_data_response.get(
-                        "technical_analysis", {}
-                    )
-                    current_price = technical_analysis.get("close_price", 0.0)
-
-                    if current_price <= 0:
-                        logger.warning(
-                            f"Failed to get valid current price for {ticker}"
-                        )
-                        continue
-
-                    profit_percent = cls._calculate_profit_percent(
-                        enter_price, current_price, original_action
-                    )
-
-                    should_exit = False
-                    exit_reason = None
-
-                    if profit_percent < cls.stop_loss_threshold:
-                        should_exit = True
-                        exit_reason = (
-                            f"Trailing stop loss triggered: {profit_percent:.2f}% "
-                            f"(below {cls.stop_loss_threshold}% stop loss threshold)"
-                        )
-                        logger.info(
-                            f"Exit signal for {ticker} - losing trade: {profit_percent:.2f}%"
-                        )
-
-                    elif peak_profit_percent > 0:
-                        drop_from_peak = peak_profit_percent - profit_percent
-                        if drop_from_peak >= cls.trailing_stop_percent:
-                            should_exit = True
-                            exit_reason = (
-                                f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
-                                f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%)"
-                            )
-                            logger.info(
-                                f"Exit signal for {ticker} - trailing stop: "
-                                f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%"
-                            )
-
-                    if not should_exit:
-                        profit_target_to_exit = cls.profit_target_strong_momentum
-
-                        is_profitable = profit_percent >= profit_target_to_exit
-                        if is_profitable:
-                            should_exit = True
-                            exit_reason = (
-                                f"Profit target reached: {profit_percent:.2f}% profit "
-                                f"(target: {profit_target_to_exit:.2f}%)"
-                            )
-
-                    if not should_exit:
-                        if profit_percent > peak_profit_percent:
-                            peak_profit_percent = profit_percent
-                            trailing_stop = cls.trailing_stop_percent
-
-                        skipped_reason = None
-                        if profit_percent < 0:
-                            skipped_reason = (
-                                f"Trade is losing: {profit_percent:.2f}% "
-                                f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
-                            )
-                        elif profit_percent < cls.profit_threshold:
-                            skipped_reason = (
-                                f"Trade not yet profitable: {profit_percent:.2f}% "
-                                f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
-                            )
-                        else:
-                            skipped_reason = (
-                                f"Trade profitable: {profit_percent:.2f}% "
-                                f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
-                            )
-
-                        await DynamoDBClient.update_momentum_trade_trailing_stop(
-                            ticker=ticker,
-                            indicator=cls.indicator_name(),
-                            trailing_stop=trailing_stop,
-                            peak_profit_percent=peak_profit_percent,
-                            skipped_exit_reason=skipped_reason,
-                        )
-
-                    if should_exit:
-                        logger.info(
-                            f"Exit signal for {ticker} "
-                            f"(enter: {enter_price}, current: {current_price}, "
-                            f"profit: {profit_percent:.2f}%)"
-                        )
-
-                        technical_indicators_for_enter = trade.get(
-                            "technical_indicators_for_enter"
-                        )
-                        technical_indicators_for_exit = technical_analysis.copy()
-                        if "datetime_price" in technical_indicators_for_exit:
-                            technical_indicators_for_exit = {
-                                k: v
-                                for k, v in technical_indicators_for_exit.items()
-                                if k != "datetime_price"
-                            }
-
-                        await cls._exit_trade(
-                            ticker=ticker,
-                            original_action=original_action,
-                            enter_price=enter_price,
-                            exit_price=current_price,
-                            exit_reason=exit_reason,
-                            technical_indicators_enter=technical_indicators_for_enter,
-                            technical_indicators_exit=technical_indicators_for_exit,
-                        )
-
-                await asyncio.sleep(cls.exit_cycle_seconds)
-
+                await cls._run_exit_cycle()
             except Exception as e:
                 logger.exception(f"Error in momentum exit service: {str(e)}")
                 await asyncio.sleep(5)
 
+    @classmethod
+    @measure_latency
+    async def _run_exit_cycle(cls):
+        """Execute a single momentum exit monitoring cycle."""
+        if not await cls._check_market_open():
+            logger.debug("Market is closed, skipping momentum exit logic")
+            await asyncio.sleep(cls.exit_cycle_seconds)
+            return
+
+        active_trades = await cls._get_active_trades()
+
+        if not active_trades:
+            logger.debug("No active momentum trades to monitor")
+            await asyncio.sleep(cls.exit_cycle_seconds)
+            return
+
+        active_count = len(active_trades)
+        logger.info(
+            f"Monitoring {active_count}/{cls.max_active_trades} active momentum trades"
+        )
+
+        for trade in active_trades:
+            if not cls.running:
+                break
+
+            ticker = trade.get("ticker")
+            original_action = trade.get("action")
+            enter_price = trade.get("enter_price")
+            trailing_stop = float(trade.get("trailing_stop", 0.5))
+            peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
+
+            if not ticker or enter_price is None or enter_price <= 0:
+                logger.warning(f"Invalid momentum trade data: {trade}")
+                continue
+
+            market_data_response = await MCPClient.get_market_data(ticker)
+            if not market_data_response:
+                logger.warning(
+                    f"Failed to get market data for {ticker} for exit check - will retry in next cycle"
+                )
+                continue
+
+            technical_analysis = market_data_response.get("technical_analysis", {})
+            current_price = technical_analysis.get("close_price", 0.0)
+
+            if current_price <= 0:
+                logger.warning(f"Failed to get valid current price for {ticker}")
+                continue
+
+            profit_percent = cls._calculate_profit_percent(
+                enter_price, current_price, original_action
+            )
+
+            should_exit = False
+            exit_reason = None
+
+            if profit_percent < cls.stop_loss_threshold:
+                should_exit = True
+                exit_reason = (
+                    f"Trailing stop loss triggered: {profit_percent:.2f}% "
+                    f"(below {cls.stop_loss_threshold}% stop loss threshold)"
+                )
+                logger.info(
+                    f"Exit signal for {ticker} - losing trade: {profit_percent:.2f}%"
+                )
+
+            elif peak_profit_percent > 0:
+                drop_from_peak = peak_profit_percent - profit_percent
+                if drop_from_peak >= cls.trailing_stop_percent:
+                    should_exit = True
+                    exit_reason = (
+                        f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
+                        f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%)"
+                    )
+                    logger.info(
+                        f"Exit signal for {ticker} - trailing stop: "
+                        f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%"
+                    )
+
+            if not should_exit:
+                profit_target_to_exit = cls.profit_target_strong_momentum
+
+                is_profitable = profit_percent >= profit_target_to_exit
+                if is_profitable:
+                    should_exit = True
+                    exit_reason = (
+                        f"Profit target reached: {profit_percent:.2f}% profit "
+                        f"(target: {profit_target_to_exit:.2f}%)"
+                    )
+
+            if not should_exit:
+                if profit_percent > peak_profit_percent:
+                    peak_profit_percent = profit_percent
+                    trailing_stop = cls.trailing_stop_percent
+
+                skipped_reason = None
+                if profit_percent < 0:
+                    skipped_reason = (
+                        f"Trade is losing: {profit_percent:.2f}% "
+                        f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
+                    )
+                elif profit_percent < cls.profit_threshold:
+                    skipped_reason = (
+                        f"Trade not yet profitable: {profit_percent:.2f}% "
+                        f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
+                    )
+                else:
+                    skipped_reason = (
+                        f"Trade profitable: {profit_percent:.2f}% "
+                        f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
+                    )
+
+                await DynamoDBClient.update_momentum_trade_trailing_stop(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    trailing_stop=trailing_stop,
+                    peak_profit_percent=peak_profit_percent,
+                    skipped_exit_reason=skipped_reason,
+                )
+
+            if should_exit:
+                logger.info(
+                    f"Exit signal for {ticker} "
+                    f"(enter: {enter_price}, current: {current_price}, "
+                    f"profit: {profit_percent:.2f}%)"
+                )
+
+                technical_indicators_for_enter = trade.get(
+                    "technical_indicators_for_enter"
+                )
+                technical_indicators_for_exit = technical_analysis.copy()
+                if "datetime_price" in technical_indicators_for_exit:
+                    technical_indicators_for_exit = {
+                        k: v
+                        for k, v in technical_indicators_for_exit.items()
+                        if k != "datetime_price"
+                    }
+
+                await cls._exit_trade(
+                    ticker=ticker,
+                    original_action=original_action,
+                    enter_price=enter_price,
+                    exit_price=current_price,
+                    exit_reason=exit_reason,
+                    technical_indicators_enter=technical_indicators_for_enter,
+                    technical_indicators_exit=technical_indicators_for_exit,
+                )
+
+        await asyncio.sleep(cls.exit_cycle_seconds)
