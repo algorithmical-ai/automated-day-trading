@@ -784,6 +784,34 @@ class DynamoDBClient:
             return False
 
     @classmethod
+    async def get_completed_trade_count(cls, date: str, indicator: str) -> int:
+        """
+        Get the count of completed trades for a specific date and indicator
+        
+        Args:
+            date: Date in yyyy-mm-dd format
+            indicator: Indicator name
+            
+        Returns:
+            Number of completed trades (0 if not found or error)
+        """
+        try:
+            cls._ensure_tables()
+            response = cls._completed_trades_table.get_item(
+                Key={"date": date, "indicator": indicator}
+            )
+            item = response.get("Item")
+            if item:
+                count = item.get("completed_trade_count", 0)
+                return int(count) if count else 0
+            return 0
+        except Exception as e:
+            logger.error(
+                f"Error getting completed trade count for {date}/{indicator}: {str(e)}"
+            )
+            return 0
+
+    @classmethod
     async def ticker_exists_in_inactive(cls, ticker: str) -> bool:
         """
         Check if a ticker exists in InactiveTickers table

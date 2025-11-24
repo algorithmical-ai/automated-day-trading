@@ -289,7 +289,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
         await cls._reset_daily_stats_if_needed()
 
-        if cls._has_reached_daily_trade_limit():
+        if await cls._has_reached_daily_trade_limit():
             logger.info(
                 f"Daily trade limit reached: {cls.daily_trades_count}/{cls.max_daily_trades}. "
                 "Skipping entry logic this cycle."
@@ -478,7 +478,7 @@ class MomentumIndicator(BaseTradingIndicator):
             if not cls.running:
                 break
 
-            if cls._has_reached_daily_trade_limit():
+            if await cls._has_reached_daily_trade_limit():
                 logger.info(
                     f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
                     f"Skipping remaining candidates."
@@ -561,7 +561,7 @@ class MomentumIndicator(BaseTradingIndicator):
             if not cls.running:
                 break
 
-            if cls._has_reached_daily_trade_limit():
+            if await cls._has_reached_daily_trade_limit():
                 logger.info(
                     f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
                     f"Skipping remaining candidates."

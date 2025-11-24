@@ -73,15 +73,16 @@ class BaseTradingIndicator(ABC):
         return True
 
     @classmethod
-    def _has_reached_daily_trade_limit(cls) -> bool:
-        """Check if daily trade limit has been reached"""
+    async def _has_reached_daily_trade_limit(cls) -> bool:
+        """Check if daily trade limit has been reached by querying DynamoDB"""
         today = date.today().isoformat()
 
-        if cls.daily_trades_date != today:
-            cls.daily_trades_count = 0
-            cls.daily_trades_date = today
+        # Query DynamoDB for actual completed trade count
+        completed_count = await DynamoDBClient.get_completed_trade_count(
+            date=today, indicator=cls.indicator_name()
+        )
 
-        return cls.daily_trades_count >= cls.max_daily_trades
+        return completed_count >= cls.max_daily_trades
 
     @classmethod
     def _increment_daily_trade_count(cls):
@@ -131,7 +132,6 @@ class BaseTradingIndicator(ABC):
 
         # Combine all unique tickers
         return list(set(most_actives + gainers + losers))
-
 
     @classmethod
     async def _fetch_market_data_batch(
