@@ -55,6 +55,37 @@ class MomentumIndicator(BaseTradingIndicator):
         return False
 
     @classmethod
+    def _is_golden_ticker(
+        cls, momentum_score: float, market_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Check if ticker is a "golden" opportunity with exceptional momentum or technical indicators
+        Golden tickers can bypass daily trade limits
+        """
+        abs_momentum = abs(momentum_score)
+
+        # Exceptional momentum
+        if abs_momentum >= cls.exceptional_momentum_threshold:
+            return True
+
+        # Exceptional technical indicators
+        technical_analysis = market_data.get("technical_analysis", {})
+        adx = technical_analysis.get("adx")
+        rsi = technical_analysis.get("rsi", 50.0)
+
+        # Very strong trend (ADX > 40) with perfect RSI conditions
+        if adx and adx > 40:
+            is_long = momentum_score > 0
+            is_short = momentum_score < 0
+
+            if is_long and rsi < 25:  # Very oversold
+                return True
+            if is_short and rsi > 75:  # Very overbought
+                return True
+
+        return False
+
+    @classmethod
     async def _passes_stock_quality_filters(
         cls, ticker: str, market_data: Dict[str, Any], momentum_score: float = 0.0
     ) -> Tuple[bool, str]:
@@ -295,13 +326,13 @@ class MomentumIndicator(BaseTradingIndicator):
 
         await cls._reset_daily_stats_if_needed()
 
-        if await cls._has_reached_daily_trade_limit():
+        # Check daily limit (will be bypassed for golden tickers later)
+        daily_limit_reached = await cls._has_reached_daily_trade_limit()
+        if daily_limit_reached:
             logger.info(
                 f"Daily trade limit reached: {cls.daily_trades_count}/{cls.max_daily_trades}. "
-                "Skipping entry logic this cycle."
+                "Will still check for golden/exceptional opportunities."
             )
-            await asyncio.sleep(cls.entry_cycle_seconds)
-            return
 
         all_tickers = await cls._get_screened_tickers()
         if not all_tickers:
@@ -521,12 +552,33 @@ class MomentumIndicator(BaseTradingIndicator):
             if not cls.running:
                 break
 
-            if await cls._has_reached_daily_trade_limit():
-                logger.info(
-                    f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                    f"Skipping remaining candidates."
-                )
-                break
+            # Check if daily limit reached (allow golden tickers to bypass)
+            daily_limit_reached = await cls._has_reached_daily_trade_limit()
+            is_golden = False
+
+            if daily_limit_reached:
+                market_data_response = market_data_dict.get(ticker)
+                if market_data_response:
+                    is_golden = cls._is_golden_ticker(
+                        momentum_score, market_data_response
+                    )
+                    if not is_golden:
+                        logger.info(
+                            f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                            f"Skipping {ticker} (not golden/exceptional)."
+                        )
+                        break
+                    else:
+                        logger.info(
+                            f"Daily trade limit reached, but {ticker} is GOLDEN "
+                            f"(momentum: {momentum_score:.2f}%) - allowing entry"
+                        )
+                else:
+                    logger.info(
+                        f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                        f"Skipping {ticker} (no market data to verify golden status)."
+                    )
+                    break
 
             active_trades = await cls._get_active_trades()
             active_count = len(active_trades)
@@ -573,7 +625,8 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 continue
 
-            ranked_reason = f"{reason} (ranked #{rank} upward momentum)"
+            golden_prefix = "🟡 GOLDEN: " if is_golden else ""
+            ranked_reason = f"{golden_prefix}{reason} (ranked #{rank} upward momentum)"
             await send_signal_to_webhook(
                 ticker=ticker,
                 action=action,
@@ -604,12 +657,33 @@ class MomentumIndicator(BaseTradingIndicator):
             if not cls.running:
                 break
 
-            if await cls._has_reached_daily_trade_limit():
-                logger.info(
-                    f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                    f"Skipping remaining candidates."
-                )
-                break
+            # Check if daily limit reached (allow golden tickers to bypass)
+            daily_limit_reached = await cls._has_reached_daily_trade_limit()
+            is_golden = False
+
+            if daily_limit_reached:
+                market_data_response = market_data_dict.get(ticker)
+                if market_data_response:
+                    is_golden = cls._is_golden_ticker(
+                        momentum_score, market_data_response
+                    )
+                    if not is_golden:
+                        logger.info(
+                            f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                            f"Skipping {ticker} (not golden/exceptional)."
+                        )
+                        break
+                    else:
+                        logger.info(
+                            f"Daily trade limit reached, but {ticker} is GOLDEN "
+                            f"(momentum: {momentum_score:.2f}%) - allowing entry"
+                        )
+                else:
+                    logger.info(
+                        f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                        f"Skipping {ticker} (no market data to verify golden status)."
+                    )
+                    break
 
             active_trades = await cls._get_active_trades()
             active_count = len(active_trades)
@@ -656,7 +730,10 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 continue
 
-            ranked_reason = f"{reason} (ranked #{rank} downward momentum)"
+            golden_prefix = "🟡 GOLDEN: " if is_golden else ""
+            ranked_reason = (
+                f"{golden_prefix}{reason} (ranked #{rank} downward momentum)"
+            )
             await send_signal_to_webhook(
                 ticker=ticker,
                 action=action,

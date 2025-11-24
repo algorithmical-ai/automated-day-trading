@@ -22,10 +22,29 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
     # Deep Analyzer specific configuration
     top_k: int = 2
     min_entry_score: float = 0.70  # Minimum entry score from MarketDataService
+    exceptional_entry_score: float = 0.90  # Exceptional entry score for golden tickers
 
     @classmethod
     def indicator_name(cls) -> str:
         return "Deep Analyzer"
+
+    @classmethod
+    def _is_golden_ticker(
+        cls, entry_score: float, signal_data: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Check if ticker is a "golden" opportunity with exceptional entry score or golden flag
+        Golden tickers can bypass daily trade limits
+        """
+        # Check golden flag from MarketDataService
+        if signal_data and signal_data.get("is_golden", False):
+            return True
+        
+        # Exceptional entry score
+        if entry_score >= cls.exceptional_entry_score:
+            return True
+        
+        return False
 
     @classmethod
     async def _evaluate_ticker_for_entry(
@@ -191,14 +210,13 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
         # Reset daily stats if needed
         await cls._reset_daily_stats_if_needed()
 
-        # Check daily trade limit
-        if await cls._has_reached_daily_trade_limit():
+        # Check daily limit (will be bypassed for golden tickers later)
+        daily_limit_reached = await cls._has_reached_daily_trade_limit()
+        if daily_limit_reached:
             logger.info(
                 f"Daily trade limit reached: {cls.daily_trades_count}/{cls.max_daily_trades}. "
-                "Skipping entry logic this cycle."
+                "Will still check for golden/exceptional opportunities."
             )
-            await asyncio.sleep(cls.entry_cycle_seconds)
-            return
 
         # Get screened tickers
         all_tickers = await cls._get_screened_tickers()
@@ -399,12 +417,24 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             if not cls.running:
                 break
 
-            if await cls._has_reached_daily_trade_limit():
-                logger.info(
-                    f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                    f"Skipping remaining candidates."
-                )
-                break
+            # Check if daily limit reached (allow golden tickers to bypass)
+            daily_limit_reached = await cls._has_reached_daily_trade_limit()
+            is_golden = False
+            
+            if daily_limit_reached:
+                signal_data, _ = long_signal_lookup.get(ticker, (None, ""))
+                is_golden = cls._is_golden_ticker(entry_score, signal_data)
+                if not is_golden:
+                    logger.info(
+                        f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                        f"Skipping {ticker} (not golden/exceptional, score: {entry_score:.2f})."
+                    )
+                    break
+                else:
+                    logger.info(
+                        f"Daily trade limit reached, but {ticker} is GOLDEN "
+                        f"(entry_score: {entry_score:.2f}) - allowing entry"
+                    )
 
             active_trades = await cls._get_active_trades()
             active_count = len(active_trades)
@@ -436,10 +466,14 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 )
                 continue
 
+            # Use the is_golden from daily limit check, or check signal_data if not already set
+            if not is_golden:
+                is_golden = signal_data.get("is_golden", False) if signal_data else False
+            
+            golden_prefix = "🟡 GOLDEN: " if is_golden else ""
             ranked_reason = (
-                f"{reason} (ranked #{rank} long, entry_score: {entry_score:.2f})"
+                f"{golden_prefix}{reason} (ranked #{rank} long, entry_score: {entry_score:.2f})"
             )
-            is_golden = signal_data.get("is_golden", False) if signal_data else False
             portfolio_allocation = (
                 signal_data.get("portfolio_allocation", None) if signal_data else None
             )
@@ -479,12 +513,24 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             if not cls.running:
                 break
 
-            if await cls._has_reached_daily_trade_limit():
-                logger.info(
-                    f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                    f"Skipping remaining candidates."
-                )
-                break
+            # Check if daily limit reached (allow golden tickers to bypass)
+            daily_limit_reached = await cls._has_reached_daily_trade_limit()
+            is_golden = False
+            
+            if daily_limit_reached:
+                signal_data, _ = short_signal_lookup.get(ticker, (None, ""))
+                is_golden = cls._is_golden_ticker(entry_score, signal_data)
+                if not is_golden:
+                    logger.info(
+                        f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                        f"Skipping {ticker} (not golden/exceptional, score: {entry_score:.2f})."
+                    )
+                    break
+                else:
+                    logger.info(
+                        f"Daily trade limit reached, but {ticker} is GOLDEN "
+                        f"(entry_score: {entry_score:.2f}) - allowing entry"
+                    )
 
             active_trades = await cls._get_active_trades()
             active_count = len(active_trades)
@@ -516,10 +562,14 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 )
                 continue
 
+            # Use the is_golden from daily limit check, or check signal_data if not already set
+            if not is_golden:
+                is_golden = signal_data.get("is_golden", False) if signal_data else False
+            
+            golden_prefix = "🟡 GOLDEN: " if is_golden else ""
             ranked_reason = (
-                f"{reason} (ranked #{rank} short, entry_score: {entry_score:.2f})"
+                f"{golden_prefix}{reason} (ranked #{rank} short, entry_score: {entry_score:.2f})"
             )
-            is_golden = signal_data.get("is_golden", False) if signal_data else False
             portfolio_allocation = (
                 signal_data.get("portfolio_allocation", None) if signal_data else None
             )
