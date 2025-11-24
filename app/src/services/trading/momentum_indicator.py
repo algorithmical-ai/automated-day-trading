@@ -24,13 +24,19 @@ class MomentumIndicator(BaseTradingIndicator):
     top_k: int = 2
     exceptional_momentum_threshold: float = 5.0
     min_momentum_threshold: float = 3.0
+    max_momentum_threshold: float = (
+        50.0  # Avoid entering on extreme momentum (likely at peak)
+    )
     min_daily_volume: int = 1000
-    stop_loss_threshold: float = -1.5
-    trailing_stop_percent: float = 1.5
+    stop_loss_threshold: float = -2.5  # Increased from -1.5% to give trades more room
+    trailing_stop_percent: float = 2.5  # Increased from 1.5% to reduce premature exits
     min_adx_threshold: float = 20.0
     rsi_oversold_for_long: float = 35.0
     rsi_overbought_for_short: float = 65.0
     profit_target_strong_momentum: float = 5.0
+    min_holding_period_seconds: int = (
+        60  # Minimum 60 seconds before allowing exit (prevent instant exits)
+    )
 
     @classmethod
     def indicator_name(cls) -> str:
@@ -335,10 +341,10 @@ class MomentumIndicator(BaseTradingIndicator):
             "failed_quality_filters": 0,
             "passed": 0,
         }
-        
+
         # Collect inactive ticker reasons for batch writing
         inactive_ticker_logs = []
-        
+
         for ticker in candidates_to_fetch:
             if not cls.running:
                 break
@@ -346,13 +352,15 @@ class MomentumIndicator(BaseTradingIndicator):
             market_data_response = market_data_dict.get(ticker)
             if not market_data_response:
                 stats["no_market_data"] += 1
-                inactive_ticker_logs.append({
-                    "ticker": ticker,
-                    "indicator": cls.indicator_name(),
-                    "reason_not_to_enter_long": "No market data response",
-                    "reason_not_to_enter_short": "No market data response",
-                    "technical_indicators": None,
-                })
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": "No market data response",
+                        "reason_not_to_enter_short": "No market data response",
+                        "technical_indicators": None,
+                    }
+                )
                 continue
 
             technical_analysis = market_data_response.get("technical_analysis", {})
@@ -361,13 +369,15 @@ class MomentumIndicator(BaseTradingIndicator):
             if not datetime_price:
                 stats["no_datetime_price"] += 1
                 logger.debug(f"No datetime_price data for {ticker}")
-                inactive_ticker_logs.append({
-                    "ticker": ticker,
-                    "indicator": cls.indicator_name(),
-                    "reason_not_to_enter_long": "No datetime_price data",
-                    "reason_not_to_enter_short": "No datetime_price data",
-                    "technical_indicators": technical_analysis,
-                })
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": "No datetime_price data",
+                        "reason_not_to_enter_short": "No datetime_price data",
+                        "technical_indicators": technical_analysis,
+                    }
+                )
                 continue
 
             momentum_score, reason = cls._calculate_momentum(datetime_price)
@@ -386,14 +396,42 @@ class MomentumIndicator(BaseTradingIndicator):
                 else:
                     reason_long = None
                     reason_short = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}%"
-                
-                inactive_ticker_logs.append({
-                    "ticker": ticker,
-                    "indicator": cls.indicator_name(),
-                    "reason_not_to_enter_long": reason_long,
-                    "reason_not_to_enter_short": reason_short,
-                    "technical_indicators": technical_analysis,
-                })
+
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": reason_long,
+                        "reason_not_to_enter_short": reason_short,
+                        "technical_indicators": technical_analysis,
+                    }
+                )
+                continue
+
+            # Check for extreme momentum (likely entering at peak)
+            if abs_momentum > cls.max_momentum_threshold:
+                stats["low_momentum"] += 1  # Reuse this stat for high momentum
+                logger.debug(
+                    f"Skipping {ticker}: momentum {momentum_score:.2f}% > "
+                    f"maximum threshold {cls.max_momentum_threshold}% (likely at peak)"
+                )
+                # Determine long/short based on momentum sign
+                if momentum_score > 0:
+                    reason_long = f"Momentum {momentum_score:.2f}% > maximum threshold {cls.max_momentum_threshold}% (likely at peak)"
+                    reason_short = None
+                else:
+                    reason_long = None
+                    reason_short = f"Momentum {momentum_score:.2f}% > maximum threshold {cls.max_momentum_threshold}% (likely at peak)"
+
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": reason_long,
+                        "reason_not_to_enter_short": reason_short,
+                        "technical_indicators": technical_analysis,
+                    }
+                )
                 continue
 
             passes_filter, filter_reason = await cls._passes_stock_quality_filters(
@@ -409,14 +447,16 @@ class MomentumIndicator(BaseTradingIndicator):
                 else:
                     reason_long = None
                     reason_short = filter_reason
-                
-                inactive_ticker_logs.append({
-                    "ticker": ticker,
-                    "indicator": cls.indicator_name(),
-                    "reason_not_to_enter_long": reason_long,
-                    "reason_not_to_enter_short": reason_short,
-                    "technical_indicators": technical_analysis,
-                })
+
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": reason_long,
+                        "reason_not_to_enter_short": reason_short,
+                        "technical_indicators": technical_analysis,
+                    }
+                )
                 continue
 
             stats["passed"] += 1
@@ -428,14 +468,17 @@ class MomentumIndicator(BaseTradingIndicator):
 
         # Batch write all inactive ticker reasons in parallel
         if inactive_ticker_logs:
+
             async def log_one(log_data):
                 await DynamoDBClient.log_inactive_ticker_reason(**log_data)
-            
+
             # Write in batches of 20 to avoid overwhelming DynamoDB
             batch_size = 20
             for i in range(0, len(inactive_ticker_logs), batch_size):
-                batch = inactive_ticker_logs[i:i + batch_size]
-                await asyncio.gather(*[log_one(log_data) for log_data in batch], return_exceptions=True)
+                batch = inactive_ticker_logs[i : i + batch_size]
+                await asyncio.gather(
+                    *[log_one(log_data) for log_data in batch], return_exceptions=True
+                )
 
         logger.info(
             f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers "
@@ -683,10 +726,34 @@ class MomentumIndicator(BaseTradingIndicator):
             enter_price = trade.get("enter_price")
             trailing_stop = float(trade.get("trailing_stop", 0.5))
             peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
+            created_at = trade.get("created_at")
 
             if not ticker or enter_price is None or enter_price <= 0:
                 logger.warning(f"Invalid momentum trade data: {trade}")
                 continue
+
+            # Check minimum holding period
+            if created_at:
+                try:
+                    enter_time = datetime.fromisoformat(
+                        created_at.replace("Z", "+00:00")
+                    )
+                    if enter_time.tzinfo is None:
+                        enter_time = enter_time.replace(tzinfo=timezone.utc)
+                    current_time = datetime.now(timezone.utc)
+                    holding_period_seconds = (current_time - enter_time).total_seconds()
+
+                    if holding_period_seconds < cls.min_holding_period_seconds:
+                        logger.debug(
+                            f"Skipping exit check for {ticker}: "
+                            f"holding period {holding_period_seconds:.1f}s < "
+                            f"minimum {cls.min_holding_period_seconds}s"
+                        )
+                        continue
+                except Exception as e:
+                    logger.warning(
+                        f"Error calculating holding period for {ticker}: {str(e)}"
+                    )
 
             market_data_response = await MCPClient.get_market_data(ticker)
             if not market_data_response:

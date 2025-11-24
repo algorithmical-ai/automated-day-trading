@@ -78,11 +78,11 @@ class BaseTradingIndicator(ABC):
         today = date.today().isoformat()
 
         # Query DynamoDB for actual completed trade count
-        completed_count = await DynamoDBClient.get_completed_trade_count(
+        cls.daily_trades_count = await DynamoDBClient.get_completed_trade_count(
             date=today, indicator=cls.indicator_name()
         )
 
-        return completed_count >= cls.max_daily_trades
+        return cls.daily_trades_count >= cls.max_daily_trades
 
     @classmethod
     def _increment_daily_trade_count(cls):
