@@ -204,13 +204,8 @@ class BaseTradingIndicator(ABC):
                 indicator=cls.indicator_name(),
                 enter_price=enter_price,
                 enter_reason=enter_reason,
+                technical_indicators_for_enter=technical_indicators,
             )
-
-            # Update with technical indicators if provided
-            if technical_indicators:
-                # Note: This would require adding a method to update technical_indicators_for_enter
-                # For now, we'll store it in a separate field if needed
-                pass
 
             cls._increment_daily_trade_count()
 

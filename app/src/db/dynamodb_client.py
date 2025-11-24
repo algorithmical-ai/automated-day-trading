@@ -222,6 +222,7 @@ class DynamoDBClient:
         indicator: str,
         enter_price: float,
         enter_reason: str,
+        technical_indicators_for_enter: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Add a momentum-based trade to ActiveTickersForAutomatedDayTrader table"""
         try:
@@ -236,6 +237,13 @@ class DynamoDBClient:
                 "peak_profit_percent": cls._convert_to_decimal(0.0),  # Initialize to 0%
                 "created_at": datetime.utcnow().isoformat(),
             }
+            
+            # Add technical indicators if provided
+            if technical_indicators_for_enter:
+                item["technical_indicators_for_enter"] = cls._convert_to_decimal(
+                    technical_indicators_for_enter
+                )
+            
             cls._momentum_table.put_item(Item=item)
             logger.info(f"Added momentum trade to DynamoDB: {ticker} - {action}")
             return True
