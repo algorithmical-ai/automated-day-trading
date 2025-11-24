@@ -99,8 +99,16 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
 
                 if long_analysis_score > short_analysis_score:
                     reason = long_result.get("message", "No entry signal")
+                    logger.debug(
+                        f"{ticker} no entry: long_score={long_analysis_score:.2f}, "
+                        f"short_score={short_analysis_score:.2f}, reason={reason}"
+                    )
                 else:
                     reason = short_result.get("message", "No entry signal")
+                    logger.debug(
+                        f"{ticker} no entry: long_score={long_analysis_score:.2f}, "
+                        f"short_score={short_analysis_score:.2f}, reason={reason}"
+                    )
 
                 return None, None, reason
 
@@ -221,12 +229,20 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             []
         )  # List of (ticker, entry_score, action, signal_data, reason)
 
+        stats = {
+            "no_market_data": 0,
+            "no_entry_signal": 0,
+            "low_entry_score": 0,
+            "passed": 0,
+        }
+
         for ticker in candidates_to_fetch:
             if not cls.running:
                 break
 
             market_data_response = market_data_dict.get(ticker)
             if not market_data_response:
+                stats["no_market_data"] += 1
                 continue
 
             # Evaluate for entry
@@ -237,6 +253,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             if action and signal_data:
                 entry_score = signal_data.get("entry_score", 0.0)
                 if entry_score >= cls.min_entry_score:
+                    stats["passed"] += 1
                     ticker_candidates.append(
                         (ticker, entry_score, action, signal_data, reason)
                     )
@@ -245,15 +262,20 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                         f"(score: {entry_score:.2f}, {reason})"
                     )
                 else:
+                    stats["low_entry_score"] += 1
                     logger.debug(
                         f"Skipping {ticker}: entry score {entry_score:.2f} < "
                         f"minimum {cls.min_entry_score}"
                     )
             else:
+                stats["no_entry_signal"] += 1
                 logger.debug(f"Skipping {ticker}: {reason}")
 
         logger.info(
-            f"Evaluated {len(ticker_candidates)} tickers with valid entry signals"
+            f"Evaluated {len(ticker_candidates)} tickers with valid entry signals "
+            f"(filtered: {stats['no_market_data']} no data, "
+            f"{stats['no_entry_signal']} no entry signal, "
+            f"{stats['low_entry_score']} low entry score < {cls.min_entry_score})"
         )
 
         # Separate long and short candidates

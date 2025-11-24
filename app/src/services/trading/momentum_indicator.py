@@ -328,18 +328,28 @@ class MomentumIndicator(BaseTradingIndicator):
 
         # Process results
         ticker_momentum_scores = []
+        stats = {
+            "no_market_data": 0,
+            "no_datetime_price": 0,
+            "low_momentum": 0,
+            "failed_quality_filters": 0,
+            "passed": 0,
+        }
+        
         for ticker in candidates_to_fetch:
             if not cls.running:
                 break
 
             market_data_response = market_data_dict.get(ticker)
             if not market_data_response:
+                stats["no_market_data"] += 1
                 continue
 
             technical_analysis = market_data_response.get("technical_analysis", {})
             datetime_price = technical_analysis.get("datetime_price", [])
 
             if not datetime_price:
+                stats["no_datetime_price"] += 1
                 logger.debug(f"No datetime_price data for {ticker}")
                 continue
 
@@ -347,6 +357,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
             abs_momentum = abs(momentum_score)
             if abs_momentum < cls.min_momentum_threshold:
+                stats["low_momentum"] += 1
                 logger.debug(
                     f"Skipping {ticker}: momentum {momentum_score:.2f}% < "
                     f"minimum threshold {cls.min_momentum_threshold}%"
@@ -357,9 +368,11 @@ class MomentumIndicator(BaseTradingIndicator):
                 ticker, market_data_response, momentum_score
             )
             if not passes_filter:
+                stats["failed_quality_filters"] += 1
                 logger.debug(f"Skipping {ticker}: {filter_reason}")
                 continue
 
+            stats["passed"] += 1
             ticker_momentum_scores.append((ticker, momentum_score, reason))
             logger.info(
                 f"{ticker} passed all filters: momentum={momentum_score:.2f}%, "
@@ -367,7 +380,11 @@ class MomentumIndicator(BaseTradingIndicator):
             )
 
         logger.info(
-            f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers"
+            f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers "
+            f"(filtered: {stats['no_market_data']} no data, "
+            f"{stats['no_datetime_price']} no datetime_price, "
+            f"{stats['low_momentum']} low momentum, "
+            f"{stats['failed_quality_filters']} failed quality filters)"
         )
 
         upward_tickers = [
