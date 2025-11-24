@@ -343,6 +343,12 @@ class MomentumIndicator(BaseTradingIndicator):
             market_data_response = market_data_dict.get(ticker)
             if not market_data_response:
                 stats["no_market_data"] += 1
+                await DynamoDBClient.log_inactive_ticker_reason(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    reason_not_to_enter_long="No market data response",
+                    reason_not_to_enter_short="No market data response",
+                )
                 continue
 
             technical_analysis = market_data_response.get("technical_analysis", {})
@@ -351,6 +357,13 @@ class MomentumIndicator(BaseTradingIndicator):
             if not datetime_price:
                 stats["no_datetime_price"] += 1
                 logger.debug(f"No datetime_price data for {ticker}")
+                await DynamoDBClient.log_inactive_ticker_reason(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    reason_not_to_enter_long="No datetime_price data",
+                    reason_not_to_enter_short="No datetime_price data",
+                    technical_indicators=technical_analysis,
+                )
                 continue
 
             momentum_score, reason = cls._calculate_momentum(datetime_price)
@@ -362,6 +375,21 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"Skipping {ticker}: momentum {momentum_score:.2f}% < "
                     f"minimum threshold {cls.min_momentum_threshold}%"
                 )
+                # Determine long/short based on momentum sign
+                if momentum_score > 0:
+                    reason_long = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}%"
+                    reason_short = None
+                else:
+                    reason_long = None
+                    reason_short = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}%"
+                
+                await DynamoDBClient.log_inactive_ticker_reason(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    reason_not_to_enter_long=reason_long,
+                    reason_not_to_enter_short=reason_short,
+                    technical_indicators=technical_analysis,
+                )
                 continue
 
             passes_filter, filter_reason = await cls._passes_stock_quality_filters(
@@ -370,6 +398,21 @@ class MomentumIndicator(BaseTradingIndicator):
             if not passes_filter:
                 stats["failed_quality_filters"] += 1
                 logger.debug(f"Skipping {ticker}: {filter_reason}")
+                # Determine long/short based on momentum sign
+                if momentum_score > 0:
+                    reason_long = filter_reason
+                    reason_short = None
+                else:
+                    reason_long = None
+                    reason_short = filter_reason
+                
+                await DynamoDBClient.log_inactive_ticker_reason(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    reason_not_to_enter_long=reason_long,
+                    reason_not_to_enter_short=reason_short,
+                    technical_indicators=technical_analysis,
+                )
                 continue
 
             stats["passed"] += 1

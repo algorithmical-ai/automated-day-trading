@@ -34,6 +34,8 @@ MAB_TABLE_NAME = "MABForDayTradingService"
 COMPLETED_TRADES_TABLE_NAME = "CompletedTradesForAutomatedDayTrading"
 # Inactive tickers table
 INACTIVE_TICKERS_TABLE_NAME = "InactiveTickers"
+# Inactive tickers for day trading table (with indicator as sort key)
+INACTIVE_TICKERS_FOR_DAY_TRADING_TABLE_NAME = "InactiveTickersForDayTrading"
 
 class DynamoDBClient:
     """Client for DynamoDB operations"""
@@ -45,6 +47,7 @@ class DynamoDBClient:
     _mab_table = None
     _completed_trades_table = None
     _inactive_tickers_table = None
+    _inactive_tickers_for_day_trading_table = None
     
     @classmethod
     def configure(cls):
@@ -72,6 +75,7 @@ class DynamoDBClient:
         cls._mab_table = cls._dynamodb.Table(MAB_TABLE_NAME)    
         cls._completed_trades_table = cls._dynamodb.Table(COMPLETED_TRADES_TABLE_NAME)
         cls._inactive_tickers_table = cls._dynamodb.Table(INACTIVE_TICKERS_TABLE_NAME)
+        cls._inactive_tickers_for_day_trading_table = cls._dynamodb.Table(INACTIVE_TICKERS_FOR_DAY_TRADING_TABLE_NAME)
 
     @classmethod
     def _is_float_type(cls, obj):
@@ -865,3 +869,66 @@ class DynamoDBClient:
         except Exception as e:
             logger.error(f"Error getting all inactive tickers from DynamoDB: {str(e)}")
             return []
+
+    @classmethod
+    async def log_inactive_ticker_reason(
+        cls,
+        ticker: str,
+        indicator: str,
+        reason_not_to_enter_long: Optional[str] = None,
+        reason_not_to_enter_short: Optional[str] = None,
+        technical_indicators: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Log why a ticker is not entering a trade in InactiveTickersForDayTrading table
+        
+        Args:
+            ticker: Ticker symbol (partition key)
+            indicator: Indicator name (sort key)
+            reason_not_to_enter_long: Reason for not entering long position
+            reason_not_to_enter_short: Reason for not entering short position
+            technical_indicators: Technical indicators data
+            
+        Returns:
+            True if logged successfully, False otherwise
+        """
+        try:
+            cls._ensure_tables()
+            
+            # Use EST timezone for timestamps (NYSE trading timezone)
+            est_tz = pytz.timezone("America/New_York")
+            last_updated_est = datetime.now(est_tz).isoformat()
+            
+            item = {
+                "ticker": ticker,
+                "indicator": indicator,
+                "last_updated": last_updated_est,
+            }
+            
+            if reason_not_to_enter_long is not None:
+                item["reason_not_to_enter_long"] = reason_not_to_enter_long
+                
+            if reason_not_to_enter_short is not None:
+                item["reason_not_to_enter_short"] = reason_not_to_enter_short
+                
+            if technical_indicators:
+                # Convert technical indicators, removing datetime_price if present
+                tech_indicators_clean = {
+                    k: v for k, v in technical_indicators.items()
+                    if k != "datetime_price"
+                }
+                item["technical_indicators"] = tech_indicators_clean
+            
+            item = cls._ensure_all_floats_converted(item)
+            
+            cls._inactive_tickers_for_day_trading_table.put_item(Item=item)
+            logger.debug(
+                f"Logged inactive ticker reason for {ticker} ({indicator}): "
+                f"long={reason_not_to_enter_long}, short={reason_not_to_enter_short}"
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                f"Error logging inactive ticker reason for {ticker} ({indicator}): {str(e)}"
+            )
+            return False
