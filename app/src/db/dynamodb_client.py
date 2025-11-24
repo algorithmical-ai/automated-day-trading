@@ -7,7 +7,7 @@ import boto3
 import json
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import pytz
 from app.src.common.loguru_logger import logger
 
@@ -36,6 +36,8 @@ COMPLETED_TRADES_TABLE_NAME = "CompletedTradesForAutomatedDayTrading"
 INACTIVE_TICKERS_TABLE_NAME = "InactiveTickers"
 # Inactive tickers for day trading table (with indicator as sort key)
 INACTIVE_TICKERS_FOR_DAY_TRADING_TABLE_NAME = "InactiveTickersForDayTrading"
+# Day trader events table for LLM threshold adjustments
+DAY_TRADER_EVENTS_TABLE_NAME = "DayTraderEvents"
 
 class DynamoDBClient:
     """Client for DynamoDB operations"""
@@ -48,6 +50,7 @@ class DynamoDBClient:
     _completed_trades_table = None
     _inactive_tickers_table = None
     _inactive_tickers_for_day_trading_table = None
+    _day_trader_events_table = None
     
     @classmethod
     def configure(cls):
@@ -76,6 +79,7 @@ class DynamoDBClient:
         cls._completed_trades_table = cls._dynamodb.Table(COMPLETED_TRADES_TABLE_NAME)
         cls._inactive_tickers_table = cls._dynamodb.Table(INACTIVE_TICKERS_TABLE_NAME)
         cls._inactive_tickers_for_day_trading_table = cls._dynamodb.Table(INACTIVE_TICKERS_FOR_DAY_TRADING_TABLE_NAME)
+        cls._day_trader_events_table = cls._dynamodb.Table(DAY_TRADER_EVENTS_TABLE_NAME)
 
     @classmethod
     def _is_float_type(cls, obj):
@@ -966,5 +970,107 @@ class DynamoDBClient:
         except Exception as e:
             logger.error(
                 f"Error logging inactive ticker reason for {ticker} ({indicator}): {str(e)}"
+            )
+            return False
+
+    @classmethod
+    async def get_inactive_tickers_for_indicator(
+        cls, indicator: str, minutes_window: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Get inactive tickers for a specific indicator within the last N minutes
+        
+        Args:
+            indicator: Indicator name
+            minutes_window: Number of minutes to look back (default: 5)
+            
+        Returns:
+            List of inactive ticker records
+        """
+        try:
+            cls._ensure_tables()
+            
+            # Calculate cutoff time
+            cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=minutes_window)
+            cutoff_iso = cutoff_time.isoformat()
+            
+            # Scan table and filter by indicator and time
+            response = cls._inactive_tickers_for_day_trading_table.scan(
+                FilterExpression="#ind = :ind AND #lu >= :cutoff",
+                ExpressionAttributeNames={
+                    "#ind": "indicator",
+                    "#lu": "last_updated",
+                },
+                ExpressionAttributeValues={
+                    ":ind": indicator,
+                    ":cutoff": cutoff_iso,
+                },
+            )
+            
+            items = []
+            for item in response.get("Items", []):
+                converted_item = cls._convert_from_decimal(item)
+                items.append(converted_item)
+            
+            return items
+        except Exception as e:
+            logger.error(
+                f"Error getting inactive tickers for {indicator}: {str(e)}"
+            )
+            return []
+
+    @classmethod
+    async def store_day_trader_event(
+        cls,
+        date: str,
+        indicator: str,
+        threshold_change: Dict[str, Any],
+        max_long_trades: int,
+        max_short_trades: int,
+        llm_response: Optional[str] = None,
+    ) -> bool:
+        """
+        Store a day trader event (LLM threshold adjustment) in DayTraderEvents table
+        
+        Args:
+            date: Date in yyyy-mm-dd format (partition key)
+            indicator: Indicator name (sort key)
+            threshold_change: Dictionary of threshold changes
+            max_long_trades: Maximum long trades
+            max_short_trades: Maximum short trades
+            llm_response: Optional LLM response text
+            
+        Returns:
+            True if stored successfully, False otherwise
+        """
+        try:
+            cls._ensure_tables()
+            
+            est_tz = pytz.timezone("America/New_York")
+            last_updated_est = datetime.now(est_tz).isoformat()
+            
+            item = {
+                "date": date,
+                "indicator": indicator,
+                "last_updated": last_updated_est,
+                "threshold_change": cls._convert_to_decimal(threshold_change),
+                "max_long_trades": max_long_trades,
+                "max_short_trades": max_short_trades,
+            }
+            
+            if llm_response:
+                item["llm_response"] = llm_response
+            
+            item = cls._ensure_all_floats_converted(item)
+            
+            cls._day_trader_events_table.put_item(Item=item)
+            logger.info(
+                f"Stored day trader event for {indicator} on {date}: "
+                f"max_long={max_long_trades}, max_short={max_short_trades}"
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                f"Error storing day trader event for {indicator} on {date}: {str(e)}"
             )
             return False

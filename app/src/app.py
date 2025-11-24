@@ -12,6 +12,9 @@ from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
 from app.src.services.candidate_generator.screener_monitor_service import (
     ScreenerMonitorService,
 )
+from app.src.services.threshold_adjustment.threshold_adjustment_service import (
+    ThresholdAdjustmentService,
+)
 from app.src.config.constants import MOMENTUM_TOP_K, MCP_SERVER_TRANSPORT
 from app.src.services.mcp.server import main as mcp_server_main
 
@@ -24,6 +27,7 @@ def setup_signal_handlers():
         TradingService.stop()
         ToolDiscoveryService.stop()
         ScreenerMonitorService().stop()
+        ThresholdAdjustmentService.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -70,6 +74,10 @@ async def main():
             ScreenerMonitorService().start(),
         ]
 
+        # Start threshold adjustment service (runs as background task)
+        threshold_task = await ThresholdAdjustmentService.start()
+        tasks.append(threshold_task)
+
         # Add MCP server task if applicable (typically only for local dev)
         if start_mcp_server:
             tasks.append(_run_mcp_server())
@@ -84,6 +92,7 @@ async def main():
         ToolDiscoveryService.stop()
         TradingService.stop()
         ScreenerMonitorService().stop()
+        ThresholdAdjustmentService.stop()
         sys.exit(1)
 
 

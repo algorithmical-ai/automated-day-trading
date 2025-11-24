@@ -1,6 +1,7 @@
 """
 Constants and configuration loaded from environment variables
 """
+
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -16,8 +17,7 @@ load_dotenv(dotenv_path=env_path, override=True)
 
 # MCP API Configuration
 MARKET_DATA_MCP_URL = os.getenv(
-    "MARKET_DATA_MCP_URL",
-    "https://market-data-analyzer-d1d18da61b50.herokuapp.com/mcp"
+    "MARKET_DATA_MCP_URL", "https://market-data-analyzer-d1d18da61b50.herokuapp.com/mcp"
 )
 
 MCP_AUTH_HEADER_NAME = os.getenv("MCP_AUTH_HEADER_NAME", "Authorization")
@@ -36,8 +36,7 @@ if isinstance(DEBUG_DAY_TRADING, str):
 
 # DynamoDB Configuration
 DYNAMODB_TABLE_NAME = os.getenv(
-    "DYNAMODB_TABLE_NAME",
-    "ActiveTradesForAutomatedWorkflow"
+    "DYNAMODB_TABLE_NAME", "ActiveTradesForAutomatedWorkflow"
 )
 
 # AWS Configuration
@@ -46,7 +45,9 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 
 # Momentum Trading Configuration
-MOMENTUM_TOP_K = int(os.getenv("MOMENTUM_TOP_K", "10"))  # Number of top tickers to trade per direction
+MOMENTUM_TOP_K = int(
+    os.getenv("MOMENTUM_TOP_K", "10")
+)  # Number of top tickers to trade per direction
 
 
 # ---------------------------------------------------------------------------
@@ -120,3 +121,8 @@ if isinstance(DEBUG_TRADING_SERVICE, str):
 
 
 MARKET_DATA_ANALYZER_INDICATOR = "Market Data Analyzer"
+
+# AWS Bedrock Configuration
+AWS_BEDROCK_MODEL_ID: str = os.getenv(
+    "AWS_BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+)
