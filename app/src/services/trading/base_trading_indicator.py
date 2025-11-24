@@ -13,7 +13,6 @@ from app.src.services.mcp.mcp_client import MCPClient
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
-from app.src.services.candidate_generator.alpaca_screener import AlpacaScreenerService
 
 
 class BaseTradingIndicator(ABC):
@@ -119,9 +118,8 @@ class BaseTradingIndicator(ABC):
 
     @classmethod
     async def _get_screened_tickers(cls) -> List[str]:
-        """Get screened tickers from Alpaca Screener Service"""
-        screener_service = AlpacaScreenerService()
-        screened_data = await screener_service.get_all_screened_tickers()
+        """Get screened tickers from MCP tool (proxied Alpaca screener)"""
+        screened_data = await MCPClient.get_alpaca_screened_tickers()
 
         if not screened_data:
             return []
