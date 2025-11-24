@@ -143,6 +143,49 @@ class BaseTradingIndicator(ABC):
         return tickers
 
     @classmethod
+    async def _fetch_market_data_batch(
+        cls, tickers: List[str], max_concurrent: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Fetch market data for multiple tickers in parallel batches.
+
+        Args:
+            tickers: List of ticker symbols to fetch
+            max_concurrent: Maximum number of concurrent API calls
+
+        Returns:
+            Dictionary mapping ticker -> market_data_response (or None if failed)
+        """
+        if not tickers:
+            return {}
+
+        async def fetch_one(ticker: str) -> Tuple[str, Any]:
+            """Fetch market data for a single ticker"""
+            try:
+                market_data = await MCPClient.get_market_data(ticker)
+                return (ticker, market_data)
+            except Exception as e:
+                logger.debug(f"Failed to get market data for {ticker}: {str(e)}")
+                return (ticker, None)
+
+        # Process in batches to avoid overwhelming the API
+        results: Dict[str, Any] = {}
+        for i in range(0, len(tickers), max_concurrent):
+            batch = tickers[i : i + max_concurrent]
+            batch_results = await asyncio.gather(
+                *[fetch_one(ticker) for ticker in batch], return_exceptions=True
+            )
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    logger.debug(f"Exception in batch fetch: {str(result)}")
+                    continue
+                if isinstance(result, tuple) and len(result) == 2:
+                    ticker, market_data = result
+                    results[ticker] = market_data
+
+        return results
+
+    @classmethod
     async def _get_active_trades(cls) -> List[Dict[str, Any]]:
         """Get active trades for this indicator"""
         return await DynamoDBClient.get_all_momentum_trades(cls.indicator_name())

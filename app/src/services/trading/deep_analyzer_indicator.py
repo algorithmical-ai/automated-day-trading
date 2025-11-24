@@ -164,6 +164,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
     @measure_latency
     async def _run_entry_cycle(cls):
         """Execute a single Deep Analyzer entry cycle."""
+        logger.debug("Starting Deep Analyzer entry cycle")
         # Check market open
         if not await cls._check_market_open():
             logger.debug("Market is closed, skipping Deep Analyzer entry logic")
@@ -201,36 +202,33 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
 
         logger.info(f"Current active trades: {active_count}/{cls.max_active_trades}")
 
+        # Filter out tickers that are already active or in cooldown before fetching market data
+        candidates_to_fetch = [
+            ticker
+            for ticker in filtered_tickers
+            if ticker not in active_ticker_set and not cls._is_ticker_in_cooldown(ticker)
+        ]
+
+        logger.info(
+            f"Fetching market data for {len(candidates_to_fetch)} tickers in parallel batches"
+        )
+
+        # Fetch market data in parallel batches
+        market_data_dict = await cls._fetch_market_data_batch(
+            candidates_to_fetch, max_concurrent=10
+        )
+
         # Evaluate all tickers for entry
         ticker_candidates = (
             []
         )  # List of (ticker, entry_score, action, signal_data, reason)
-        market_data_dict = {}
 
-        for ticker in filtered_tickers:
+        for ticker in candidates_to_fetch:
             if not cls.running:
                 break
 
-            if ticker in active_ticker_set:
-                logger.debug(
-                    f"Ticker {ticker} already has an active Deep Analyzer trade, skipping"
-                )
-                continue
-
-            # Get market data
-            market_data_response = await MCPClient.get_market_data(ticker)
+            market_data_response = market_data_dict.get(ticker)
             if not market_data_response:
-                logger.debug(f"Failed to get market data for {ticker}")
-                continue
-
-            market_data_dict[ticker] = market_data_response
-
-            # Check cooldown
-            if cls._is_ticker_in_cooldown(ticker):
-                logger.debug(
-                    f"Skipping {ticker}: still in cooldown period "
-                    f"({cls.ticker_cooldown_minutes} minutes after exit)"
-                )
                 continue
 
             # Evaluate for entry

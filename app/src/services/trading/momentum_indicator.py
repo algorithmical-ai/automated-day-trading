@@ -277,6 +277,7 @@ class MomentumIndicator(BaseTradingIndicator):
     @measure_latency
     async def _run_entry_cycle(cls):
         """Execute a single momentum entry cycle."""
+        logger.debug("Starting momentum entry cycle")
         if not await cls._check_market_open():
             logger.debug("Market is closed, skipping momentum entry logic")
             await asyncio.sleep(cls.entry_cycle_seconds)
@@ -310,25 +311,31 @@ class MomentumIndicator(BaseTradingIndicator):
 
         logger.info(f"Current active trades: {active_count}/{cls.max_active_trades}")
 
-        ticker_momentum_scores = []
-        market_data_dict = {}
+        # Filter out tickers that are already active or in cooldown before fetching market data
+        candidates_to_fetch = [
+            ticker
+            for ticker in filtered_tickers
+            if ticker not in active_ticker_set and not cls._is_ticker_in_cooldown(ticker)
+        ]
 
-        for ticker in filtered_tickers:
+        logger.info(
+            f"Fetching market data for {len(candidates_to_fetch)} tickers in parallel batches"
+        )
+
+        # Fetch market data in parallel batches
+        market_data_dict = await cls._fetch_market_data_batch(
+            candidates_to_fetch, max_concurrent=10
+        )
+
+        # Process results
+        ticker_momentum_scores = []
+        for ticker in candidates_to_fetch:
             if not cls.running:
                 break
 
-            if ticker in active_ticker_set:
-                logger.debug(
-                    f"Ticker {ticker} already has an active momentum trade, skipping"
-                )
-                continue
-
-            market_data_response = await MCPClient.get_market_data(ticker)
+            market_data_response = market_data_dict.get(ticker)
             if not market_data_response:
-                logger.debug(f"Failed to get market data for {ticker}")
                 continue
-
-            market_data_dict[ticker] = market_data_response
 
             technical_analysis = market_data_response.get("technical_analysis", {})
             datetime_price = technical_analysis.get("datetime_price", [])
@@ -352,13 +359,6 @@ class MomentumIndicator(BaseTradingIndicator):
             )
             if not passes_filter:
                 logger.debug(f"Skipping {ticker}: {filter_reason}")
-                continue
-
-            if cls._is_ticker_in_cooldown(ticker):
-                logger.debug(
-                    f"Skipping {ticker}: still in cooldown period "
-                    f"({cls.ticker_cooldown_minutes} minutes after exit)"
-                )
                 continue
 
             ticker_momentum_scores.append((ticker, momentum_score, reason))
