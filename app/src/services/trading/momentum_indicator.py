@@ -71,7 +71,10 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"Volume too low: {avg_volume:,} < {cls.min_daily_volume:,} minimum",
             )
 
-        adx = technical_analysis.get("adx", 0.0)
+        adx = technical_analysis.get("adx")
+        if adx is None:
+            return False, "Missing ADX data"
+
         if adx < cls.min_adx_threshold:
             return (
                 False,
