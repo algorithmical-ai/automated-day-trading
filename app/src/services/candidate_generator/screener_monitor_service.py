@@ -23,6 +23,7 @@ class ScreenerMonitorService(metaclass=SingletonMeta):
         self._dynamodb = DynamoDBClient()
         self._running = False
         self._check_interval = 60  # Check every 60 seconds (1 minute)
+        self._top_n = 50  # Check top 50 from each category (increased from 10)
 
     @measure_latency
     async def _check_and_add_tickers(self):
@@ -32,8 +33,9 @@ class ScreenerMonitorService(metaclass=SingletonMeta):
         """
         try:
             # Get movers and most actives from Alpaca screener
-            most_actives = await self._screener.get_most_actives(top=10)
-            movers = await self._screener.get_movers(top=10)
+            logger.debug(f"Fetching top {self._top_n} from each screener category...")
+            most_actives = await self._screener.get_most_actives(top=self._top_n)
+            movers = await self._screener.get_movers(top=self._top_n)
 
             # Combine all tickers
             all_screened_tickers: Set[str] = set()
@@ -42,36 +44,42 @@ class ScreenerMonitorService(metaclass=SingletonMeta):
             all_screened_tickers.update(movers.get("losers", []))
 
             if not all_screened_tickers:
-                logger.debug("No tickers found in Alpaca screener")
+                logger.warning("⚠️  No tickers found in Alpaca screener - API may be down or market closed")
                 return
 
-            logger.debug(
-                f"Checking {len(all_screened_tickers)} screened tickers "
+            logger.info(
+                f"📊 Screener monitor: Checking {len(all_screened_tickers)} unique screened tickers "
                 f"({len(most_actives)} most actives, "
                 f"{len(movers.get('gainers', []))} gainers, "
                 f"{len(movers.get('losers', []))} losers)"
             )
 
-            # Check each ticker and add if not present in InactiveTickers
-            added_count = 0
-            existing_count = 0
+            # Convert to list and filter empty tickers
+            ticker_list = [t.upper() for t in all_screened_tickers if t and t.strip()]
+            
+            if not ticker_list:
+                logger.warning("⚠️  No valid tickers after filtering")
+                return
+
+            # Batch check all tickers in parallel
+            logger.debug(f"Batch checking existence of {len(ticker_list)} tickers in InactiveTickers...")
+            existence_map = await self._dynamodb.batch_check_tickers_exist_in_inactive(ticker_list)
 
             # Convert lists to sets for O(1) membership checks
             most_actives_set = set(most_actives)
             gainers_set = set(movers.get("gainers", []))
             losers_set = set(movers.get("losers", []))
 
-            for ticker in all_screened_tickers:
-                if not ticker or not ticker.strip():
-                    continue
+            # Prepare tickers to add (those that don't exist)
+            tickers_to_add = []
+            added_count = 0
+            existing_count = 0
 
-                ticker_upper = ticker.upper()
-
-                # Check if ticker exists in InactiveTickers
-                exists = await self._dynamodb.ticker_exists_in_inactive(ticker_upper)
-
+            for ticker_upper in ticker_list:
+                exists = existence_map.get(ticker_upper, False)
+                
                 if not exists:
-                    # Add ticker to InactiveTickers
+                    # Prepare to add ticker
                     categories = []
                     if ticker_upper in most_actives_set:
                         categories.append("most_actives")
@@ -81,29 +89,41 @@ class ScreenerMonitorService(metaclass=SingletonMeta):
                         categories.append("losers")
 
                     reason = f"Auto-added from Alpaca screener: {', '.join(categories) if categories else 'screener'}"
+                    tickers_to_add.append((ticker_upper, reason))
+                else:
+                    existing_count += 1
 
-                    success = await self._dynamodb.add_ticker_to_inactive(
-                        ticker_upper, reason
-                    )
-
-                    if success:
+            # Add all new tickers in parallel
+            if tickers_to_add:
+                logger.debug(f"Adding {len(tickers_to_add)} new ticker(s) to InactiveTickers...")
+                add_tasks = [
+                    self._dynamodb.add_ticker_to_inactive(ticker, reason)
+                    for ticker, reason in tickers_to_add
+                ]
+                add_results = await asyncio.gather(*add_tasks, return_exceptions=True)
+                
+                for (ticker_upper, reason), success in zip(tickers_to_add, add_results):
+                    if isinstance(success, Exception):
+                        logger.error(f"Error adding ticker {ticker_upper}: {success}")
+                    elif success:
                         added_count += 1
                         logger.info(
                             f"✅ Added new ticker {ticker_upper} to InactiveTickers "
                             f"(will be picked up by DynamoDB polling)"
                         )
-                else:
-                    existing_count += 1
 
             if added_count > 0:
                 logger.info(
                     f"📊 Screener monitor: Added {added_count} new ticker(s) to InactiveTickers, "
-                    f"{existing_count} already existed"
+                    f"{existing_count} already existed (checked {len(ticker_list)} total)"
                 )
             elif existing_count > 0:
-                logger.debug(
-                    f"📊 Screener monitor: All {existing_count} ticker(s) already in InactiveTickers"
+                logger.info(
+                    f"📊 Screener monitor: All {existing_count} ticker(s) already in InactiveTickers "
+                    f"(checked {len(ticker_list)} total)"
                 )
+            else:
+                logger.warning(f"⚠️  Screener monitor: No valid tickers to process")
 
         except Exception as e:
             logger.error(f"Error in screener monitor check: {str(e)}", exc_info=True)

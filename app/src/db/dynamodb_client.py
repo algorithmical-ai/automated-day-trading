@@ -845,6 +845,35 @@ class DynamoDBClient:
             return False
 
     @classmethod
+    async def batch_check_tickers_exist_in_inactive(cls, tickers: List[str]) -> Dict[str, bool]:
+        """
+        Batch check if multiple tickers exist in InactiveTickers table using parallel async calls
+
+        Args:
+            tickers: List of ticker symbols to check
+
+        Returns:
+            Dict mapping ticker -> exists (True/False)
+        """
+        if not tickers:
+            return {}
+
+        try:
+            # Use asyncio.gather to check all tickers in parallel
+            import asyncio
+            tasks = [cls.ticker_exists_in_inactive(ticker) for ticker in tickers]
+            results = await asyncio.gather(*tasks)
+            
+            return dict(zip(tickers, results))
+        except Exception as e:
+            logger.error(f"Error batch checking tickers in InactiveTickers: {str(e)}")
+            # Fallback to individual checks
+            result = {}
+            for ticker in tickers:
+                result[ticker] = await cls.ticker_exists_in_inactive(ticker)
+            return result
+
+    @classmethod
     async def add_ticker_to_inactive(cls, ticker: str, reason: str = "Auto-added from Alpaca screener (most actives/movers)") -> bool:
         """
         Add a ticker to InactiveTickers table if it doesn't exist
