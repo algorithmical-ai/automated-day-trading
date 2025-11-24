@@ -19,34 +19,35 @@ class ThresholdAdjustmentService:
     """Service to analyze inactive tickers and adjust thresholds using LLM"""
 
     running: bool = False
-    _task: Optional[asyncio.Task] = None
     analysis_interval_seconds: int = 300  # Run every 5 minutes
 
     @classmethod
     async def start(cls):
-        """Start the threshold adjustment service"""
+        """Start the threshold adjustment service (runs the service loop)"""
         if cls.running:
             logger.warning("Threshold adjustment service already running")
             return
 
         cls.running = True
-        cls._task = asyncio.create_task(cls._run_service())
         logger.info("Threshold adjustment service started")
 
-        # Return the task so it can be awaited if needed
-        return cls._task
+        # Run the service loop directly (will be awaited by asyncio.gather)
+        await cls._run_service()
 
     @classmethod
     def stop(cls):
         """Stop the threshold adjustment service"""
         cls.running = False
-        if cls._task:
-            cls._task.cancel()
         logger.info("Threshold adjustment service stopped")
 
     @classmethod
     async def _run_service(cls):
         """Main service loop"""
+        logger.info(
+            f"Threshold adjustment service loop started "
+            f"(interval: {cls.analysis_interval_seconds}s)"
+        )
+
         while cls.running:
             try:
                 # Check market open status before running analysis
@@ -69,7 +70,12 @@ class ThresholdAdjustmentService:
                     )
                     # Proceed with analysis if we can't determine market status
 
+                logger.debug("Running threshold adjustment analysis...")
                 await cls._analyze_and_adjust_thresholds()
+                logger.debug(
+                    f"Threshold adjustment analysis completed. "
+                    f"Next run in {cls.analysis_interval_seconds}s"
+                )
                 await asyncio.sleep(cls.analysis_interval_seconds)
             except asyncio.CancelledError:
                 logger.info("Threshold adjustment service cancelled")
@@ -135,37 +141,45 @@ class ThresholdAdjustmentService:
             llm_response, indicator_name
         )
 
-        if threshold_changes or max_long != 5 or max_short != 5:
-            # Apply threshold changes
-            if threshold_changes:
-                await cls._apply_threshold_changes(indicator_cls, threshold_changes)
+        # Always store the event if we got an LLM response (even if no changes)
+        # This helps track when the service ran and what the LLM suggested
+        current_date = date.today().isoformat()
 
-            # Apply max trades adjustments (store as max_daily_trades for now)
-            # Note: We could split this into separate long/short limits if needed
-            total_max_trades = max_long + max_short
-            if total_max_trades != indicator_cls.max_daily_trades:
-                old_max = indicator_cls.max_daily_trades
-                indicator_cls.max_daily_trades = total_max_trades
-                logger.info(
-                    f"Updated {indicator_cls.__name__}.max_daily_trades: "
-                    f"{old_max} -> {total_max_trades} (long: {max_long}, short: {max_short})"
-                )
+        # Apply threshold changes if any
+        if threshold_changes:
+            await cls._apply_threshold_changes(indicator_cls, threshold_changes)
 
-            # Store event in DayTraderEvents table
-            current_date = date.today().isoformat()
-            await DynamoDBClient.store_day_trader_event(
-                date=current_date,
-                indicator=indicator_name,
-                threshold_change=threshold_changes,
-                max_long_trades=max_long,
-                max_short_trades=max_short,
-                llm_response=llm_response,
+        # Apply max trades adjustments (store as max_daily_trades for now)
+        # Note: We could split this into separate long/short limits if needed
+        total_max_trades = max_long + max_short
+        if total_max_trades != indicator_cls.max_daily_trades:
+            old_max = indicator_cls.max_daily_trades
+            indicator_cls.max_daily_trades = total_max_trades
+            logger.info(
+                f"Updated {indicator_cls.__name__}.max_daily_trades: "
+                f"{old_max} -> {total_max_trades} (long: {max_long}, short: {max_short})"
             )
 
+        # Store event in DayTraderEvents table (always store if we got LLM response)
+        await DynamoDBClient.store_day_trader_event(
+            date=current_date,
+            indicator=indicator_name,
+            threshold_change=threshold_changes,
+            max_long_trades=max_long,
+            max_short_trades=max_short,
+            llm_response=llm_response,
+        )
+
+        if threshold_changes or max_long != 5 or max_short != 5:
             logger.info(
                 f"Applied threshold adjustments for {indicator_name}: "
                 f"thresholds={json.dumps(threshold_changes, indent=2)}, "
                 f"max_long={max_long}, max_short={max_short}"
+            )
+        else:
+            logger.info(
+                f"LLM analysis for {indicator_name} completed: No changes recommended "
+                f"(max_long={max_long}, max_short={max_short})"
             )
 
     @classmethod
