@@ -844,6 +844,8 @@ class DynamoDBClient:
                 },
             }
 
+            item = cls._ensure_all_floats_converted(item)
+
             cls._ensure_tables()
             cls._inactive_tickers_table.put_item(Item=item)
             logger.debug(f"Added ticker {ticker} to InactiveTickers: {reason}")
