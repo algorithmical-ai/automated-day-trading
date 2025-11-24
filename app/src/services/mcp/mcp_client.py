@@ -177,8 +177,15 @@ class MCPClient:
                                             "message", str(error_data)
                                         )
                                         error_code = error_data.get("code", "unknown")
+
+                                        extra_hint = ""
+                                        if "Unknown tool" in str(error_msg):
+                                            extra_hint = (
+                                                " (tool not registered on MCP server; redeploy or restart MCP service)"
+                                            )
+
                                         logger.error(
-                                            f"JSON-RPC Error calling {tool_name}: {error_code} - {error_msg}"
+                                            f"JSON-RPC Error calling {tool_name}: {error_code} - {error_msg}{extra_hint}"
                                         )
                                     else:
                                         error_msg = str(error_json).replace("\n", " ")[
@@ -193,7 +200,7 @@ class MCPClient:
                                         f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - {error_msg}"
                                     )
                             return None
-            except asyncio.TimeoutError as e:
+            except asyncio.TimeoutError:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2**attempt)
                     logger.warning(
@@ -232,8 +239,9 @@ class MCPClient:
     ) -> Optional[Dict[str, Any]]:
         """Generic method to call MCP tools - uses HTTP directly since MCP protocol fails with 500 errors"""
         # Check if tool is available via discovery service
-        if cls._tool_discovery_cls:
-            is_available = await cls._tool_discovery_cls.is_tool_available(tool_name)
+        discovery_cls = cls._tool_discovery_cls
+        if discovery_cls and hasattr(discovery_cls, "is_tool_available"):
+            is_available = await discovery_cls.is_tool_available(tool_name)
             if not is_available:
                 logger.debug(
                     f"Tool {tool_name} not found in discovered tools list, trying anyway..."
