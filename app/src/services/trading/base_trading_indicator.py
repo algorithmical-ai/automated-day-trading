@@ -6,7 +6,8 @@ Abstract base class for trading indicators with shared infrastructure
 import asyncio
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Tuple, Optional
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, time
+import pytz
 
 from app.src.common.loguru_logger import logger
 from app.src.services.mcp.mcp_client import MCPClient
@@ -31,6 +32,7 @@ class BaseTradingIndicator(ABC):
     daily_trades_date: Optional[str] = None
     ticker_exit_timestamps: Dict[str, datetime] = {}
     mab_reset_date: Optional[str] = None
+    mab_reset_timestamp: Optional[datetime] = None  # Track when reset happened (EST)
 
     @classmethod
     @abstractmethod
@@ -46,6 +48,7 @@ class BaseTradingIndicator(ABC):
         MABService.configure()
         cls.running = True
         cls.mab_reset_date = None
+        cls.mab_reset_timestamp = None
         cls.daily_trades_count = 0
         cls.daily_trades_date = None
         cls.ticker_exit_timestamps.clear()
@@ -107,15 +110,44 @@ class BaseTradingIndicator(ABC):
 
     @classmethod
     async def _reset_daily_stats_if_needed(cls):
-        """Reset daily stats if new trading day"""
-        today = date.today().isoformat()
-        if cls.mab_reset_date != today:
-            logger.info(f"Resetting daily MAB statistics for {cls.indicator_name()}")
+        """Reset daily stats only once per day at 9:30 AM EST (market open)"""
+        est_tz = pytz.timezone("America/New_York")
+        current_time_est = datetime.now(est_tz)
+        today = current_time_est.date().isoformat()
+        market_open_time = time(9, 30)  # 9:30 AM EST
+        
+        # Check if it's after 9:30 AM EST
+        current_time_only = current_time_est.time()
+        is_after_market_open = current_time_only >= market_open_time
+        
+        # Check if we've already reset today
+        already_reset_today = (
+            cls.mab_reset_timestamp is not None
+            and cls.mab_reset_timestamp.date().isoformat() == today
+        )
+        
+        # Only reset if:
+        # 1. It's after 9:30 AM EST
+        # 2. We haven't reset today yet
+        # 3. The date has changed (safety check)
+        if is_after_market_open and not already_reset_today and cls.mab_reset_date != today:
+            logger.info(
+                f"Resetting daily MAB statistics for {cls.indicator_name()} "
+                f"(market open: {current_time_est.strftime('%Y-%m-%d %H:%M:%S %Z')})"
+            )
             await MABService.reset_daily_stats(cls.indicator_name())
             cls.mab_reset_date = today
+            cls.mab_reset_timestamp = current_time_est
             cls.daily_trades_count = 0
             cls.daily_trades_date = today
             cls.ticker_exit_timestamps.clear()
+        elif not is_after_market_open:
+            # Log if we're before market open (only once to avoid spam)
+            if cls.mab_reset_date != today:
+                logger.debug(
+                    f"Waiting for market open (9:30 AM EST) before resetting MAB stats "
+                    f"for {cls.indicator_name()}. Current time: {current_time_est.strftime('%H:%M:%S %Z')}"
+                )
 
     @classmethod
     async def _get_screened_tickers(cls) -> List[str]:
