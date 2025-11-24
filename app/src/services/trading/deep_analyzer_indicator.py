@@ -213,7 +213,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
 
         # Fetch market data in parallel batches
         market_data_dict = await cls._fetch_market_data_batch(
-            candidates_to_fetch, max_concurrent=100
+            candidates_to_fetch, max_concurrent=10
         )
 
         # Evaluate all tickers for entry
