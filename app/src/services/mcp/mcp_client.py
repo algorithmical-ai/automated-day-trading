@@ -16,6 +16,9 @@ from app.src.config.constants import (
     MARKET_DATA_MCP_TOKEN,
 )
 from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
+from app.src.services.candidate_generator.alpaca_screener import (
+    AlpacaScreenerService,
+)
 
 
 class MCPClient:
@@ -180,9 +183,7 @@ class MCPClient:
 
                                         extra_hint = ""
                                         if "Unknown tool" in str(error_msg):
-                                            extra_hint = (
-                                                " (tool not registered on MCP server; redeploy or restart MCP service)"
-                                            )
+                                            extra_hint = " (tool not registered on MCP server; redeploy or restart MCP service)"
 
                                         logger.error(
                                             f"JSON-RPC Error calling {tool_name}: {error_code} - {error_msg}{extra_hint}"
@@ -268,8 +269,41 @@ class MCPClient:
 
     @classmethod
     async def get_alpaca_screened_tickers(cls) -> Optional[Dict[str, Any]]:
-        """Get screened tickers (gainers, losers, most_actives)"""
-        return await cls._call_mcp_tool("get_alpaca_screened_tickers", {})
+        """
+        Get screened tickers using the local Alpaca screener service.
+
+        Returns:
+            Dict with gainers/losers/most_actives plus counts, matching the
+            structure of the MCP tool output.
+        """
+        try:
+            screened_data = await AlpacaScreenerService().get_all_screened_tickers()
+            if not screened_data:
+                return None
+
+            most_actives = sorted(list(screened_data.get("most_actives", set())))
+            gainers = sorted(list(screened_data.get("gainers", set())))
+            losers = sorted(list(screened_data.get("losers", set())))
+            all_tickers = sorted(list(screened_data.get("all", set())))
+
+            return {
+                "most_actives": most_actives,
+                "gainers": gainers,
+                "losers": losers,
+                "all": all_tickers,
+                "count": {
+                    "most_actives": len(most_actives),
+                    "gainers": len(gainers),
+                    "losers": len(losers),
+                    "all": len(all_tickers),
+                },
+            }
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error(
+                f"Error getting screened tickers from local Alpaca service: {exc}",
+                exc_info=True,
+            )
+            return None
 
     @classmethod
     async def get_quote(cls, ticker: str) -> Optional[Dict[str, Any]]:
