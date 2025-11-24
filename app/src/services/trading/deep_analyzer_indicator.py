@@ -30,10 +30,11 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
     @classmethod
     async def _evaluate_ticker_for_entry(
         cls, ticker: str, market_data: Dict[str, Any]
-    ) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]]:
         """
         Evaluate ticker for entry using MarketDataService
-        Returns: (action, signal_data, reason) or (None, None, reason) if no entry
+        Returns: (action, signal_data, reason, detailed_results) or (None, None, reason, detailed_results) if no entry
+        detailed_results contains long_result and short_result for logging purposes
         """
         try:
             # Evaluate for long entry (buy_to_open)
@@ -64,6 +65,8 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 else 0.0
             )
 
+            detailed_results = {"long_result": long_result, "short_result": short_result}
+
             # Choose the better signal
             if long_enter and short_enter:
                 if long_score >= short_score:
@@ -71,24 +74,28 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                         "buy_to_open",
                         long_result.get("signal"),
                         f"Long entry (score: {long_score:.2f})",
+                        detailed_results,
                     )
                 else:
                     return (
                         "sell_to_open",
                         short_result.get("signal"),
                         f"Short entry (score: {short_score:.2f})",
+                        detailed_results,
                     )
             elif long_enter:
                 return (
                     "buy_to_open",
                     long_result.get("signal"),
                     f"Long entry (score: {long_score:.2f})",
+                    detailed_results,
                 )
             elif short_enter:
                 return (
                     "sell_to_open",
                     short_result.get("signal"),
                     f"Short entry (score: {short_score:.2f})",
+                    detailed_results,
                 )
             else:
                 # Check which one had a higher score even if not entering
@@ -110,11 +117,11 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                         f"short_score={short_analysis_score:.2f}, reason={reason}"
                     )
 
-                return None, None, reason
+                return None, None, reason, detailed_results
 
         except Exception as e:
             logger.error(f"Error evaluating {ticker} for entry: {str(e)}")
-            return None, None, f"Error: {str(e)}"
+            return None, None, f"Error: {str(e)}", None
 
     @classmethod
     async def _evaluate_ticker_for_exit(
@@ -219,9 +226,9 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             f"Fetching market data for {len(candidates_to_fetch)} tickers in parallel batches"
         )
 
-        # Fetch market data in parallel batches
+        # Fetch market data in parallel batches (increased concurrency for speed)
         market_data_dict = await cls._fetch_market_data_batch(
-            candidates_to_fetch, max_concurrent=10
+            candidates_to_fetch, max_concurrent=25
         )
 
         # Evaluate all tickers for entry
@@ -236,6 +243,9 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             "passed": 0,
         }
 
+        # Collect inactive ticker reasons for batch writing
+        inactive_ticker_logs = []
+
         for ticker in candidates_to_fetch:
             if not cls.running:
                 break
@@ -243,18 +253,19 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             market_data_response = market_data_dict.get(ticker)
             if not market_data_response:
                 stats["no_market_data"] += 1
-                await DynamoDBClient.log_inactive_ticker_reason(
-                    ticker=ticker,
-                    indicator=cls.indicator_name(),
-                    reason_not_to_enter_long="No market data response",
-                    reason_not_to_enter_short="No market data response",
-                )
+                inactive_ticker_logs.append({
+                    "ticker": ticker,
+                    "indicator": cls.indicator_name(),
+                    "reason_not_to_enter_long": "No market data response",
+                    "reason_not_to_enter_short": "No market data response",
+                    "technical_indicators": None,
+                })
                 continue
 
             technical_analysis = market_data_response.get("technical_analysis", {})
 
             # Evaluate for entry
-            action, signal_data, reason = await cls._evaluate_ticker_for_entry(
+            action, signal_data, reason, detailed_results = await cls._evaluate_ticker_for_entry(
                 ticker, market_data_response
             )
 
@@ -283,47 +294,51 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                         reason_long = None
                         reason_short = f"Entry score {entry_score:.2f} < minimum {cls.min_entry_score}"
                     
-                    await DynamoDBClient.log_inactive_ticker_reason(
-                        ticker=ticker,
-                        indicator=cls.indicator_name(),
-                        reason_not_to_enter_long=reason_long,
-                        reason_not_to_enter_short=reason_short,
-                        technical_indicators=technical_analysis,
-                    )
+                    inactive_ticker_logs.append({
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": reason_long,
+                        "reason_not_to_enter_short": reason_short,
+                        "technical_indicators": technical_analysis,
+                    })
             else:
                 stats["no_entry_signal"] += 1
                 logger.debug(f"Skipping {ticker}: {reason}")
                 
-                # Get detailed reasons for both long and short
-                long_result = await MarketDataService.enter_trade(
-                    ticker=ticker,
-                    action="buy_to_open",
-                    market_data=market_data_response,
-                )
-                short_result = await MarketDataService.enter_trade(
-                    ticker=ticker,
-                    action="sell_to_open",
-                    market_data=market_data_response,
-                )
-                
-                long_enter = long_result.get("enter", False)
-                short_enter = short_result.get("enter", False)
-                
+                # Use detailed_results from evaluation to avoid double API calls
                 reason_long = None
                 reason_short = None
                 
-                if not long_enter:
-                    reason_long = long_result.get("message", "No entry signal")
-                if not short_enter:
-                    reason_short = short_result.get("message", "No entry signal")
+                if detailed_results:
+                    long_result = detailed_results.get("long_result", {})
+                    short_result = detailed_results.get("short_result", {})
+                    
+                    long_enter = long_result.get("enter", False)
+                    short_enter = short_result.get("enter", False)
+                    
+                    if not long_enter:
+                        reason_long = long_result.get("message", "No entry signal")
+                    if not short_enter:
+                        reason_short = short_result.get("message", "No entry signal")
                 
-                await DynamoDBClient.log_inactive_ticker_reason(
-                    ticker=ticker,
-                    indicator=cls.indicator_name(),
-                    reason_not_to_enter_long=reason_long,
-                    reason_not_to_enter_short=reason_short,
-                    technical_indicators=technical_analysis,
-                )
+                inactive_ticker_logs.append({
+                    "ticker": ticker,
+                    "indicator": cls.indicator_name(),
+                    "reason_not_to_enter_long": reason_long,
+                    "reason_not_to_enter_short": reason_short,
+                    "technical_indicators": technical_analysis,
+                })
+
+        # Batch write all inactive ticker reasons in parallel
+        if inactive_ticker_logs:
+            async def log_one(log_data):
+                await DynamoDBClient.log_inactive_ticker_reason(**log_data)
+            
+            # Write in batches of 20 to avoid overwhelming DynamoDB
+            batch_size = 20
+            for i in range(0, len(inactive_ticker_logs), batch_size):
+                batch = inactive_ticker_logs[i:i + batch_size]
+                await asyncio.gather(*[log_one(log_data) for log_data in batch], return_exceptions=True)
 
         logger.info(
             f"Evaluated {len(ticker_candidates)} tickers with valid entry signals "

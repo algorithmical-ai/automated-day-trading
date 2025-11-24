@@ -321,9 +321,9 @@ class MomentumIndicator(BaseTradingIndicator):
             f"Fetching market data for {len(candidates_to_fetch)} tickers in parallel batches"
         )
 
-        # Fetch market data in parallel batches
+        # Fetch market data in parallel batches (increased concurrency for speed)
         market_data_dict = await cls._fetch_market_data_batch(
-            candidates_to_fetch, max_concurrent=10
+            candidates_to_fetch, max_concurrent=25
         )
 
         # Process results
@@ -336,6 +336,9 @@ class MomentumIndicator(BaseTradingIndicator):
             "passed": 0,
         }
         
+        # Collect inactive ticker reasons for batch writing
+        inactive_ticker_logs = []
+        
         for ticker in candidates_to_fetch:
             if not cls.running:
                 break
@@ -343,12 +346,13 @@ class MomentumIndicator(BaseTradingIndicator):
             market_data_response = market_data_dict.get(ticker)
             if not market_data_response:
                 stats["no_market_data"] += 1
-                await DynamoDBClient.log_inactive_ticker_reason(
-                    ticker=ticker,
-                    indicator=cls.indicator_name(),
-                    reason_not_to_enter_long="No market data response",
-                    reason_not_to_enter_short="No market data response",
-                )
+                inactive_ticker_logs.append({
+                    "ticker": ticker,
+                    "indicator": cls.indicator_name(),
+                    "reason_not_to_enter_long": "No market data response",
+                    "reason_not_to_enter_short": "No market data response",
+                    "technical_indicators": None,
+                })
                 continue
 
             technical_analysis = market_data_response.get("technical_analysis", {})
@@ -357,13 +361,13 @@ class MomentumIndicator(BaseTradingIndicator):
             if not datetime_price:
                 stats["no_datetime_price"] += 1
                 logger.debug(f"No datetime_price data for {ticker}")
-                await DynamoDBClient.log_inactive_ticker_reason(
-                    ticker=ticker,
-                    indicator=cls.indicator_name(),
-                    reason_not_to_enter_long="No datetime_price data",
-                    reason_not_to_enter_short="No datetime_price data",
-                    technical_indicators=technical_analysis,
-                )
+                inactive_ticker_logs.append({
+                    "ticker": ticker,
+                    "indicator": cls.indicator_name(),
+                    "reason_not_to_enter_long": "No datetime_price data",
+                    "reason_not_to_enter_short": "No datetime_price data",
+                    "technical_indicators": technical_analysis,
+                })
                 continue
 
             momentum_score, reason = cls._calculate_momentum(datetime_price)
@@ -383,13 +387,13 @@ class MomentumIndicator(BaseTradingIndicator):
                     reason_long = None
                     reason_short = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}%"
                 
-                await DynamoDBClient.log_inactive_ticker_reason(
-                    ticker=ticker,
-                    indicator=cls.indicator_name(),
-                    reason_not_to_enter_long=reason_long,
-                    reason_not_to_enter_short=reason_short,
-                    technical_indicators=technical_analysis,
-                )
+                inactive_ticker_logs.append({
+                    "ticker": ticker,
+                    "indicator": cls.indicator_name(),
+                    "reason_not_to_enter_long": reason_long,
+                    "reason_not_to_enter_short": reason_short,
+                    "technical_indicators": technical_analysis,
+                })
                 continue
 
             passes_filter, filter_reason = await cls._passes_stock_quality_filters(
@@ -406,13 +410,13 @@ class MomentumIndicator(BaseTradingIndicator):
                     reason_long = None
                     reason_short = filter_reason
                 
-                await DynamoDBClient.log_inactive_ticker_reason(
-                    ticker=ticker,
-                    indicator=cls.indicator_name(),
-                    reason_not_to_enter_long=reason_long,
-                    reason_not_to_enter_short=reason_short,
-                    technical_indicators=technical_analysis,
-                )
+                inactive_ticker_logs.append({
+                    "ticker": ticker,
+                    "indicator": cls.indicator_name(),
+                    "reason_not_to_enter_long": reason_long,
+                    "reason_not_to_enter_short": reason_short,
+                    "technical_indicators": technical_analysis,
+                })
                 continue
 
             stats["passed"] += 1
@@ -421,6 +425,17 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"{ticker} passed all filters: momentum={momentum_score:.2f}%, "
                 f"{filter_reason}"
             )
+
+        # Batch write all inactive ticker reasons in parallel
+        if inactive_ticker_logs:
+            async def log_one(log_data):
+                await DynamoDBClient.log_inactive_ticker_reason(**log_data)
+            
+            # Write in batches of 20 to avoid overwhelming DynamoDB
+            batch_size = 20
+            for i in range(0, len(inactive_ticker_logs), batch_size):
+                batch = inactive_ticker_logs[i:i + batch_size]
+                await asyncio.gather(*[log_one(log_data) for log_data in batch], return_exceptions=True)
 
         logger.info(
             f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers "
