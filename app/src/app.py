@@ -72,11 +72,8 @@ async def main():
             ToolDiscoveryService.discovery_job(),
             TradingService.run(),
             ScreenerMonitorService().start(),
+            ThresholdAdjustmentService.start()
         ]
-
-        # Start threshold adjustment service (runs as background task)
-        threshold_task = await ThresholdAdjustmentService.start()
-        tasks.append(threshold_task)
 
         # Add MCP server task if applicable (typically only for local dev)
         if start_mcp_server:
