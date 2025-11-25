@@ -4,7 +4,10 @@ Provides entry and exit analysis for trading signals
 """
 
 import math
+from datetime import datetime
 from typing import Any, Dict, Tuple, Optional
+
+import pytz
 
 from app.src.common.loguru_logger import logger
 from app.src.models.technical_indicators import TechnicalIndicators
@@ -740,9 +743,262 @@ class MarketDataService:
             return cls._is_downward_trend(indicators)
 
     @classmethod
+    def _check_price_trend_upward(cls, datetime_price: Tuple) -> bool:
+        """
+        Check if price trend is upward by analyzing datetime_price time-series data.
+        Data is sorted by timestamp in ascending order (oldest to newest).
+        
+        Args:
+            datetime_price: Tuple/list of price data entries, each containing [timestamp, price] or dict
+            
+        Returns:
+            True if price shows upward trend
+        """
+        if not datetime_price or len(datetime_price) < 3:
+            return False
+        
+        try:
+            # Parse and extract (timestamp, price) pairs
+            price_points = []
+            for entry in datetime_price:
+                try:
+                    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                        # Format: [timestamp, price] or [datetime_str, price]
+                        timestamp_str = str(entry[0])
+                        price = float(entry[1])
+                        price_points.append((timestamp_str, price))
+                    elif isinstance(entry, dict):
+                        # Format: {"datetime": ..., "price": ...} or {"datetime": ..., "close": ...}
+                        timestamp_str = str(entry.get("datetime") or entry.get("timestamp") or "")
+                        price = float(
+                            entry.get("price")
+                            or entry.get("close")
+                            or entry.get("close_price")
+                            or 0.0
+                        )
+                        if price > 0:
+                            price_points.append((timestamp_str, price))
+                except (ValueError, TypeError, KeyError, IndexError):
+                    continue
+            
+            if len(price_points) < 3:
+                return False
+            
+            # Sort by timestamp in ascending order (oldest to newest)
+            # Handle EST timestamps - parse and sort properly
+            est_tz = pytz.timezone("America/New_York")
+            
+            def parse_timestamp(ts_str: str) -> datetime:
+                """Parse timestamp string, handling various formats"""
+                ts_str = str(ts_str).strip()
+                # Try ISO format first
+                try:
+                    if "T" in ts_str or "+" in ts_str or ts_str.endswith("Z"):
+                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    else:
+                        # Try common formats
+                        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"]:
+                            try:
+                                dt = datetime.strptime(ts_str, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            # Fallback: try ISO without timezone
+                            dt = datetime.fromisoformat(ts_str)
+                    
+                    # Ensure timezone-aware (assume EST if not specified)
+                    if dt.tzinfo is None:
+                        dt = est_tz.localize(dt)
+                    else:
+                        dt = dt.astimezone(est_tz)
+                    
+                    return dt
+                except Exception:
+                    # If parsing fails, return a default datetime
+                    return datetime.now(est_tz)
+            
+            # Sort by timestamp (ascending - oldest to newest)
+            try:
+                price_points_sorted = sorted(
+                    price_points,
+                    key=lambda x: parse_timestamp(x[0])
+                )
+            except Exception:
+                # If sorting fails, use original order
+                price_points_sorted = price_points
+            
+            # Extract prices in chronological order
+            prices = [float(price) for _, price in price_points_sorted]
+            
+            if len(prices) < 3:
+                return False
+            
+            # Analyze trend: compare early vs recent prices
+            # Use first 1/3 and last 1/3 of data points
+            n = len(prices)
+            early_count = max(1, n // 3)
+            recent_count = max(1, n // 3)
+            
+            early_prices = prices[:early_count]
+            recent_prices = prices[-recent_count:]
+            
+            early_avg = sum(early_prices) / len(early_prices)
+            recent_avg = sum(recent_prices) / len(recent_prices)
+            
+            # Check if recent average is higher than early average
+            if recent_avg <= early_avg:
+                return False
+            
+            # Calculate percentage change
+            change_pct = ((recent_avg - early_avg) / early_avg) * 100
+            
+            # Also check recent momentum (last few points)
+            if len(recent_prices) >= 2:
+                recent_momentum = sum(
+                    (recent_prices[i] - recent_prices[i - 1])
+                    for i in range(1, len(recent_prices))
+                ) / max(1, len(recent_prices) - 1)
+                
+                # Both overall trend and recent momentum should be positive
+                return change_pct > 0.1 and recent_momentum > 0
+            
+            return change_pct > 0.1
+            
+        except Exception as e:
+            logger.debug(f"Error checking upward price trend: {str(e)}")
+            return False
+    
+    @classmethod
+    def _check_price_trend_downward(cls, datetime_price: Tuple) -> bool:
+        """
+        Check if price trend is downward by analyzing datetime_price time-series data.
+        Data is sorted by timestamp in ascending order (oldest to newest).
+        
+        Args:
+            datetime_price: Tuple/list of price data entries, each containing [timestamp, price] or dict
+            
+        Returns:
+            True if price shows downward trend
+        """
+        if not datetime_price or len(datetime_price) < 3:
+            return False
+        
+        try:
+            # Parse and extract (timestamp, price) pairs
+            price_points = []
+            for entry in datetime_price:
+                try:
+                    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                        timestamp_str = str(entry[0])
+                        price = float(entry[1])
+                        price_points.append((timestamp_str, price))
+                    elif isinstance(entry, dict):
+                        timestamp_str = str(entry.get("datetime") or entry.get("timestamp") or "")
+                        price = float(
+                            entry.get("price")
+                            or entry.get("close")
+                            or entry.get("close_price")
+                            or 0.0
+                        )
+                        if price > 0:
+                            price_points.append((timestamp_str, price))
+                except (ValueError, TypeError, KeyError, IndexError):
+                    continue
+            
+            if len(price_points) < 3:
+                return False
+            
+            # Sort by timestamp in ascending order (oldest to newest)
+            est_tz = pytz.timezone("America/New_York")
+            
+            def parse_timestamp(ts_str: str) -> datetime:
+                """Parse timestamp string, handling various formats"""
+                ts_str = str(ts_str).strip()
+                try:
+                    if "T" in ts_str or "+" in ts_str or ts_str.endswith("Z"):
+                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    else:
+                        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"]:
+                            try:
+                                dt = datetime.strptime(ts_str, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            dt = datetime.fromisoformat(ts_str)
+                    
+                    if dt.tzinfo is None:
+                        dt = est_tz.localize(dt)
+                    else:
+                        dt = dt.astimezone(est_tz)
+                    
+                    return dt
+                except Exception:
+                    return datetime.now(est_tz)
+            
+            try:
+                price_points_sorted = sorted(
+                    price_points,
+                    key=lambda x: parse_timestamp(x[0])
+                )
+            except Exception:
+                price_points_sorted = price_points
+            
+            # Extract prices in chronological order
+            prices = [float(price) for _, price in price_points_sorted]
+            
+            if len(prices) < 3:
+                return False
+            
+            # Analyze trend: compare early vs recent prices
+            n = len(prices)
+            early_count = max(1, n // 3)
+            recent_count = max(1, n // 3)
+            
+            early_prices = prices[:early_count]
+            recent_prices = prices[-recent_count:]
+            
+            early_avg = sum(early_prices) / len(early_prices)
+            recent_avg = sum(recent_prices) / len(recent_prices)
+            
+            # Check if recent average is lower than early average
+            if recent_avg >= early_avg:
+                return False
+            
+            # Calculate percentage change
+            change_pct = ((recent_avg - early_avg) / early_avg) * 100
+            
+            # Also check recent momentum (last few points)
+            if len(recent_prices) >= 2:
+                recent_momentum = sum(
+                    (recent_prices[i] - recent_prices[i - 1])
+                    for i in range(1, len(recent_prices))
+                ) / max(1, len(recent_prices) - 1)
+                
+                # Both overall trend and recent momentum should be negative
+                return change_pct < -0.1 and recent_momentum < 0
+            
+            return change_pct < -0.1
+            
+        except Exception as e:
+            logger.debug(f"Error checking downward price trend: {str(e)}")
+            return False
+
+    @classmethod
     def _is_upward_trend(cls, indicators: TechnicalIndicators) -> bool:
-        """Determine if ticker is in upward trend"""
+        """Determine if ticker is in upward trend using time-series price data and indicators"""
         trend_confirmations = 0
+
+        # First, verify trend using actual price data from datetime_price (if available)
+        price_trend_confirmed = False
+        if indicators.datetime_price and len(indicators.datetime_price) >= 3:
+            price_trend_confirmed = cls._check_price_trend_upward(indicators.datetime_price)
+            if price_trend_confirmed:
+                trend_confirmations += 1
+            # If price data shows downward trend, reject immediately
+            elif cls._check_price_trend_downward(indicators.datetime_price):
+                return False
 
         # 1. EMA fast > EMA slow
         if indicators.ema_fast > indicators.ema_slow:
@@ -766,12 +1022,27 @@ class MarketDataService:
         if indicators.adx > 25:
             trend_confirmations += 1
 
-        return trend_confirmations >= 3
+        # Require at least 3 confirmations, and if price data is available, it must confirm
+        if price_trend_confirmed:
+            return trend_confirmations >= 3
+        else:
+            # If no price data, require 4 confirmations for safety
+            return trend_confirmations >= 4
 
     @classmethod
     def _is_downward_trend(cls, indicators: TechnicalIndicators) -> bool:
-        """Determine if ticker is in downward trend"""
+        """Determine if ticker is in downward trend using time-series price data and indicators"""
         trend_confirmations = 0
+
+        # First, verify trend using actual price data from datetime_price (if available)
+        price_trend_confirmed = False
+        if indicators.datetime_price and len(indicators.datetime_price) >= 3:
+            price_trend_confirmed = cls._check_price_trend_downward(indicators.datetime_price)
+            if price_trend_confirmed:
+                trend_confirmations += 1
+            # If price data shows upward trend, reject immediately
+            elif cls._check_price_trend_upward(indicators.datetime_price):
+                return False
 
         # 1. EMA fast < EMA slow
         if indicators.ema_fast < indicators.ema_slow:
@@ -795,7 +1066,12 @@ class MarketDataService:
         if indicators.adx > 25:
             trend_confirmations += 1
 
-        return trend_confirmations >= 3
+        # Require at least 3 confirmations, and if price data is available, it must confirm
+        if price_trend_confirmed:
+            return trend_confirmations >= 3
+        else:
+            # If no price data, require 4 confirmations for safety
+            return trend_confirmations >= 4
 
     @classmethod
     def _calculate_portfolio_allocation(

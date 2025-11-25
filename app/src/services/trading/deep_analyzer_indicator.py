@@ -39,17 +39,19 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
         # Check golden flag from MarketDataService
         if signal_data and signal_data.get("is_golden", False):
             return True
-        
+
         # Exceptional entry score
         if entry_score >= cls.exceptional_entry_score:
             return True
-        
+
         return False
 
     @classmethod
     async def _evaluate_ticker_for_entry(
         cls, ticker: str, market_data: Dict[str, Any]
-    ) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]]:
+    ) -> Tuple[
+        Optional[str], Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]
+    ]:
         """
         Evaluate ticker for entry using MarketDataService
         Returns: (action, signal_data, reason, detailed_results) or (None, None, reason, detailed_results) if no entry
@@ -84,7 +86,10 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 else 0.0
             )
 
-            detailed_results = {"long_result": long_result, "short_result": short_result}
+            detailed_results = {
+                "long_result": long_result,
+                "short_result": short_result,
+            }
 
             # Choose the better signal
             if long_enter and short_enter:
@@ -271,20 +276,22 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             market_data_response = market_data_dict.get(ticker)
             if not market_data_response:
                 stats["no_market_data"] += 1
-                inactive_ticker_logs.append({
-                    "ticker": ticker,
-                    "indicator": cls.indicator_name(),
-                    "reason_not_to_enter_long": "No market data response",
-                    "reason_not_to_enter_short": "No market data response",
-                    "technical_indicators": None,
-                })
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": "No market data response",
+                        "reason_not_to_enter_short": "No market data response",
+                        "technical_indicators": None,
+                    }
+                )
                 continue
 
             technical_analysis = market_data_response.get("technical_analysis", {})
 
             # Evaluate for entry
-            action, signal_data, reason, detailed_results = await cls._evaluate_ticker_for_entry(
-                ticker, market_data_response
+            action, signal_data, reason, detailed_results = (
+                await cls._evaluate_ticker_for_entry(ticker, market_data_response)
             )
 
             if action and signal_data:
@@ -311,52 +318,59 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                     else:  # sell_to_open
                         reason_long = None
                         reason_short = f"Entry score {entry_score:.2f} < minimum {cls.min_entry_score}"
-                    
-                    inactive_ticker_logs.append({
+
+                    inactive_ticker_logs.append(
+                        {
+                            "ticker": ticker,
+                            "indicator": cls.indicator_name(),
+                            "reason_not_to_enter_long": reason_long,
+                            "reason_not_to_enter_short": reason_short,
+                            "technical_indicators": technical_analysis,
+                        }
+                    )
+            else:
+                stats["no_entry_signal"] += 1
+                logger.debug(f"Skipping {ticker}: {reason}")
+
+                # Use detailed_results from evaluation to avoid double API calls
+                reason_long = None
+                reason_short = None
+
+                if detailed_results:
+                    long_result = detailed_results.get("long_result", {})
+                    short_result = detailed_results.get("short_result", {})
+
+                    long_enter = long_result.get("enter", False)
+                    short_enter = short_result.get("enter", False)
+
+                    if not long_enter:
+                        reason_long = long_result.get("message", "No entry signal")
+                    if not short_enter:
+                        reason_short = short_result.get("message", "No entry signal")
+
+                inactive_ticker_logs.append(
+                    {
                         "ticker": ticker,
                         "indicator": cls.indicator_name(),
                         "reason_not_to_enter_long": reason_long,
                         "reason_not_to_enter_short": reason_short,
                         "technical_indicators": technical_analysis,
-                    })
-            else:
-                stats["no_entry_signal"] += 1
-                logger.debug(f"Skipping {ticker}: {reason}")
-                
-                # Use detailed_results from evaluation to avoid double API calls
-                reason_long = None
-                reason_short = None
-                
-                if detailed_results:
-                    long_result = detailed_results.get("long_result", {})
-                    short_result = detailed_results.get("short_result", {})
-                    
-                    long_enter = long_result.get("enter", False)
-                    short_enter = short_result.get("enter", False)
-                    
-                    if not long_enter:
-                        reason_long = long_result.get("message", "No entry signal")
-                    if not short_enter:
-                        reason_short = short_result.get("message", "No entry signal")
-                
-                inactive_ticker_logs.append({
-                    "ticker": ticker,
-                    "indicator": cls.indicator_name(),
-                    "reason_not_to_enter_long": reason_long,
-                    "reason_not_to_enter_short": reason_short,
-                    "technical_indicators": technical_analysis,
-                })
+                    }
+                )
 
         # Batch write all inactive ticker reasons in parallel
         if inactive_ticker_logs:
+
             async def log_one(log_data):
                 await DynamoDBClient.log_inactive_ticker_reason(**log_data)
-            
+
             # Write in batches of 20 to avoid overwhelming DynamoDB
             batch_size = 20
             for i in range(0, len(inactive_ticker_logs), batch_size):
-                batch = inactive_ticker_logs[i:i + batch_size]
-                await asyncio.gather(*[log_one(log_data) for log_data in batch], return_exceptions=True)
+                batch = inactive_ticker_logs[i : i + batch_size]
+                await asyncio.gather(
+                    *[log_one(log_data) for log_data in batch], return_exceptions=True
+                )
 
         logger.info(
             f"Evaluated {len(ticker_candidates)} tickers with valid entry signals "
@@ -364,6 +378,20 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             f"{stats['no_entry_signal']} no entry signal, "
             f"{stats['low_entry_score']} low entry score < {cls.min_entry_score})"
         )
+
+        # Log market condition summary
+        if stats["no_entry_signal"] > 0:
+            no_signal_pct = (
+                (stats["no_entry_signal"] / len(candidates_to_fetch)) * 100
+                if candidates_to_fetch
+                else 0
+            )
+            if no_signal_pct > 70:
+                logger.info(
+                    f"Market condition: {no_signal_pct:.1f}% of tickers show no clear trend "
+                    f"({stats['no_entry_signal']}/{len(candidates_to_fetch)}). "
+                    f"Market appears choppy/trendless - system correctly staying on sidelines."
+                )
 
         # Separate long and short candidates
         long_candidates = [
@@ -404,6 +432,21 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             f"{len(top_short)} short Deep Analyzer tickers (top_k={cls.top_k})"
         )
 
+        # Log summary of candidates before entry attempts
+        if len(ticker_candidates) > 0:
+            logger.info(
+                f"Deep Analyzer entry cycle summary: "
+                f"{len(long_candidates)} long candidates, {len(short_candidates)} short candidates, "
+                f"MAB selected {len(top_long)} long + {len(top_short)} short = {len(top_long) + len(top_short)} total"
+            )
+        else:
+            logger.warning(
+                f"Deep Analyzer entry cycle: No tickers passed entry evaluation. "
+                f"Stats: {stats['no_market_data']} no data, "
+                f"{stats['no_entry_signal']} no entry signal, "
+                f"{stats['low_entry_score']} low entry score"
+            )
+
         # Create lookup for signal data
         long_signal_lookup = {
             t: (signal, reason) for t, _, _, signal, reason in long_candidates
@@ -413,14 +456,20 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
         }
 
         # Enter trades for long candidates
+        long_entries_attempted = 0
+        long_entries_successful = 0
+        long_entries_blocked = {"daily_limit": 0, "max_capacity": 0, "quote_failed": 0}
+
         for rank, (ticker, entry_score, _) in enumerate(top_long, start=1):
             if not cls.running:
                 break
 
+            long_entries_attempted += 1
+
             # Check if daily limit reached (allow golden tickers to bypass)
             daily_limit_reached = await cls._has_reached_daily_trade_limit()
             is_golden = False
-            
+
             if daily_limit_reached:
                 signal_data, _ = long_signal_lookup.get(ticker, (None, ""))
                 is_golden = cls._is_golden_ticker(entry_score, signal_data)
@@ -429,6 +478,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                         f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
                         f"Skipping {ticker} (not golden/exceptional, score: {entry_score:.2f})."
                     )
+                    long_entries_blocked["daily_limit"] += 1
                     break
                 else:
                     logger.info(
@@ -444,6 +494,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                     f"At max capacity ({active_count}/{cls.max_active_trades}), "
                     f"skipping {ticker} (entry score: {entry_score:.2f})"
                 )
+                long_entries_blocked["max_capacity"] += 1
                 continue
 
             action = "buy_to_open"
@@ -453,6 +504,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             quote_response = await MCPClient.get_quote(ticker)
             if not quote_response:
                 logger.warning(f"Failed to get quote for {ticker}, skipping")
+                long_entries_blocked["quote_failed"] += 1
                 continue
 
             quote_data = quote_response.get("quote", {})
@@ -464,16 +516,17 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 logger.warning(
                     f"Failed to get valid quote price for {ticker}, skipping"
                 )
+                long_entries_blocked["quote_failed"] += 1
                 continue
 
             # Use the is_golden from daily limit check, or check signal_data if not already set
             if not is_golden:
-                is_golden = signal_data.get("is_golden", False) if signal_data else False
-            
+                is_golden = (
+                    signal_data.get("is_golden", False) if signal_data else False
+                )
+
             golden_prefix = "🟡 GOLDEN: " if is_golden else ""
-            ranked_reason = (
-                f"{golden_prefix}{reason} (ranked #{rank} long, entry_score: {entry_score:.2f})"
-            )
+            ranked_reason = f"{golden_prefix}{reason} (ranked #{rank} long, entry_score: {entry_score:.2f})"
             portfolio_allocation = (
                 signal_data.get("portfolio_allocation", None) if signal_data else None
             )
@@ -508,15 +561,29 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 technical_indicators=technical_indicators_for_enter,
             )
 
+        # Log long entry summary
+        if long_entries_attempted > 0:
+            logger.info(
+                f"Deep Analyzer long entries: {long_entries_attempted} attempted, "
+                f"{long_entries_successful} successful, "
+                f"blocked: {long_entries_blocked}"
+            )
+
         # Enter trades for short candidates
+        short_entries_attempted = 0
+        short_entries_successful = 0
+        short_entries_blocked = {"daily_limit": 0, "max_capacity": 0, "quote_failed": 0}
+
         for rank, (ticker, entry_score, _) in enumerate(top_short, start=1):
             if not cls.running:
                 break
 
+            short_entries_attempted += 1
+
             # Check if daily limit reached (allow golden tickers to bypass)
             daily_limit_reached = await cls._has_reached_daily_trade_limit()
             is_golden = False
-            
+
             if daily_limit_reached:
                 signal_data, _ = short_signal_lookup.get(ticker, (None, ""))
                 is_golden = cls._is_golden_ticker(entry_score, signal_data)
@@ -525,6 +592,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                         f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
                         f"Skipping {ticker} (not golden/exceptional, score: {entry_score:.2f})."
                     )
+                    short_entries_blocked["daily_limit"] += 1
                     break
                 else:
                     logger.info(
@@ -540,6 +608,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                     f"At max capacity ({active_count}/{cls.max_active_trades}), "
                     f"skipping {ticker} (entry score: {entry_score:.2f})"
                 )
+                short_entries_blocked["max_capacity"] += 1
                 continue
 
             action = "sell_to_open"
@@ -549,6 +618,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             quote_response = await MCPClient.get_quote(ticker)
             if not quote_response:
                 logger.warning(f"Failed to get quote for {ticker}, skipping")
+                short_entries_blocked["quote_failed"] += 1
                 continue
 
             quote_data = quote_response.get("quote", {})
@@ -560,16 +630,17 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 logger.warning(
                     f"Failed to get valid quote price for {ticker}, skipping"
                 )
+                short_entries_blocked["quote_failed"] += 1
                 continue
 
             # Use the is_golden from daily limit check, or check signal_data if not already set
             if not is_golden:
-                is_golden = signal_data.get("is_golden", False) if signal_data else False
-            
+                is_golden = (
+                    signal_data.get("is_golden", False) if signal_data else False
+                )
+
             golden_prefix = "🟡 GOLDEN: " if is_golden else ""
-            ranked_reason = (
-                f"{golden_prefix}{reason} (ranked #{rank} short, entry_score: {entry_score:.2f})"
-            )
+            ranked_reason = f"{golden_prefix}{reason} (ranked #{rank} short, entry_score: {entry_score:.2f})"
             portfolio_allocation = (
                 signal_data.get("portfolio_allocation", None) if signal_data else None
             )
@@ -596,12 +667,38 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                     if k != "datetime_price"
                 }
 
-            await cls._enter_trade(
+            success = await cls._enter_trade(
                 ticker=ticker,
                 action=action,
                 enter_price=enter_price,
                 enter_reason=ranked_reason,
                 technical_indicators=technical_indicators_for_enter,
+            )
+            if success:
+                short_entries_successful += 1
+
+        # Log short entry summary
+        if short_entries_attempted > 0:
+            logger.info(
+                f"Deep Analyzer short entries: {short_entries_attempted} attempted, "
+                f"{short_entries_successful} successful, "
+                f"blocked: {short_entries_blocked}"
+            )
+
+        # Final summary
+        total_attempted = long_entries_attempted + short_entries_attempted
+        total_successful = long_entries_successful + short_entries_successful
+        if total_attempted > 0:
+            logger.info(
+                f"Deep Analyzer entry cycle complete: {total_attempted} entries attempted, "
+                f"{total_successful} successful. "
+                f"Long: {long_entries_successful}/{long_entries_attempted}, "
+                f"Short: {short_entries_successful}/{short_entries_attempted}"
+            )
+        elif len(top_long) == 0 and len(top_short) == 0:
+            logger.warning(
+                f"Deep Analyzer entry cycle: MAB selected 0 tickers. "
+                f"Had {len(long_candidates)} long and {len(short_candidates)} short candidates."
             )
 
         await asyncio.sleep(cls.entry_cycle_seconds)
