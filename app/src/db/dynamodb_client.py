@@ -227,6 +227,7 @@ class DynamoDBClient:
         enter_price: float,
         enter_reason: str,
         technical_indicators_for_enter: Optional[Dict[str, Any]] = None,
+        dynamic_stop_loss: Optional[float] = None,
     ) -> bool:
         """Add a momentum-based trade to ActiveTickersForAutomatedDayTrader table"""
         try:
@@ -241,6 +242,10 @@ class DynamoDBClient:
                 "peak_profit_percent": cls._convert_to_decimal(0.0),  # Initialize to 0%
                 "created_at": datetime.utcnow().isoformat(),
             }
+            
+            # Add dynamic stop loss if provided
+            if dynamic_stop_loss is not None:
+                item["dynamic_stop_loss"] = cls._convert_to_decimal(dynamic_stop_loss)
             
             # Add technical indicators if provided
             if technical_indicators_for_enter:

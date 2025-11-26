@@ -227,6 +227,7 @@ class BaseTradingIndicator(ABC):
         enter_price: float,
         enter_reason: str,
         technical_indicators: Optional[Dict[str, Any]] = None,
+        dynamic_stop_loss: Optional[float] = None,
     ) -> bool:
         """Enter a trade and save to DynamoDB"""
         try:
@@ -237,6 +238,7 @@ class BaseTradingIndicator(ABC):
                 enter_price=enter_price,
                 enter_reason=enter_reason,
                 technical_indicators_for_enter=technical_indicators,
+                dynamic_stop_loss=dynamic_stop_loss,
             )
 
             cls._increment_daily_trade_count()

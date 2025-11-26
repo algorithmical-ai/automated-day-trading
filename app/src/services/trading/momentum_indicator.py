@@ -4,8 +4,11 @@ Uses price momentum to identify entry and exit signals
 """
 
 import asyncio
+import os
 from typing import List, Tuple, Dict, Any, Optional
-from datetime import datetime, date, timezone
+from datetime import datetime, timezone
+
+import aiohttp
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
@@ -38,9 +41,232 @@ class MomentumIndicator(BaseTradingIndicator):
         60  # Minimum 60 seconds before allowing exit (prevent instant exits)
     )
 
+    # Dynamic stop loss configuration
+    _alpaca_api_key = os.environ.get("REAL_TRADE_API_KEY", "")
+    _alpaca_api_secret = os.environ.get("REAL_TRADE_SECRET_KEY", "")
+    _alpaca_base_url = "https://data.alpaca.markets/v2/stocks/bars"
+
     @classmethod
     def indicator_name(cls) -> str:
         return "Momentum Trading"
+
+    @classmethod
+    async def _calculate_dynamic_stop_loss(
+        cls, ticker: str, enter_price: float
+    ) -> float:
+        """
+        Calculate dynamic stop loss based on intraday volatility from Alpaca API.
+
+        Args:
+            ticker: Stock ticker symbol
+            enter_price: Entry price for the trade
+
+        Returns:
+            Dynamic stop loss percentage (negative value, e.g., -3.5 for -3.5%)
+        """
+        # Default stop loss if we can't calculate dynamic one
+        default_stop_loss = cls.stop_loss_threshold
+
+        # Only calculate for stocks under $2 (penny stocks that need more room)
+        if enter_price >= 2.0:
+            return default_stop_loss
+
+        # Check if we have API credentials
+        if not cls._alpaca_api_key or not cls._alpaca_api_secret:
+            logger.debug(
+                f"No Alpaca API credentials, using default stop loss for {ticker}"
+            )
+            return default_stop_loss
+
+        try:
+            # Get today's date in UTC
+            today = datetime.now(timezone.utc).date()
+            start_time = datetime.combine(today, datetime.min.time()).replace(
+                tzinfo=timezone.utc
+            )
+            start_iso = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            # Fetch intraday bars (1-minute) for today
+            url = f"{cls._alpaca_base_url}"
+            params = {
+                "symbols": ticker,
+                "timeframe": "1Min",
+                "start": start_iso,
+                "limit": 1000,
+                "adjustment": "raw",
+                "feed": "sip",
+                "sort": "asc",
+            }
+            headers = {
+                "accept": "application/json",
+                "APCA-API-KEY-ID": cls._alpaca_api_key,
+                "APCA-API-SECRET-KEY": cls._alpaca_api_secret,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    params={k: str(v) for k, v in params.items()},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if response.status != 200:
+                        logger.debug(
+                            f"Alpaca API returned status {response.status} for {ticker}, using default stop loss"
+                        )
+                        return default_stop_loss
+
+                    try:
+                        data = await response.json()
+                    except Exception as json_error:
+                        logger.warning(
+                            f"Failed to parse JSON response for {ticker}: {str(json_error)}, using default stop loss"
+                        )
+                        return default_stop_loss
+
+                    # Validate response structure
+                    if not isinstance(data, dict):
+                        logger.warning(
+                            f"Invalid response format for {ticker}: expected dict, got {type(data)}, using default stop loss"
+                        )
+                        return default_stop_loss
+
+                    bars_dict = data.get("bars", {})
+                    if not isinstance(bars_dict, dict):
+                        logger.warning(
+                            f"Invalid bars format for {ticker}: expected dict, got {type(bars_dict)}, using default stop loss"
+                        )
+                        return default_stop_loss
+
+                    bars = bars_dict.get(ticker, [])
+                    if not isinstance(bars, list):
+                        logger.warning(
+                            f"Invalid bars list for {ticker}: expected list, got {type(bars)}, using default stop loss"
+                        )
+                        return default_stop_loss
+
+                    if not bars or len(bars) < 5:
+                        logger.debug(
+                            f"Insufficient bars data for {ticker} ({len(bars) if bars else 0} bars), using default stop loss"
+                        )
+                        return default_stop_loss
+
+                    # Extract prices from bars
+                    prices = []
+                    for bar in bars:
+                        if not isinstance(bar, dict):
+                            logger.debug(
+                                f"Skipping invalid bar entry for {ticker}: not a dict"
+                            )
+                            continue
+                        # Alpaca bars format: {"t": timestamp, "o": open, "h": high, "l": low, "c": close, "v": volume, "vw": vwap, "n": trades}
+                        try:
+                            close_price = bar.get("c")
+                            if close_price is not None:
+                                close_price = float(close_price)
+                                if close_price > 0:
+                                    prices.append(close_price)
+                        except (ValueError, TypeError) as price_error:
+                            logger.debug(
+                                f"Skipping bar with invalid close price for {ticker}: {str(price_error)}"
+                            )
+                            continue
+
+                    if len(prices) < 5:
+                        logger.debug(
+                            f"Insufficient valid prices for {ticker}, using default stop loss"
+                        )
+                        return default_stop_loss
+
+                    # Calculate volatility metrics
+                    min_price = min(prices)
+                    max_price = max(prices)
+                    price_range = max_price - min_price
+                    price_range_pct = (
+                        (price_range / min_price) * 100 if min_price > 0 else 0
+                    )
+
+                    # Calculate average true range (ATR) approximation
+                    # Use high-low ranges for volatility
+                    high_low_ranges = []
+                    for bar in bars:
+                        if not isinstance(bar, dict):
+                            continue
+                        try:
+                            high = bar.get("h")
+                            low = bar.get("l")
+                            if high is not None and low is not None:
+                                high = float(high)
+                                low = float(low)
+                                if high > 0 and low > 0:
+                                    high_low_ranges.append((high - low) / low * 100)
+                        except (ValueError, TypeError) as vol_error:
+                            logger.debug(
+                                f"Skipping bar for volatility calculation for {ticker}: {str(vol_error)}"
+                            )
+                            continue
+
+                    avg_volatility = (
+                        sum(high_low_ranges) / len(high_low_ranges)
+                        if high_low_ranges
+                        else 0
+                    )
+
+                    # Calculate recent volatility (last 30 minutes)
+                    recent_bars = bars[-30:] if len(bars) >= 30 else bars
+                    recent_high_low_ranges = []
+                    for bar in recent_bars:
+                        if not isinstance(bar, dict):
+                            continue
+                        try:
+                            high = bar.get("h")
+                            low = bar.get("l")
+                            if high is not None and low is not None:
+                                high = float(high)
+                                low = float(low)
+                                if high > 0 and low > 0:
+                                    recent_high_low_ranges.append(
+                                        (high - low) / low * 100
+                                    )
+                        except (ValueError, TypeError) as vol_error:
+                            logger.debug(
+                                f"Skipping recent bar for volatility calculation for {ticker}: {str(vol_error)}"
+                            )
+                            continue
+
+                    recent_volatility = (
+                        sum(recent_high_low_ranges) / len(recent_high_low_ranges)
+                        if recent_high_low_ranges
+                        else 0
+                    )
+
+                    # Use the higher of average or recent volatility
+                    volatility = max(avg_volatility, recent_volatility)
+
+                    # Calculate dynamic stop loss:
+                    # - Base: 2.5% (default)
+                    # - Add 50% of daily price range percentage
+                    # - Add 50% of volatility
+                    # - Cap at -7% maximum (to prevent excessive losses)
+                    # - Minimum of -3.5% for penny stocks (give them more room than default)
+                    dynamic_stop_loss = (
+                        -2.5 - (price_range_pct * 0.5) - (volatility * 0.5)
+                    )
+                    dynamic_stop_loss = max(-7.0, min(-3.5, dynamic_stop_loss))
+
+                    logger.info(
+                        f"Dynamic stop loss for {ticker}: {dynamic_stop_loss:.2f}% "
+                        f"(price_range: {price_range_pct:.2f}%, volatility: {volatility:.2f}%, "
+                        f"enter_price: ${enter_price:.2f})"
+                    )
+
+                    return dynamic_stop_loss
+
+        except Exception as e:
+            logger.warning(
+                f"Error calculating dynamic stop loss for {ticker}: {str(e)}, using default"
+            )
+            return default_stop_loss
 
     @classmethod
     def _is_warrant_or_option(cls, ticker: str) -> bool:
@@ -645,12 +871,18 @@ class MomentumIndicator(BaseTradingIndicator):
                     if k != "datetime_price"
                 }
 
+            # Calculate dynamic stop loss for penny stocks
+            dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
+                ticker, enter_price
+            )
+
             await cls._enter_trade(
                 ticker=ticker,
                 action=action,
                 enter_price=enter_price,
                 enter_reason=ranked_reason,
                 technical_indicators=technical_indicators_for_enter,
+                dynamic_stop_loss=dynamic_stop_loss,
             )
 
         for rank, (ticker, momentum_score, reason) in enumerate(top_downward, start=1):
@@ -752,12 +984,18 @@ class MomentumIndicator(BaseTradingIndicator):
                     if k != "datetime_price"
                 }
 
+            # Calculate dynamic stop loss for penny stocks
+            dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
+                ticker, enter_price
+            )
+
             await cls._enter_trade(
                 ticker=ticker,
                 action=action,
                 enter_price=enter_price,
                 enter_reason=ranked_reason,
                 technical_indicators=technical_indicators_for_enter,
+                dynamic_stop_loss=dynamic_stop_loss,
             )
 
         await asyncio.sleep(cls.entry_cycle_seconds)
@@ -804,6 +1042,13 @@ class MomentumIndicator(BaseTradingIndicator):
             trailing_stop = float(trade.get("trailing_stop", 0.5))
             peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
             created_at = trade.get("created_at")
+            # Get dynamic stop loss if available, otherwise use default
+            dynamic_stop_loss = trade.get("dynamic_stop_loss")
+            stop_loss_threshold = (
+                float(dynamic_stop_loss)
+                if dynamic_stop_loss is not None
+                else cls.stop_loss_threshold
+            )
 
             if not ticker or enter_price is None or enter_price <= 0:
                 logger.warning(f"Invalid momentum trade data: {trade}")
@@ -853,11 +1098,12 @@ class MomentumIndicator(BaseTradingIndicator):
             should_exit = False
             exit_reason = None
 
-            if profit_percent < cls.stop_loss_threshold:
+            if profit_percent < stop_loss_threshold:
                 should_exit = True
                 exit_reason = (
                     f"Trailing stop loss triggered: {profit_percent:.2f}% "
-                    f"(below {cls.stop_loss_threshold}% stop loss threshold)"
+                    f"(below {stop_loss_threshold:.2f}% stop loss threshold"
+                    f"{' (dynamic)' if dynamic_stop_loss is not None else ''})"
                 )
                 logger.info(
                     f"Exit signal for {ticker} - losing trade: {profit_percent:.2f}%"
