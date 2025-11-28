@@ -1005,7 +1005,8 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 )
 
             # Check if trailing stop should apply (cooling period)
-            if not should_exit and peak_profit_percent > 0:
+            # Trailing stop should only protect profits, not trigger on losses
+            if not should_exit and peak_profit_percent > 0 and profit_percent > 0:
                 should_apply_trailing, cooling_reason = VolatilityUtils.should_apply_trailing_stop(
                     enter_price, created_at, profit_percent
                 )
@@ -1023,6 +1024,14 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         )
                 else:
                     logger.debug(f"{ticker}: {cooling_reason}")
+            elif not should_exit and peak_profit_percent > 0 and profit_percent <= 0:
+                # Trade is already negative - trailing stop doesn't apply
+                # The hard stop loss will handle it if it gets worse
+                logger.debug(
+                    f"Trailing stop not applicable for {ticker}: "
+                    f"current profit {profit_percent:.2f}% is negative "
+                    f"(peak was {peak_profit_percent:.2f}%)"
+                )
 
             # Profit target
             if not should_exit:

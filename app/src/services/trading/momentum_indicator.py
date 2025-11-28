@@ -6,9 +6,8 @@ Uses price momentum to identify entry and exit signals
 import asyncio
 import os
 from typing import List, Tuple, Dict, Any, Optional
-from datetime import datetime, timezone
-
-import aiohttp
+from datetime import datetime, timezone, time
+import pytz
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
@@ -34,8 +33,8 @@ class MomentumIndicator(BaseTradingIndicator):
     stop_loss_threshold: float = -2.5  # Increased from -1.5% to give trades more room
     trailing_stop_percent: float = 2.5  # Increased from 1.5% to reduce premature exits
     min_adx_threshold: float = 20.0
-    rsi_oversold_for_long: float = 35.0
-    rsi_overbought_for_short: float = 65.0
+    rsi_oversold_for_long: float = 40.0  # Increased from 35.0 - require more oversold for longs
+    rsi_overbought_for_short: float = 70.0  # Increased from 65.0 - require truly overbought for shorts
     profit_target_strong_momentum: float = 5.0
     min_holding_period_seconds: int = (
         60  # Minimum 60 seconds before allowing exit (prevent instant exits)
@@ -67,8 +66,13 @@ class MomentumIndicator(BaseTradingIndicator):
         60  # Maximum holding time for volatile stocks
     )
     trailing_stop_cooldown_seconds: int = (
-        180  # 3 minutes - don't activate trailing stop until this time has passed
+        180  # 3 minutes - don't activate trailing stop until this time has passed (for penny stocks)
     )
+    min_trailing_stop_cooldown_seconds: int = (
+        120  # 2 minutes minimum cooldown for ALL stocks to prevent whipsaw exits
+    )
+    force_close_before_market_close: bool = True  # Force close all positions before market close
+    minutes_before_close_to_exit: int = 15  # Exit positions 15 minutes before market close
 
     # Dynamic stop loss configuration
     _alpaca_api_key = os.environ.get("REAL_TRADE_API_KEY", "")
@@ -78,6 +82,32 @@ class MomentumIndicator(BaseTradingIndicator):
     @classmethod
     def indicator_name(cls) -> str:
         return "Momentum Trading"
+
+    @classmethod
+    def _is_near_market_close(cls) -> bool:
+        """
+        Check if we're within the specified minutes before market close.
+        Market close is 4:00 PM ET (16:00).
+        """
+        if not cls.force_close_before_market_close:
+            return False
+        
+        est_tz = pytz.timezone("America/New_York")
+        current_time_est = datetime.now(est_tz)
+        market_close_time = time(16, 0)  # 4:00 PM ET
+        current_time_only = current_time_est.time()
+        
+        # Calculate minutes until market close
+        close_datetime = datetime.combine(current_time_est.date(), market_close_time)
+        close_datetime = est_tz.localize(close_datetime)
+        current_datetime = current_time_est
+        
+        if current_datetime >= close_datetime:
+            # Already past market close
+            return True
+        
+        minutes_until_close = (close_datetime - current_datetime).total_seconds() / 60.0
+        return minutes_until_close <= cls.minutes_before_close_to_exit
 
     @classmethod
     def _calculate_atr_percent(cls, atr: float, current_price: float) -> float:
@@ -645,6 +675,20 @@ class MomentumIndicator(BaseTradingIndicator):
                 False,
                 f"RSI too low for short: {rsi:.2f} <= {cls.rsi_overbought_for_short} (not overbought enough)",
             )
+
+        # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
+        if is_short:
+            stoch = technical_analysis.get("stoch", {})
+            stoch_k = stoch.get("k", 50.0) if isinstance(stoch, dict) else 50.0
+            stoch_d = stoch.get("d", 50.0) if isinstance(stoch, dict) else 50.0
+            
+            # Don't short if stochastic is still bullish (K > D and K > 60)
+            # This indicates upward momentum is still present
+            if stoch_k > stoch_d and stoch_k > 60:
+                return (
+                    False,
+                    f"Stochastic still bullish for short: K={stoch_k:.2f} > D={stoch_d:.2f} and K > 60 (upward momentum present)",
+                )
 
         # Check for mean reversion risk (Bollinger Band extremes)
         is_mean_reverting, mean_revert_reason = cls._is_likely_mean_reverting(
@@ -1347,6 +1391,14 @@ class MomentumIndicator(BaseTradingIndicator):
             f"Monitoring {active_count}/{cls.max_active_trades} active momentum trades"
         )
 
+        # Check if we need to force close positions before market close
+        is_near_close = cls._is_near_market_close()
+        if is_near_close:
+            logger.info(
+                f"Near market close - forcing exit of all {active_count} active positions "
+                f"({cls.minutes_before_close_to_exit} minutes before close)"
+            )
+
         for trade in active_trades:
             if not cls.running:
                 break
@@ -1415,6 +1467,17 @@ class MomentumIndicator(BaseTradingIndicator):
             should_exit = False
             exit_reason = None
 
+            # Force exit before market close
+            if is_near_close:
+                should_exit = True
+                exit_reason = (
+                    f"End-of-day closure: exiting {cls.minutes_before_close_to_exit} minutes before market close "
+                    f"(current profit: {profit_percent:.2f}%)"
+                )
+                logger.info(
+                    f"Force exit for {ticker} before market close: {exit_reason}"
+                )
+
             # Time-based exit for volatile/low-priced stocks (check after getting market data)
             if holding_period_minutes > 0:
                 is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
@@ -1472,18 +1535,22 @@ class MomentumIndicator(BaseTradingIndicator):
                             datetime.now(timezone.utc) - enter_time
                         ).total_seconds()
 
-                        # For penny stocks, wait before activating trailing stop
+                        # Apply minimum cooldown for ALL stocks to prevent whipsaw exits
+                        # For penny stocks, use longer cooldown
                         is_low_price = (
                             enter_price < cls.max_stock_price_for_penny_treatment
                         )
-                        if (
-                            is_low_price
-                            and elapsed_seconds < cls.trailing_stop_cooldown_seconds
-                        ):
+                        required_cooldown = (
+                            cls.trailing_stop_cooldown_seconds
+                            if is_low_price
+                            else cls.min_trailing_stop_cooldown_seconds
+                        )
+                        if elapsed_seconds < required_cooldown:
                             trailing_stop_active = False
                             logger.debug(
                                 f"Trailing stop not active for {ticker}: "
-                                f"cooling period ({elapsed_seconds:.0f}s < {cls.trailing_stop_cooldown_seconds}s)"
+                                f"cooling period ({elapsed_seconds:.0f}s < {required_cooldown}s) "
+                                f"{'(penny stock)' if is_low_price else '(standard)'}"
                             )
                     except Exception as e:
                         logger.debug(
@@ -1525,18 +1592,29 @@ class MomentumIndicator(BaseTradingIndicator):
                         else:
                             dynamic_trailing_stop = base_trailing_stop
 
-                    drop_from_peak = peak_profit_percent - profit_percent
-                    if drop_from_peak >= dynamic_trailing_stop:
-                        should_exit = True
-                        exit_reason = (
-                            f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
-                            f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
-                            f"trailing stop: {dynamic_trailing_stop:.2f}%)"
-                        )
-                        logger.info(
-                            f"Exit signal for {ticker} - trailing stop: "
-                            f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%, "
-                            f"trailing stop: {dynamic_trailing_stop:.2f}%"
+                    # Trailing stop should only protect profits, not trigger on losses
+                    # Only apply trailing stop if current profit is still positive
+                    if profit_percent > 0:
+                        drop_from_peak = peak_profit_percent - profit_percent
+                        if drop_from_peak >= dynamic_trailing_stop:
+                            should_exit = True
+                            exit_reason = (
+                                f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
+                                f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
+                                f"trailing stop: {dynamic_trailing_stop:.2f}%)"
+                            )
+                            logger.info(
+                                f"Exit signal for {ticker} - trailing stop: "
+                                f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%, "
+                                f"trailing stop: {dynamic_trailing_stop:.2f}%"
+                            )
+                    else:
+                        # Trade is already negative - trailing stop doesn't apply
+                        # The hard stop loss will handle it if it gets worse
+                        logger.debug(
+                            f"Trailing stop not applicable for {ticker}: "
+                            f"current profit {profit_percent:.2f}% is negative "
+                            f"(peak was {peak_profit_percent:.2f}%)"
                         )
 
             if not should_exit:
