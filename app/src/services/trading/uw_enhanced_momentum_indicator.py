@@ -23,6 +23,7 @@ from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
 from app.src.services.trading.base_trading_indicator import BaseTradingIndicator
+from app.src.services.market_data.market_data_service import MarketDataService
 from app.src.services.trading.volatility_utils import VolatilityUtils
 from app.src.services.unusual_whales.uw_client import (
     UnusualWhalesClient,
@@ -859,6 +860,16 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         continue
                 else:
                     continue
+
+            # Check if ticker is shortable before attempting short trade
+            is_shortable, shortable_reason = (
+                await MarketDataService.check_ticker_shortable(
+                    ticker, indicator=cls.indicator_name()
+                )
+            )
+            if not is_shortable:
+                logger.debug(f"Skipping short entry for {ticker}: {shortable_reason}")
+                continue
 
             action = "sell_to_open"
             quote_response = await MCPClient.get_quote(ticker)
