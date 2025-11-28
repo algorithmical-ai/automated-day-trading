@@ -126,3 +126,39 @@ MARKET_DATA_ANALYZER_INDICATOR = "Market Data Analyzer"
 AWS_BEDROCK_MODEL_ID: str = os.getenv(
     "AWS_BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
 )
+
+# =============================================================================
+# Unusual Whales API Configuration
+# =============================================================================
+# Get your API token from your Unusual Whales premium subscription
+# Dashboard: https://unusualwhales.com/account/api
+UW_API_TOKEN = os.environ.get("UW_API_TOKEN", "")
+
+# Rate limiting (requests per second)
+UW_RATE_LIMIT_DELAY = float(os.environ.get("UW_RATE_LIMIT_DELAY", "0.2"))
+
+# Timeout for UW API requests (seconds)
+UW_REQUEST_TIMEOUT = int(os.environ.get("UW_REQUEST_TIMEOUT", "15"))
+
+# =============================================================================
+# Volatility Configuration (Optional Overrides)
+# =============================================================================
+# These can be overridden via environment variables if needed
+# Price category thresholds
+PENNY_STOCK_THRESHOLD = float(os.environ.get("PENNY_STOCK_THRESHOLD", "3.0"))
+LOW_PRICE_THRESHOLD = float(os.environ.get("LOW_PRICE_THRESHOLD", "5.0"))
+MID_PRICE_THRESHOLD = float(os.environ.get("MID_PRICE_THRESHOLD", "10.0"))
+
+# ATR multipliers
+ATR_TRAILING_STOP_MULTIPLIER = float(os.environ.get("ATR_TRAILING_STOP_MULTIPLIER", "2.5"))
+ATR_STOP_LOSS_MULTIPLIER = float(os.environ.get("ATR_STOP_LOSS_MULTIPLIER", "3.0"))
+
+# Cooling periods (seconds)
+PENNY_STOCK_COOLING_PERIOD = int(os.environ.get("PENNY_STOCK_COOLING_PERIOD", "180"))
+LOW_PRICE_COOLING_PERIOD = int(os.environ.get("LOW_PRICE_COOLING_PERIOD", "120"))
+DEFAULT_COOLING_PERIOD = int(os.environ.get("DEFAULT_COOLING_PERIOD", "60"))
+
+# Maximum ATR percentages for entry filter
+PENNY_STOCK_MAX_ATR_PERCENT = float(os.environ.get("PENNY_STOCK_MAX_ATR_PERCENT", "5.0"))
+LOW_PRICE_MAX_ATR_PERCENT = float(os.environ.get("LOW_PRICE_MAX_ATR_PERCENT", "4.0"))
+MID_PRICE_MAX_ATR_PERCENT = float(os.environ.get("MID_PRICE_MAX_ATR_PERCENT", "3.0"))
