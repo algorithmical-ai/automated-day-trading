@@ -41,6 +41,35 @@ class MomentumIndicator(BaseTradingIndicator):
         60  # Minimum 60 seconds before allowing exit (prevent instant exits)
     )
 
+    # Volatility and low-priced stock filters
+    min_stock_price: float = (
+        0.10  # Minimum stock price to trade (avoid extreme penny stocks)
+    )
+    max_stock_price_for_penny_treatment: float = (
+        3.0  # Stocks under this price get special handling
+    )
+    max_atr_percent_for_entry: float = (
+        5.0  # Maximum ATR% to allow entry (5% = very volatile)
+    )
+    max_volatility_for_low_price: float = 4.0  # Max ATR% for stocks under $3
+    min_price_for_standard_entry: float = 2.0  # Stocks above this use standard filters
+    max_bid_ask_spread_percent: float = 2.0  # Maximum bid-ask spread % for entry
+    trailing_stop_penny_stock_multiplier: float = (
+        1.5  # Wider trailing stop for penny stocks
+    )
+    trailing_stop_volatile_multiplier: float = (
+        1.3  # Wider trailing stop for volatile stocks
+    )
+    max_holding_time_penny_stocks_minutes: int = (
+        30  # Maximum holding time for penny stocks (reduce risk)
+    )
+    max_holding_time_volatile_stocks_minutes: int = (
+        60  # Maximum holding time for volatile stocks
+    )
+    trailing_stop_cooldown_seconds: int = (
+        180  # 3 minutes - don't activate trailing stop until this time has passed
+    )
+
     # Dynamic stop loss configuration
     _alpaca_api_key = os.environ.get("REAL_TRADE_API_KEY", "")
     _alpaca_api_secret = os.environ.get("REAL_TRADE_SECRET_KEY", "")
@@ -51,15 +80,126 @@ class MomentumIndicator(BaseTradingIndicator):
         return "Momentum Trading"
 
     @classmethod
-    async def _calculate_dynamic_stop_loss(
-        cls, ticker: str, enter_price: float
+    def _calculate_atr_percent(cls, atr: float, current_price: float) -> float:
+        """Calculate ATR as percentage of current price"""
+        if current_price <= 0 or atr <= 0:
+            return 0.0
+        return (atr / current_price) * 100
+
+    @classmethod
+    def _calculate_volatility_adjusted_trailing_stop(
+        cls,
+        enter_price: float,
+        atr: float,
+        current_price: float,
     ) -> float:
         """
-        Calculate dynamic stop loss based on intraday volatility from Alpaca API.
+        Calculate trailing stop based on ATR instead of fixed percentage.
+        For penny stocks, use 2-3x ATR as trailing stop distance.
+        This gives volatile stocks more room to breathe.
+        """
+        if enter_price <= 0 or atr <= 0 or current_price <= 0:
+            return cls.trailing_stop_percent
+
+        # Calculate ATR as percentage of price
+        atr_percent = cls._calculate_atr_percent(atr, current_price)
+
+        # Use 2.5x ATR for trailing stop, with min/max bounds
+        trailing_stop = atr_percent * 2.5
+
+        # Bounds: minimum 2%, maximum 8% for penny stocks
+        if enter_price < 5.0:  # Penny stock threshold
+            trailing_stop = max(3.0, min(8.0, trailing_stop))
+        else:
+            trailing_stop = max(2.0, min(5.0, trailing_stop))
+
+        return trailing_stop
+
+    @classmethod
+    def _calculate_volatility_score(
+        cls, technical_analysis: Dict[str, Any], current_price: float
+    ) -> Tuple[float, str]:
+        """
+        Calculate volatility score based on ATR and other indicators.
+        Returns (volatility_score, reason) where score is ATR% of price.
+        """
+        atr = technical_analysis.get("atr", 0.0)
+        atr_percent = cls._calculate_atr_percent(atr, current_price)
+
+        # Also consider Bollinger Band width as volatility indicator
+        bollinger = technical_analysis.get("bollinger", {})
+        if isinstance(bollinger, dict):
+            upper = bollinger.get("upper", 0.0)
+            lower = bollinger.get("lower", 0.0)
+            middle = bollinger.get("middle", current_price)
+            if middle > 0:
+                bb_width_percent = ((upper - lower) / middle) * 100
+                # Use the higher of ATR% or BB width% as volatility measure
+                volatility_score = max(atr_percent, bb_width_percent * 0.5)
+            else:
+                volatility_score = atr_percent
+        else:
+            volatility_score = atr_percent
+
+        reason = f"ATR: {atr_percent:.2f}%"
+        return volatility_score, reason
+
+    @classmethod
+    async def _check_bid_ask_spread(
+        cls, ticker: str, enter_price: float
+    ) -> Tuple[bool, float, str]:
+        """
+        Check if bid-ask spread is acceptable for entry.
+        Returns (is_acceptable, spread_percent, reason)
+        """
+        try:
+            quote_response = await MCPClient.get_quote(ticker)
+            if not quote_response:
+                return True, 0.0, "No quote data available, proceeding"
+
+            quote_data = quote_response.get("quote", {})
+            quotes = quote_data.get("quotes", {})
+            ticker_quote = quotes.get(ticker, {})
+
+            bid = ticker_quote.get("bp", 0.0)  # Bid price
+            ask = ticker_quote.get("ap", 0.0)  # Ask price
+
+            if bid <= 0 or ask <= 0:
+                return True, 0.0, "Invalid bid/ask data, proceeding"
+
+            spread = ask - bid
+            spread_percent = (spread / enter_price) * 100 if enter_price > 0 else 0.0
+
+            # For low-priced stocks, be more lenient with spread
+            max_spread = cls.max_bid_ask_spread_percent
+            if enter_price < cls.max_stock_price_for_penny_treatment:
+                max_spread = cls.max_bid_ask_spread_percent * 1.5  # 50% more lenient
+
+            is_acceptable = spread_percent <= max_spread
+            reason = (
+                f"Spread: {spread_percent:.2f}% "
+                f"{'acceptable' if is_acceptable else f'(exceeds {max_spread:.2f}% limit)'}"
+            )
+
+            return is_acceptable, spread_percent, reason
+        except Exception as e:
+            logger.debug(f"Error checking bid-ask spread for {ticker}: {str(e)}")
+            return True, 0.0, f"Error checking spread: {str(e)}, proceeding"
+
+    @classmethod
+    async def _calculate_dynamic_stop_loss(
+        cls,
+        ticker: str,
+        enter_price: float,
+        technical_analysis: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        """
+        Calculate dynamic stop loss based on ATR and intraday volatility.
 
         Args:
             ticker: Stock ticker symbol
             enter_price: Entry price for the trade
+            technical_analysis: Technical indicators including ATR
 
         Returns:
             Dynamic stop loss percentage (negative value, e.g., -3.5 for -3.5%)
@@ -67,8 +207,42 @@ class MomentumIndicator(BaseTradingIndicator):
         # Default stop loss if we can't calculate dynamic one
         default_stop_loss = cls.stop_loss_threshold
 
-        # Only calculate for stocks under $2 (penny stocks that need more room)
-        if enter_price >= 2.0:
+        # Use ATR if available (preferred method)
+        if technical_analysis:
+            atr = technical_analysis.get("atr", 0.0)
+            if atr > 0 and enter_price > 0:
+                atr_percent = cls._calculate_atr_percent(atr, enter_price)
+
+                # For low-priced stocks, use wider stop loss based on ATR
+                is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
+
+                if is_low_price:
+                    # Use 2x ATR for penny stocks, but cap at reasonable levels
+                    stop_loss_atr_multiple = 2.0
+                    dynamic_stop_loss = -(atr_percent * stop_loss_atr_multiple)
+                    # Cap between -3.5% and -7.0% for penny stocks
+                    dynamic_stop_loss = max(-7.0, min(-3.5, dynamic_stop_loss))
+
+                    logger.info(
+                        f"ATR-based stop loss for {ticker}: {dynamic_stop_loss:.2f}% "
+                        f"(ATR: {atr_percent:.2f}%, enter_price: ${enter_price:.2f})"
+                    )
+                    return dynamic_stop_loss
+                else:
+                    # For higher-priced stocks, use 1.5x ATR
+                    stop_loss_atr_multiple = 1.5
+                    dynamic_stop_loss = -(atr_percent * stop_loss_atr_multiple)
+                    # Cap between -2.5% and -5.0% for regular stocks
+                    dynamic_stop_loss = max(-5.0, min(-2.5, dynamic_stop_loss))
+
+                    logger.info(
+                        f"ATR-based stop loss for {ticker}: {dynamic_stop_loss:.2f}% "
+                        f"(ATR: {atr_percent:.2f}%, enter_price: ${enter_price:.2f})"
+                    )
+                    return dynamic_stop_loss
+
+        # Fallback to Alpaca API for stocks under $3 if ATR not available
+        if enter_price >= cls.max_stock_price_for_penny_treatment:
             return default_stop_loss
 
         # Check if we have API credentials
@@ -287,15 +461,46 @@ class MomentumIndicator(BaseTradingIndicator):
         """
         Check if ticker is a "golden" opportunity with exceptional momentum or technical indicators
         Golden tickers can bypass daily trade limits
+        More stringent requirements for penny stocks to avoid false signals
         """
+        technical_analysis = market_data.get("technical_analysis", {})
+        current_price = technical_analysis.get("close_price", 0.0)
         abs_momentum = abs(momentum_score)
 
-        # Exceptional momentum
+        # For penny stocks (< $3), require MUCH higher thresholds
+        if current_price < cls.max_stock_price_for_penny_treatment:
+            # Require exceptional momentum AND volume confirmation
+            volume = technical_analysis.get("volume", 0)
+            volume_sma = technical_analysis.get("volume_sma", 1)
+            volume_ratio = volume / volume_sma if volume_sma > 0 else 0
+
+            # Need 3x average volume AND >8% momentum for penny stock golden
+            if abs_momentum >= 8.0 and volume_ratio >= 3.0:
+                adx = technical_analysis.get("adx", 0)
+                if adx >= 30:  # Strong trend confirmation
+                    # Additional check: not at Bollinger Band extremes (avoid mean reversion)
+                    bollinger = technical_analysis.get("bollinger", {})
+                    if isinstance(bollinger, dict):
+                        upper = bollinger.get("upper", 0)
+                        lower = bollinger.get("lower", 0)
+                        if upper > 0 and lower > 0 and current_price > 0:
+                            band_width = upper - lower
+                            if band_width > 0:
+                                position_in_band = (current_price - lower) / band_width
+                                # Don't mark as golden if at extreme (>90% for long, <10% for short)
+                                is_long = momentum_score > 0
+                                if is_long and position_in_band > 0.90:
+                                    return False
+                                if not is_long and position_in_band < 0.10:
+                                    return False
+                    return True
+            return False
+
+        # Original logic for non-penny stocks
         if abs_momentum >= cls.exceptional_momentum_threshold:
             return True
 
         # Exceptional technical indicators
-        technical_analysis = market_data.get("technical_analysis", {})
         adx = technical_analysis.get("adx")
         rsi = technical_analysis.get("rsi", 50.0)
 
@@ -312,6 +517,50 @@ class MomentumIndicator(BaseTradingIndicator):
         return False
 
     @classmethod
+    def _is_likely_mean_reverting(
+        cls,
+        market_data: Dict[str, Any],
+        momentum_score: float,
+    ) -> Tuple[bool, str]:
+        """
+        Check if the stock is likely to mean-revert soon.
+        Reject entries at Bollinger Band extremes to avoid entering at peaks/troughs.
+        """
+        technical_analysis = market_data.get("technical_analysis", {})
+        bollinger = technical_analysis.get("bollinger", {})
+        current_price = technical_analysis.get("close_price", 0.0)
+
+        if not isinstance(bollinger, dict):
+            return False, "No Bollinger data"
+
+        upper = bollinger.get("upper", 0)
+        lower = bollinger.get("lower", 0)
+
+        if upper <= 0 or lower <= 0 or current_price <= 0:
+            return False, "Invalid Bollinger data"
+
+        # Check if price is at Bollinger Band extremes
+        band_width = upper - lower
+        if band_width > 0:
+            position_in_band = (current_price - lower) / band_width
+
+            # For LONG entries, reject if price is already at upper band (>90%)
+            if momentum_score > 0 and position_in_band > 0.90:
+                return (
+                    True,
+                    f"Price at upper Bollinger ({position_in_band:.0%}), likely to revert",
+                )
+
+            # For SHORT entries, reject if price is already at lower band (<10%)
+            if momentum_score < 0 and position_in_band < 0.10:
+                return (
+                    True,
+                    f"Price at lower Bollinger ({position_in_band:.0%}), likely to revert",
+                )
+
+        return False, "Not at Bollinger extremes"
+
+    @classmethod
     async def _passes_stock_quality_filters(
         cls, ticker: str, market_data: Dict[str, Any], momentum_score: float = 0.0
     ) -> Tuple[bool, str]:
@@ -324,6 +573,36 @@ class MomentumIndicator(BaseTradingIndicator):
 
         technical_analysis = market_data.get("technical_analysis", {})
         current_price = technical_analysis.get("close_price", 0.0)
+
+        # Check minimum price filter
+        if current_price < cls.min_stock_price:
+            return (
+                False,
+                f"Price too low: ${current_price:.2f} < ${cls.min_stock_price:.2f} minimum (too risky)",
+            )
+
+        # Check volatility for low-priced stocks
+        is_low_price = current_price < cls.max_stock_price_for_penny_treatment
+        volatility_score, volatility_reason = cls._calculate_volatility_score(
+            technical_analysis, current_price
+        )
+
+        if is_low_price:
+            # Stricter volatility filter for low-priced stocks
+            if volatility_score > cls.max_volatility_for_low_price:
+                return (
+                    False,
+                    f"Too volatile for low-priced stock: {volatility_reason} "
+                    f"(exceeds {cls.max_volatility_for_low_price:.2f}% limit for stocks < ${cls.max_stock_price_for_penny_treatment})",
+                )
+        else:
+            # Standard volatility filter for higher-priced stocks
+            if volatility_score > cls.max_atr_percent_for_entry:
+                return (
+                    False,
+                    f"Too volatile: {volatility_reason} "
+                    f"(exceeds {cls.max_atr_percent_for_entry:.2f}% limit)",
+                )
 
         volume = technical_analysis.get("volume", 0)
         volume_sma = technical_analysis.get("volume_sma", 0)
@@ -361,7 +640,17 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"RSI too low for short: {rsi:.2f} <= {cls.rsi_overbought_for_short} (not overbought enough)",
             )
 
-        return True, f"Passed all quality filters (ADX: {adx:.2f}, RSI: {rsi:.2f})"
+        # Check for mean reversion risk (Bollinger Band extremes)
+        is_mean_reverting, mean_revert_reason = cls._is_likely_mean_reverting(
+            market_data, momentum_score
+        )
+        if is_mean_reverting:
+            return False, mean_revert_reason
+
+        return (
+            True,
+            f"Passed all quality filters (ADX: {adx:.2f}, RSI: {rsi:.2f}, {volatility_reason})",
+        )
 
     @classmethod
     def _calculate_momentum(cls, datetime_price: List[Any]) -> Tuple[float, str]:
@@ -851,6 +1140,16 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 continue
 
+            # Check bid-ask spread before entry
+            spread_acceptable, spread_percent, spread_reason = (
+                await cls._check_bid_ask_spread(ticker, enter_price)
+            )
+            if not spread_acceptable:
+                logger.info(
+                    f"Skipping {ticker}: {spread_reason} (enter_price: ${enter_price:.2f})"
+                )
+                continue
+
             golden_prefix = "🟡 GOLDEN: " if is_golden else ""
             ranked_reason = f"{golden_prefix}{reason} (ranked #{rank} upward momentum)"
             await send_signal_to_webhook(
@@ -873,7 +1172,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
             # Calculate dynamic stop loss for penny stocks
             dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
-                ticker, enter_price
+                ticker, enter_price, technical_indicators_for_enter
             )
 
             await cls._enter_trade(
@@ -962,6 +1261,16 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 continue
 
+            # Check bid-ask spread before entry
+            spread_acceptable, spread_percent, spread_reason = (
+                await cls._check_bid_ask_spread(ticker, enter_price)
+            )
+            if not spread_acceptable:
+                logger.info(
+                    f"Skipping {ticker}: {spread_reason} (enter_price: ${enter_price:.2f})"
+                )
+                continue
+
             golden_prefix = "🟡 GOLDEN: " if is_golden else ""
             ranked_reason = (
                 f"{golden_prefix}{reason} (ranked #{rank} downward momentum)"
@@ -986,7 +1295,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
             # Calculate dynamic stop loss for penny stocks
             dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
-                ticker, enter_price
+                ticker, enter_price, technical_indicators_for_enter
             )
 
             await cls._enter_trade(
@@ -1055,6 +1364,7 @@ class MomentumIndicator(BaseTradingIndicator):
                 continue
 
             # Check minimum holding period
+            holding_period_minutes = 0
             if created_at:
                 try:
                     enter_time = datetime.fromisoformat(
@@ -1064,6 +1374,7 @@ class MomentumIndicator(BaseTradingIndicator):
                         enter_time = enter_time.replace(tzinfo=timezone.utc)
                     current_time = datetime.now(timezone.utc)
                     holding_period_seconds = (current_time - enter_time).total_seconds()
+                    holding_period_minutes = holding_period_seconds / 60.0
 
                     if holding_period_seconds < cls.min_holding_period_seconds:
                         logger.debug(
@@ -1098,6 +1409,38 @@ class MomentumIndicator(BaseTradingIndicator):
             should_exit = False
             exit_reason = None
 
+            # Time-based exit for volatile/low-priced stocks (check after getting market data)
+            if holding_period_minutes > 0:
+                is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
+                atr = technical_analysis.get("atr", 0.0)
+                atr_percent = (
+                    cls._calculate_atr_percent(atr, current_price)
+                    if atr > 0 and current_price > 0
+                    else 0.0
+                )
+                is_volatile = atr_percent > 3.0
+
+                max_holding_minutes = None
+                if is_low_price:
+                    max_holding_minutes = cls.max_holding_time_penny_stocks_minutes
+                elif is_volatile:
+                    max_holding_minutes = cls.max_holding_time_volatile_stocks_minutes
+
+                if (
+                    max_holding_minutes
+                    and holding_period_minutes >= max_holding_minutes
+                ):
+                    should_exit = True
+                    exit_reason = (
+                        f"Time-based exit: held for {holding_period_minutes:.1f} minutes "
+                        f"(max: {max_holding_minutes} min for {'penny' if is_low_price else 'volatile'} stock, "
+                        f"profit: {profit_percent:.2f}%)"
+                    )
+                    logger.info(
+                        f"Exit signal for {ticker} - time-based exit: "
+                        f"held {holding_period_minutes:.1f} min, profit: {profit_percent:.2f}%"
+                    )
+
             if profit_percent < stop_loss_threshold:
                 should_exit = True
                 exit_reason = (
@@ -1110,17 +1453,85 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
 
             elif peak_profit_percent > 0:
-                drop_from_peak = peak_profit_percent - profit_percent
-                if drop_from_peak >= cls.trailing_stop_percent:
-                    should_exit = True
-                    exit_reason = (
-                        f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
-                        f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%)"
-                    )
-                    logger.info(
-                        f"Exit signal for {ticker} - trailing stop: "
-                        f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%"
-                    )
+                # Check if trailing stop should be active (cooling-off period)
+                trailing_stop_active = True
+                if created_at:
+                    try:
+                        enter_time = datetime.fromisoformat(
+                            created_at.replace("Z", "+00:00")
+                        )
+                        if enter_time.tzinfo is None:
+                            enter_time = enter_time.replace(tzinfo=timezone.utc)
+                        elapsed_seconds = (
+                            datetime.now(timezone.utc) - enter_time
+                        ).total_seconds()
+
+                        # For penny stocks, wait before activating trailing stop
+                        is_low_price = (
+                            enter_price < cls.max_stock_price_for_penny_treatment
+                        )
+                        if (
+                            is_low_price
+                            and elapsed_seconds < cls.trailing_stop_cooldown_seconds
+                        ):
+                            trailing_stop_active = False
+                            logger.debug(
+                                f"Trailing stop not active for {ticker}: "
+                                f"cooling period ({elapsed_seconds:.0f}s < {cls.trailing_stop_cooldown_seconds}s)"
+                            )
+                    except Exception as e:
+                        logger.debug(
+                            f"Error checking trailing stop cooldown for {ticker}: {str(e)}"
+                        )
+
+                if trailing_stop_active:
+                    # Calculate ATR-based trailing stop
+                    atr = technical_analysis.get("atr", 0.0)
+                    if atr > 0:
+                        # Use ATR-based trailing stop (more sophisticated)
+                        dynamic_trailing_stop = (
+                            cls._calculate_volatility_adjusted_trailing_stop(
+                                enter_price, atr, current_price
+                            )
+                        )
+                    else:
+                        # Fallback to multiplier-based approach if no ATR
+                        is_low_price = (
+                            enter_price < cls.max_stock_price_for_penny_treatment
+                        )
+                        atr_percent = (
+                            cls._calculate_atr_percent(atr, current_price)
+                            if atr > 0 and current_price > 0
+                            else 0.0
+                        )
+
+                        base_trailing_stop = cls.trailing_stop_percent
+                        if is_low_price:
+                            dynamic_trailing_stop = (
+                                base_trailing_stop
+                                * cls.trailing_stop_penny_stock_multiplier
+                            )
+                        elif atr_percent > 3.0:  # High volatility
+                            dynamic_trailing_stop = (
+                                base_trailing_stop
+                                * cls.trailing_stop_volatile_multiplier
+                            )
+                        else:
+                            dynamic_trailing_stop = base_trailing_stop
+
+                    drop_from_peak = peak_profit_percent - profit_percent
+                    if drop_from_peak >= dynamic_trailing_stop:
+                        should_exit = True
+                        exit_reason = (
+                            f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
+                            f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
+                            f"trailing stop: {dynamic_trailing_stop:.2f}%)"
+                        )
+                        logger.info(
+                            f"Exit signal for {ticker} - trailing stop: "
+                            f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%, "
+                            f"trailing stop: {dynamic_trailing_stop:.2f}%"
+                        )
 
             if not should_exit:
                 profit_target_to_exit = cls.profit_target_strong_momentum
@@ -1136,7 +1547,37 @@ class MomentumIndicator(BaseTradingIndicator):
             if not should_exit:
                 if profit_percent > peak_profit_percent:
                     peak_profit_percent = profit_percent
-                    trailing_stop = cls.trailing_stop_percent
+                    # Calculate dynamic trailing stop for updating (use ATR-based if available)
+                    atr = technical_analysis.get("atr", 0.0)
+                    if atr > 0:
+                        trailing_stop = (
+                            cls._calculate_volatility_adjusted_trailing_stop(
+                                enter_price, atr, current_price
+                            )
+                        )
+                    else:
+                        # Fallback to multiplier-based approach
+                        is_low_price = (
+                            enter_price < cls.max_stock_price_for_penny_treatment
+                        )
+                        atr_percent = (
+                            cls._calculate_atr_percent(atr, current_price)
+                            if atr > 0 and current_price > 0
+                            else 0.0
+                        )
+
+                        if is_low_price:
+                            trailing_stop = (
+                                cls.trailing_stop_percent
+                                * cls.trailing_stop_penny_stock_multiplier
+                            )
+                        elif atr_percent > 3.0:
+                            trailing_stop = (
+                                cls.trailing_stop_percent
+                                * cls.trailing_stop_volatile_multiplier
+                            )
+                        else:
+                            trailing_stop = cls.trailing_stop_percent
 
                 skipped_reason = None
                 if profit_percent < 0:
