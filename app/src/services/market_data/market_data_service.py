@@ -22,17 +22,18 @@ class MarketDataService:
     """Service for analyzing market data for entry and exit signals"""
 
     # Entry score thresholds (similar to BuyToOpenService and SellToOpenService)
-    _base_normal_entry_threshold = 0.75
-    _base_golden_entry_threshold = 0.70
-    _min_adx_normal = 25.0
-    _min_adx_golden = 32.0
-    _min_volume_ratio_normal = 1.2
-    _min_volume_ratio_golden = 2.5
-    _min_ema_crossover_pct = 0.1
-    _max_vwap_deviation_normal = 2.0
-    _max_vwap_deviation_golden = 3.5
-    _max_vwap_premium_normal = 0.35
-    _max_vwap_premium_golden = 0.75
+    # Loosened thresholds to allow more trades
+    _base_normal_entry_threshold = 0.65  # Lowered from 0.75
+    _base_golden_entry_threshold = 0.60  # Lowered from 0.70
+    _min_adx_normal = 20.0  # Lowered from 25.0
+    _min_adx_golden = 25.0  # Lowered from 32.0
+    _min_volume_ratio_normal = 1.0  # Lowered from 1.2 (allow at least average volume)
+    _min_volume_ratio_golden = 1.5  # Lowered from 2.5
+    _min_ema_crossover_pct = 0.05  # Lowered from 0.1 (allow smaller crossovers)
+    _max_vwap_deviation_normal = 2.5  # Increased from 2.0 (allow more deviation)
+    _max_vwap_deviation_golden = 4.0  # Increased from 3.5
+    _max_vwap_premium_normal = 0.50  # Increased from 0.35 (allow higher premium)
+    _max_vwap_premium_golden = 1.0  # Increased from 0.75
 
     # Exit monitoring parameters (similar to ExitMonitoringService)
     _minimum_hold_seconds = 60

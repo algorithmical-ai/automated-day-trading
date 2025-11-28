@@ -21,8 +21,8 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
 
     # Deep Analyzer specific configuration
     top_k: int = 2
-    min_entry_score: float = 0.70  # Minimum entry score from MarketDataService
-    exceptional_entry_score: float = 0.90  # Exceptional entry score for golden tickers
+    min_entry_score: float = 0.60  # Minimum entry score from MarketDataService (lowered from 0.70)
+    exceptional_entry_score: float = 0.75  # Exceptional entry score for golden tickers (lowered from 0.90)
 
     @classmethod
     def indicator_name(cls) -> str:
