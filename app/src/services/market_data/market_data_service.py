@@ -276,6 +276,22 @@ class MarketDataService:
         return result
 
     @classmethod
+    async def check_ticker_shortable(
+        cls, ticker: str, indicator: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """
+        Public method to check if a ticker is shortable.
+        
+        Args:
+            ticker: Stock ticker symbol
+            indicator: Optional indicator name for DynamoDB lookup
+            
+        Returns:
+            Tuple of (is_shortable: bool, reason: str)
+        """
+        return await cls._check_ticker_shortable(ticker, indicator=indicator)
+
+    @classmethod
     async def enter_trade(
         cls,
         ticker: str,

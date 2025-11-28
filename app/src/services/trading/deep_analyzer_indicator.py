@@ -21,8 +21,12 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
 
     # Deep Analyzer specific configuration
     top_k: int = 2
-    min_entry_score: float = 0.60  # Minimum entry score from MarketDataService (lowered from 0.70)
-    exceptional_entry_score: float = 0.75  # Exceptional entry score for golden tickers (lowered from 0.90)
+    min_entry_score: float = (
+        0.60  # Minimum entry score from MarketDataService (lowered from 0.70)
+    )
+    exceptional_entry_score: float = (
+        0.75  # Exceptional entry score for golden tickers (lowered from 0.90)
+    )
 
     @classmethod
     def indicator_name(cls) -> str:
@@ -67,12 +71,29 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             )
 
             # Evaluate for short entry (sell_to_open)
-            short_result = await MarketDataService.enter_trade(
-                ticker=ticker,
-                action="sell_to_open",
-                market_data=market_data,
-                indicator=cls.indicator_name(),
+            # First check if ticker is shortable before attempting short trade
+            is_shortable, shortable_reason = (
+                await MarketDataService.check_ticker_shortable(
+                    ticker, indicator=cls.indicator_name()
+                )
             )
+            if not is_shortable:
+                logger.debug(f"Skipping short entry for {ticker}: {shortable_reason}")
+                short_result: Dict[str, Any] = {
+                    "ticker": ticker,
+                    "action": "sell_to_open",
+                    "signal": None,
+                    "enter": False,
+                    "analysis": {},
+                    "message": f"Cannot proceed with short: {shortable_reason}",
+                }
+            else:
+                short_result = await MarketDataService.enter_trade(
+                    ticker=ticker,
+                    action="sell_to_open",
+                    market_data=market_data,
+                    indicator=cls.indicator_name(),
+                )
 
             long_enter = long_result.get("enter", False)
             short_enter = short_result.get("enter", False)
