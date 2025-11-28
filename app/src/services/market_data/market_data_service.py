@@ -4,9 +4,11 @@ Provides entry and exit analysis for trading signals
 """
 
 import math
+import os
 from datetime import datetime
 from typing import Any, Dict, Tuple, Optional
 
+import aiohttp
 import pytz
 
 from app.src.common.loguru_logger import logger
@@ -38,6 +40,73 @@ class MarketDataService:
     _low_volume_threshold_single = 0.45
 
     @classmethod
+    async def _check_ticker_shortable(cls, ticker: str) -> Tuple[bool, str]:
+        """
+        Check if a ticker is shortable using Alpaca Assets API.
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            Tuple of (is_shortable: bool, reason: str)
+        """
+        api_key = os.environ.get("REAL_TRADE_API_KEY", "")
+        api_secret = os.environ.get("REAL_TRADE_SECRET_KEY", "")
+
+        if not api_key or not api_secret:
+            logger.warning(
+                f"No Alpaca API credentials available, assuming {ticker} is shortable"
+            )
+            return True, "No API credentials, assuming shortable"
+
+        url = f"https://api.alpaca.markets/v2/assets/{ticker}"
+        headers = {
+            "accept": "application/json",
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": api_secret,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        shortable = data.get("shortable", False)
+                        easy_to_borrow = data.get("easy_to_borrow", False)
+                        tradable = data.get("tradable", False)
+
+                        if not tradable:
+                            return False, f"{ticker} is not tradable"
+                        if not shortable:
+                            return False, f"{ticker} is not shortable"
+                        if not easy_to_borrow:
+                            logger.warning(
+                                f"{ticker} is shortable but not easy to borrow"
+                            )
+                            # Still allow it, but log a warning
+
+                        return True, f"{ticker} is shortable"
+                    elif response.status == 404:
+                        return False, f"{ticker} not found in Alpaca assets"
+                    else:
+                        logger.warning(
+                            f"Alpaca API returned status {response.status} for {ticker} asset check"
+                        )
+                        # Assume shortable if API call fails (fail open)
+                        return (
+                            True,
+                            f"API error (status {response.status}), assuming shortable",
+                        )
+        except Exception as e:
+            logger.warning(
+                f"Error checking if {ticker} is shortable: {str(e)}, assuming shortable"
+            )
+            # Fail open - assume shortable if check fails
+            return True, f"Error checking shortability: {str(e)}, assuming shortable"
+
+    @classmethod
     async def enter_trade(
         cls, ticker: str, action: str, market_data: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -53,6 +122,21 @@ class MarketDataService:
         """
         ticker = ticker.upper().strip()
         action = action.lower().strip()
+
+        # Check if ticker is shortable for sell_to_open actions
+        if action == "sell_to_open":
+            is_shortable, shortable_reason = await cls._check_ticker_shortable(ticker)
+            if not is_shortable:
+                return {
+                    "ticker": ticker,
+                    "action": action,
+                    "signal": None,
+                    "enter": False,
+                    "analysis": {},
+                    "message": f"Cannot proceed with short: {shortable_reason}",
+                }
+            logger.debug(f"Shortability check passed for {ticker}: {shortable_reason}")
+
         if market_data is None:  # noqa: C0301
             market_data = await MCPClient.get_market_data(ticker)
             if market_data is None:
@@ -747,16 +831,16 @@ class MarketDataService:
         """
         Check if price trend is upward by analyzing datetime_price time-series data.
         Data is sorted by timestamp in ascending order (oldest to newest).
-        
+
         Args:
             datetime_price: Tuple/list of price data entries, each containing [timestamp, price] or dict
-            
+
         Returns:
             True if price shows upward trend
         """
         if not datetime_price or len(datetime_price) < 3:
             return False
-        
+
         try:
             # Parse and extract (timestamp, price) pairs
             price_points = []
@@ -769,7 +853,9 @@ class MarketDataService:
                         price_points.append((timestamp_str, price))
                     elif isinstance(entry, dict):
                         # Format: {"datetime": ..., "price": ...} or {"datetime": ..., "close": ...}
-                        timestamp_str = str(entry.get("datetime") or entry.get("timestamp") or "")
+                        timestamp_str = str(
+                            entry.get("datetime") or entry.get("timestamp") or ""
+                        )
                         price = float(
                             entry.get("price")
                             or entry.get("close")
@@ -780,14 +866,14 @@ class MarketDataService:
                             price_points.append((timestamp_str, price))
                 except (ValueError, TypeError, KeyError, IndexError):
                     continue
-            
+
             if len(price_points) < 3:
                 return False
-            
+
             # Sort by timestamp in ascending order (oldest to newest)
             # Handle EST timestamps - parse and sort properly
             est_tz = pytz.timezone("America/New_York")
-            
+
             def parse_timestamp(ts_str: str) -> datetime:
                 """Parse timestamp string, handling various formats"""
                 ts_str = str(ts_str).strip()
@@ -797,7 +883,11 @@ class MarketDataService:
                         dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                     else:
                         # Try common formats
-                        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"]:
+                        for fmt in [
+                            "%Y-%m-%d %H:%M:%S",
+                            "%Y-%m-%d %H:%M:%S.%f",
+                            "%Y-%m-%d",
+                        ]:
                             try:
                                 dt = datetime.strptime(ts_str, fmt)
                                 break
@@ -806,84 +896,83 @@ class MarketDataService:
                         else:
                             # Fallback: try ISO without timezone
                             dt = datetime.fromisoformat(ts_str)
-                    
+
                     # Ensure timezone-aware (assume EST if not specified)
                     if dt.tzinfo is None:
                         dt = est_tz.localize(dt)
                     else:
                         dt = dt.astimezone(est_tz)
-                    
+
                     return dt
                 except Exception:
                     # If parsing fails, return a default datetime
                     return datetime.now(est_tz)
-            
+
             # Sort by timestamp (ascending - oldest to newest)
             try:
                 price_points_sorted = sorted(
-                    price_points,
-                    key=lambda x: parse_timestamp(x[0])
+                    price_points, key=lambda x: parse_timestamp(x[0])
                 )
             except Exception:
                 # If sorting fails, use original order
                 price_points_sorted = price_points
-            
+
             # Extract prices in chronological order
             prices = [float(price) for _, price in price_points_sorted]
-            
+
             if len(prices) < 3:
                 return False
-            
+
             # Analyze trend: compare early vs recent prices
             # Use first 1/3 and last 1/3 of data points
             n = len(prices)
             early_count = max(1, n // 3)
             recent_count = max(1, n // 3)
-            
+
             early_prices = prices[:early_count]
             recent_prices = prices[-recent_count:]
-            
+
             early_avg = sum(early_prices) / len(early_prices)
             recent_avg = sum(recent_prices) / len(recent_prices)
-            
+
             # Check if recent average is higher than early average
             if recent_avg <= early_avg:
                 return False
-            
+
             # Calculate percentage change
             change_pct = ((recent_avg - early_avg) / early_avg) * 100
-            
+
             # Also check recent momentum (last few points)
             if len(recent_prices) >= 2:
                 recent_momentum = sum(
                     (recent_prices[i] - recent_prices[i - 1])
                     for i in range(1, len(recent_prices))
                 ) / max(1, len(recent_prices) - 1)
-                
+
                 # Both overall trend and recent momentum should be positive
                 return change_pct > 0.1 and recent_momentum > 0
-            
+
             return change_pct > 0.1
-            
+
         except Exception as e:
             logger.debug(f"Error checking upward price trend: {str(e)}")
             return False
-    
+
     @classmethod
     def _check_price_trend_downward(cls, datetime_price: Tuple) -> bool:
         """
         Check if price trend is downward by analyzing datetime_price time-series data.
         Data is sorted by timestamp in ascending order (oldest to newest).
-        
+
         Args:
             datetime_price: Tuple/list of price data entries, each containing [timestamp, price] or dict
-            
+
         Returns:
             True if price shows downward trend
         """
         if not datetime_price or len(datetime_price) < 3:
             return False
-        
+
         try:
             # Parse and extract (timestamp, price) pairs
             price_points = []
@@ -894,7 +983,9 @@ class MarketDataService:
                         price = float(entry[1])
                         price_points.append((timestamp_str, price))
                     elif isinstance(entry, dict):
-                        timestamp_str = str(entry.get("datetime") or entry.get("timestamp") or "")
+                        timestamp_str = str(
+                            entry.get("datetime") or entry.get("timestamp") or ""
+                        )
                         price = float(
                             entry.get("price")
                             or entry.get("close")
@@ -905,13 +996,13 @@ class MarketDataService:
                             price_points.append((timestamp_str, price))
                 except (ValueError, TypeError, KeyError, IndexError):
                     continue
-            
+
             if len(price_points) < 3:
                 return False
-            
+
             # Sort by timestamp in ascending order (oldest to newest)
             est_tz = pytz.timezone("America/New_York")
-            
+
             def parse_timestamp(ts_str: str) -> datetime:
                 """Parse timestamp string, handling various formats"""
                 ts_str = str(ts_str).strip()
@@ -919,7 +1010,11 @@ class MarketDataService:
                     if "T" in ts_str or "+" in ts_str or ts_str.endswith("Z"):
                         dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                     else:
-                        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"]:
+                        for fmt in [
+                            "%Y-%m-%d %H:%M:%S",
+                            "%Y-%m-%d %H:%M:%S.%f",
+                            "%Y-%m-%d",
+                        ]:
                             try:
                                 dt = datetime.strptime(ts_str, fmt)
                                 break
@@ -927,60 +1022,59 @@ class MarketDataService:
                                 continue
                         else:
                             dt = datetime.fromisoformat(ts_str)
-                    
+
                     if dt.tzinfo is None:
                         dt = est_tz.localize(dt)
                     else:
                         dt = dt.astimezone(est_tz)
-                    
+
                     return dt
                 except Exception:
                     return datetime.now(est_tz)
-            
+
             try:
                 price_points_sorted = sorted(
-                    price_points,
-                    key=lambda x: parse_timestamp(x[0])
+                    price_points, key=lambda x: parse_timestamp(x[0])
                 )
             except Exception:
                 price_points_sorted = price_points
-            
+
             # Extract prices in chronological order
             prices = [float(price) for _, price in price_points_sorted]
-            
+
             if len(prices) < 3:
                 return False
-            
+
             # Analyze trend: compare early vs recent prices
             n = len(prices)
             early_count = max(1, n // 3)
             recent_count = max(1, n // 3)
-            
+
             early_prices = prices[:early_count]
             recent_prices = prices[-recent_count:]
-            
+
             early_avg = sum(early_prices) / len(early_prices)
             recent_avg = sum(recent_prices) / len(recent_prices)
-            
+
             # Check if recent average is lower than early average
             if recent_avg >= early_avg:
                 return False
-            
+
             # Calculate percentage change
             change_pct = ((recent_avg - early_avg) / early_avg) * 100
-            
+
             # Also check recent momentum (last few points)
             if len(recent_prices) >= 2:
                 recent_momentum = sum(
                     (recent_prices[i] - recent_prices[i - 1])
                     for i in range(1, len(recent_prices))
                 ) / max(1, len(recent_prices) - 1)
-                
+
                 # Both overall trend and recent momentum should be negative
                 return change_pct < -0.1 and recent_momentum < 0
-            
+
             return change_pct < -0.1
-            
+
         except Exception as e:
             logger.debug(f"Error checking downward price trend: {str(e)}")
             return False
@@ -993,7 +1087,9 @@ class MarketDataService:
         # First, verify trend using actual price data from datetime_price (if available)
         price_trend_confirmed = False
         if indicators.datetime_price and len(indicators.datetime_price) >= 3:
-            price_trend_confirmed = cls._check_price_trend_upward(indicators.datetime_price)
+            price_trend_confirmed = cls._check_price_trend_upward(
+                indicators.datetime_price
+            )
             if price_trend_confirmed:
                 trend_confirmations += 1
             # If price data shows downward trend, reject immediately
@@ -1037,7 +1133,9 @@ class MarketDataService:
         # First, verify trend using actual price data from datetime_price (if available)
         price_trend_confirmed = False
         if indicators.datetime_price and len(indicators.datetime_price) >= 3:
-            price_trend_confirmed = cls._check_price_trend_downward(indicators.datetime_price)
+            price_trend_confirmed = cls._check_price_trend_downward(
+                indicators.datetime_price
+            )
             if price_trend_confirmed:
                 trend_confirmations += 1
             # If price data shows upward trend, reject immediately
