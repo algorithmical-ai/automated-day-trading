@@ -63,6 +63,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 ticker=ticker,
                 action="buy_to_open",
                 market_data=market_data,
+                indicator=cls.indicator_name(),
             )
 
             # Evaluate for short entry (sell_to_open)
@@ -70,6 +71,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 ticker=ticker,
                 action="sell_to_open",
                 market_data=market_data,
+                indicator=cls.indicator_name(),
             )
 
             long_enter = long_result.get("enter", False)

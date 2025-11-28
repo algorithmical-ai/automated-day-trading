@@ -129,10 +129,16 @@ class MomentumIndicator(BaseTradingIndicator):
         # Also consider Bollinger Band width as volatility indicator
         bollinger = technical_analysis.get("bollinger", {})
         if isinstance(bollinger, dict):
-            upper = bollinger.get("upper", 0.0)
-            lower = bollinger.get("lower", 0.0)
-            middle = bollinger.get("middle", current_price)
-            if middle > 0:
+            upper = bollinger.get("upper", 0.0) or 0.0
+            lower = bollinger.get("lower", 0.0) or 0.0
+            middle = bollinger.get("middle", current_price) or current_price
+            # Ensure all values are numbers and middle > 0 before using them
+            if (
+                isinstance(upper, (int, float))
+                and isinstance(lower, (int, float))
+                and isinstance(middle, (int, float))
+                and middle > 0
+            ):
                 bb_width_percent = ((upper - lower) / middle) * 100
                 # Use the higher of ATR% or BB width% as volatility measure
                 volatility_score = max(atr_percent, bb_width_percent * 0.5)

@@ -3,9 +3,10 @@ Market Data Service
 Provides entry and exit analysis for trading signals
 """
 
+import asyncio
 import math
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Tuple, Optional
 
 import aiohttp
@@ -39,17 +40,71 @@ class MarketDataService:
     _low_volume_threshold_avg = 0.6
     _low_volume_threshold_single = 0.45
 
+    # Rate limiting for Alpaca API shortability checks
+    _shortability_cache: Dict[str, Tuple[bool, str, datetime]] = {}
+    _shortability_cache_ttl_seconds = 300  # 5 minutes cache
+    _last_shortability_check_time: Optional[datetime] = None
+    _min_seconds_between_checks = 0.1  # 100ms between API calls to respect rate limits
+
+    # Local in-memory cache for is_shortable (ticker -> is_shortable)
+    _is_shortable_local_cache: Dict[str, bool] = {}
+
     @classmethod
-    async def _check_ticker_shortable(cls, ticker: str) -> Tuple[bool, str]:
+    async def _check_ticker_shortable(
+        cls, ticker: str, indicator: Optional[str] = None
+    ) -> Tuple[bool, str]:
         """
-        Check if a ticker is shortable using Alpaca Assets API.
+        Check if a ticker is shortable.
+        Checks in order: local cache -> DynamoDB -> Alpaca API.
+        Includes rate limiting, caching, and retry logic for 429 errors.
 
         Args:
             ticker: Stock ticker symbol
+            indicator: Optional indicator name for DynamoDB lookup
 
         Returns:
             Tuple of (is_shortable: bool, reason: str)
         """
+        # Check local in-memory cache first (fastest)
+        if ticker in cls._is_shortable_local_cache:
+            is_shortable = cls._is_shortable_local_cache[ticker]
+            logger.debug(f"Using local cache for {ticker} shortability: {is_shortable}")
+            return (
+                is_shortable,
+                f"{ticker} is {'shortable' if is_shortable else 'not shortable'} (from local cache)",
+            )
+
+        # Check DynamoDB cache (if indicator provided)
+        if indicator:
+            from app.src.db.dynamodb_client import DynamoDBClient
+
+            db_shortable = await DynamoDBClient.get_ticker_shortability_from_db(
+                ticker, indicator
+            )
+            if db_shortable is not None:
+                # Store in local cache for future use
+                cls._is_shortable_local_cache[ticker] = db_shortable
+                logger.debug(
+                    f"Using DynamoDB cache for {ticker} shortability: {db_shortable}"
+                )
+                return (
+                    db_shortable,
+                    f"{ticker} is {'shortable' if db_shortable else 'not shortable'} (from DynamoDB)",
+                )
+
+        # Check API cache (with TTL)
+        now = datetime.now(timezone.utc)
+        if ticker in cls._shortability_cache:
+            cached_result, cached_reason, cached_time = cls._shortability_cache[ticker]
+            age_seconds = (now - cached_time).total_seconds()
+            if age_seconds < cls._shortability_cache_ttl_seconds:
+                # Also store in local cache
+                cls._is_shortable_local_cache[ticker] = cached_result
+                logger.debug(
+                    f"Using API cache for {ticker} shortability: {cached_result}"
+                )
+                return cached_result, cached_reason
+
         api_key = os.environ.get("REAL_TRADE_API_KEY", "")
         api_secret = os.environ.get("REAL_TRADE_SECRET_KEY", "")
 
@@ -57,7 +112,16 @@ class MarketDataService:
             logger.warning(
                 f"No Alpaca API credentials available, assuming {ticker} is shortable"
             )
-            return True, "No API credentials, assuming shortable"
+            result = (True, "No API credentials, assuming shortable")
+            cls._shortability_cache[ticker] = (*result, now)
+            cls._is_shortable_local_cache[ticker] = True
+            return result
+
+        # Rate limiting: ensure minimum time between API calls
+        if cls._last_shortability_check_time:
+            time_since_last = (now - cls._last_shortability_check_time).total_seconds()
+            if time_since_last < cls._min_seconds_between_checks:
+                await asyncio.sleep(cls._min_seconds_between_checks - time_since_last)
 
         url = f"https://api.alpaca.markets/v2/assets/{ticker}"
         headers = {
@@ -66,49 +130,157 @@ class MarketDataService:
             "APCA-API-SECRET-KEY": api_secret,
         }
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        shortable = data.get("shortable", False)
-                        easy_to_borrow = data.get("easy_to_borrow", False)
-                        tradable = data.get("tradable", False)
+        # Retry logic for 429 errors with exponential backoff
+        max_retries = 3
+        base_delay = 1.0  # Start with 1 second delay
 
-                        if not tradable:
-                            return False, f"{ticker} is not tradable"
-                        if not shortable:
-                            return False, f"{ticker} is not shortable"
-                        if not easy_to_borrow:
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                    ) as response:
+                        cls._last_shortability_check_time = datetime.now(timezone.utc)
+
+                        if response.status == 200:
+                            data = await response.json()
+                            shortable = data.get("shortable", False)
+                            easy_to_borrow = data.get("easy_to_borrow", False)
+                            tradable = data.get("tradable", False)
+
+                            if not tradable:
+                                result = (False, f"{ticker} is not tradable")
+                                cls._shortability_cache[ticker] = (*result, now)
+                                cls._is_shortable_local_cache[ticker] = False
+                                # Store in DynamoDB if indicator provided
+                                if indicator:
+                                    from app.src.db.dynamodb_client import (
+                                        DynamoDBClient,
+                                    )
+
+                                    await DynamoDBClient.log_inactive_ticker_reason(
+                                        ticker=ticker,
+                                        indicator=indicator,
+                                        is_shortable=False,
+                                    )
+                                return result
+                            if not shortable:
+                                result = (False, f"{ticker} is not shortable")
+                                cls._shortability_cache[ticker] = (*result, now)
+                                cls._is_shortable_local_cache[ticker] = False
+                                # Store in DynamoDB if indicator provided
+                                if indicator:
+                                    from app.src.db.dynamodb_client import (
+                                        DynamoDBClient,
+                                    )
+
+                                    await DynamoDBClient.log_inactive_ticker_reason(
+                                        ticker=ticker,
+                                        indicator=indicator,
+                                        is_shortable=False,
+                                    )
+                                return result
+                            if not easy_to_borrow:
+                                logger.warning(
+                                    f"{ticker} is shortable but not easy to borrow"
+                                )
+                                # Still allow it, but log a warning
+
+                            result = (True, f"{ticker} is shortable")
+                            cls._shortability_cache[ticker] = (*result, now)
+                            cls._is_shortable_local_cache[ticker] = True
+                            # Store in DynamoDB if indicator provided
+                            if indicator:
+                                from app.src.db.dynamodb_client import DynamoDBClient
+
+                                await DynamoDBClient.log_inactive_ticker_reason(
+                                    ticker=ticker,
+                                    indicator=indicator,
+                                    is_shortable=True,
+                                )
+                            return result
+                        elif response.status == 404:
+                            result = (False, f"{ticker} not found in Alpaca assets")
+                            cls._shortability_cache[ticker] = (*result, now)
+                            cls._is_shortable_local_cache[ticker] = False
+                            # Store in DynamoDB if indicator provided
+                            if indicator:
+                                from app.src.db.dynamodb_client import DynamoDBClient
+
+                                await DynamoDBClient.log_inactive_ticker_reason(
+                                    ticker=ticker,
+                                    indicator=indicator,
+                                    is_shortable=False,
+                                )
+                            return result
+                        elif response.status == 429:
+                            # Rate limited - retry with exponential backoff
+                            if attempt < max_retries - 1:
+                                delay = base_delay * (2**attempt)  # Exponential backoff
+                                logger.warning(
+                                    f"Rate limited (429) for {ticker}, retrying in {delay:.1f}s "
+                                    f"(attempt {attempt + 1}/{max_retries})"
+                                )
+                                await asyncio.sleep(delay)
+                                continue
+                            else:
+                                logger.warning(
+                                    f"Rate limited (429) for {ticker} after {max_retries} attempts, assuming shortable"
+                                )
+                                # Fail open after max retries
+                                result = (
+                                    True,
+                                    f"Rate limited after {max_retries} attempts, assuming shortable",
+                                )
+                                cls._shortability_cache[ticker] = (*result, now)
+                                cls._is_shortable_local_cache[ticker] = True
+                                return result
+                        else:
                             logger.warning(
-                                f"{ticker} is shortable but not easy to borrow"
+                                f"Alpaca API returned status {response.status} for {ticker} asset check"
                             )
-                            # Still allow it, but log a warning
+                            # Assume shortable if API call fails (fail open)
+                            result = (
+                                True,
+                                f"API error (status {response.status}), assuming shortable",
+                            )
+                            cls._shortability_cache[ticker] = (*result, now)
+                            cls._is_shortable_local_cache[ticker] = True
+                            return result
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2**attempt)
+                    logger.warning(
+                        f"Error checking if {ticker} is shortable (attempt {attempt + 1}/{max_retries}): {str(e)}, retrying in {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    logger.warning(
+                        f"Error checking if {ticker} is shortable after {max_retries} attempts: {str(e)}, assuming shortable"
+                    )
+                    # Fail open - assume shortable if check fails
+                    result = (
+                        True,
+                        f"Error checking shortability after {max_retries} attempts: {str(e)}, assuming shortable",
+                    )
+                    cls._shortability_cache[ticker] = (*result, now)
+                    cls._is_shortable_local_cache[ticker] = True
+                    return result
 
-                        return True, f"{ticker} is shortable"
-                    elif response.status == 404:
-                        return False, f"{ticker} not found in Alpaca assets"
-                    else:
-                        logger.warning(
-                            f"Alpaca API returned status {response.status} for {ticker} asset check"
-                        )
-                        # Assume shortable if API call fails (fail open)
-                        return (
-                            True,
-                            f"API error (status {response.status}), assuming shortable",
-                        )
-        except Exception as e:
-            logger.warning(
-                f"Error checking if {ticker} is shortable: {str(e)}, assuming shortable"
-            )
-            # Fail open - assume shortable if check fails
-            return True, f"Error checking shortability: {str(e)}, assuming shortable"
+        # Should not reach here, but fail open just in case
+        result = (True, "Max retries exceeded, assuming shortable")
+        cls._shortability_cache[ticker] = (*result, now)
+        cls._is_shortable_local_cache[ticker] = True
+        return result
 
     @classmethod
     async def enter_trade(
-        cls, ticker: str, action: str, market_data: Optional[Dict[str, Any]] = None
+        cls,
+        ticker: str,
+        action: str,
+        market_data: Optional[Dict[str, Any]] = None,
+        indicator: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Analyze a ticker for entry signal (buy-to-open or sell-to-open).
@@ -116,6 +288,8 @@ class MarketDataService:
         Args:
             ticker: Stock ticker symbol
             action: "buy_to_open" (for long) or "sell_to_open" (for short)
+            market_data: Optional pre-fetched market data
+            indicator: Optional indicator name for DynamoDB shortability lookup
 
         Returns:
             Dict containing entry signal details or analysis
@@ -125,7 +299,9 @@ class MarketDataService:
 
         # Check if ticker is shortable for sell_to_open actions
         if action == "sell_to_open":
-            is_shortable, shortable_reason = await cls._check_ticker_shortable(ticker)
+            is_shortable, shortable_reason = await cls._check_ticker_shortable(
+                ticker, indicator=indicator
+            )
             if not is_shortable:
                 return {
                     "ticker": ticker,

@@ -952,6 +952,7 @@ class DynamoDBClient:
         reason_not_to_enter_long: Optional[str] = None,
         reason_not_to_enter_short: Optional[str] = None,
         technical_indicators: Optional[Dict[str, Any]] = None,
+        is_shortable: Optional[bool] = None,
     ) -> bool:
         """
         Log why a ticker is not entering a trade in InactiveTickersForDayTrading table
@@ -993,6 +994,9 @@ class DynamoDBClient:
                 }
                 item["technical_indicators"] = tech_indicators_clean
             
+            if is_shortable is not None:
+                item["is_shortable"] = is_shortable
+            
             item = cls._ensure_all_floats_converted(item)
             
             cls._inactive_tickers_for_day_trading_table.put_item(Item=item)
@@ -1006,6 +1010,37 @@ class DynamoDBClient:
                 f"Error logging inactive ticker reason for {ticker} ({indicator}): {str(e)}"
             )
             return False
+
+    @classmethod
+    async def get_ticker_shortability_from_db(
+        cls, ticker: str, indicator: str
+    ) -> Optional[bool]:
+        """
+        Get is_shortable value from InactiveTickersForDayTrading table.
+        
+        Args:
+            ticker: Ticker symbol
+            indicator: Indicator name
+            
+        Returns:
+            is_shortable value if found, None otherwise
+        """
+        try:
+            cls._ensure_tables()
+            response = cls._inactive_tickers_for_day_trading_table.get_item(
+                Key={"ticker": ticker, "indicator": indicator}
+            )
+            item = response.get("Item")
+            if item:
+                is_shortable = item.get("is_shortable")
+                if is_shortable is not None:
+                    return bool(is_shortable)
+            return None
+        except Exception as e:
+            logger.debug(
+                f"Error getting is_shortable from DB for {ticker} ({indicator}): {str(e)}"
+            )
+            return None
 
     @classmethod
     async def get_inactive_tickers_for_indicator(
