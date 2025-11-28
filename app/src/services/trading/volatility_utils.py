@@ -119,8 +119,13 @@ class VolatilityUtils:
             # Penny stocks: wider stop loss (-3.5% to -8%)
             dynamic_stop = max(-8.0, min(-3.5, dynamic_stop))
         elif enter_price < cls.LOW_PRICE_THRESHOLD:
-            # Low-price stocks: moderate stop loss (-3% to -6%)
-            dynamic_stop = max(-6.0, min(-3.0, dynamic_stop))
+            # Low-price stocks: moderate stop loss (-3.5% to -6%)
+            # For stocks just above $3, treat them more conservatively
+            # If price is between $3.0-$3.5, use wider minimum (-4.0%)
+            if enter_price < 3.5:
+                dynamic_stop = max(-6.0, min(-4.0, dynamic_stop))
+            else:
+                dynamic_stop = max(-6.0, min(-3.5, dynamic_stop))
         else:
             # Normal stocks: standard stop loss (-2% to -4%)
             dynamic_stop = max(-4.0, min(-2.0, dynamic_stop))
