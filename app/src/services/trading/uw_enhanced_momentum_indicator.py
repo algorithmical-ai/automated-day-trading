@@ -45,8 +45,8 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     stop_loss_threshold: float = -2.5
     trailing_stop_percent: float = 2.5
     min_adx_threshold: float = 20.0
-    rsi_oversold_for_long: float = 35.0
-    rsi_overbought_for_short: float = 65.0
+    rsi_oversold_for_long: float = 40.0  # Increased from 35.0 - require more oversold for longs
+    rsi_overbought_for_short: float = 70.0  # Increased from 65.0 - require truly overbought for shorts
     profit_target_strong_momentum: float = 5.0
     min_holding_period_seconds: int = 60
 
@@ -354,6 +354,22 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
         if is_short and rsi <= cls.rsi_overbought_for_short:
             return False, f"RSI too low for short: {rsi:.2f} <= {cls.rsi_overbought_for_short}"
+
+        # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
+        if is_short:
+            stoch = technical_analysis.get("stoch", {})
+            stoch_k = stoch.get("k", 50.0) if isinstance(stoch, dict) else 50.0
+            stoch_d = stoch.get("d", 50.0) if isinstance(stoch, dict) else 50.0
+            
+            # Don't short if stochastic is still bullish (K > D and K > 60)
+            # OR if both K and D are extremely high (> 80), indicating strong upward momentum
+            # This prevents shorting when stock is extremely overbought but still rising
+            if (stoch_k > stoch_d and stoch_k > 60) or (stoch_k > 80 and stoch_d > 80):
+                return (
+                    False,
+                    f"Stochastic still bullish for short: K={stoch_k:.2f}, D={stoch_d:.2f} "
+                    f"(upward momentum present or extremely overbought)"
+                )
 
         # Check for mean reversion risk
         bollinger = technical_analysis.get("bollinger", {})
@@ -870,6 +886,19 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if not is_shortable:
                 logger.debug(f"Skipping short entry for {ticker}: {shortable_reason}")
                 continue
+
+            # Re-check stock quality filters before entry (even for golden tickers)
+            # This ensures RSI/stochastic filters are enforced at entry time
+            if market_data_response:
+                passes_filter, filter_reason = await cls._passes_stock_quality_filters(
+                    ticker, market_data_response, momentum_score
+                )
+                if not passes_filter:
+                    logger.info(
+                        f"Skipping {ticker} short entry: {filter_reason} "
+                        f"{'(was golden but failed filters at entry)' if is_golden else ''}"
+                    )
+                    continue
 
             action = "sell_to_open"
             quote_response = await MCPClient.get_quote(ticker)
