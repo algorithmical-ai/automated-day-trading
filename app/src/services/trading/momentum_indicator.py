@@ -8,6 +8,7 @@ import os
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, timezone, time
 import pytz
+import aiohttp
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
@@ -33,8 +34,12 @@ class MomentumIndicator(BaseTradingIndicator):
     stop_loss_threshold: float = -2.5  # Increased from -1.5% to give trades more room
     trailing_stop_percent: float = 2.5  # Increased from 1.5% to reduce premature exits
     min_adx_threshold: float = 20.0
-    rsi_oversold_for_long: float = 40.0  # Increased from 35.0 - require more oversold for longs
-    rsi_overbought_for_short: float = 70.0  # Increased from 65.0 - require truly overbought for shorts
+    rsi_oversold_for_long: float = (
+        40.0  # Increased from 35.0 - require more oversold for longs
+    )
+    rsi_overbought_for_short: float = (
+        70.0  # Increased from 65.0 - require truly overbought for shorts
+    )
     profit_target_strong_momentum: float = 5.0
     min_holding_period_seconds: int = (
         60  # Minimum 60 seconds before allowing exit (prevent instant exits)
@@ -71,8 +76,12 @@ class MomentumIndicator(BaseTradingIndicator):
     min_trailing_stop_cooldown_seconds: int = (
         120  # 2 minutes minimum cooldown for ALL stocks to prevent whipsaw exits
     )
-    force_close_before_market_close: bool = True  # Force close all positions before market close
-    minutes_before_close_to_exit: int = 15  # Exit positions 15 minutes before market close
+    force_close_before_market_close: bool = (
+        True  # Force close all positions before market close
+    )
+    minutes_before_close_to_exit: int = (
+        15  # Exit positions 15 minutes before market close
+    )
 
     # Dynamic stop loss configuration
     _alpaca_api_key = os.environ.get("REAL_TRADE_API_KEY", "")
@@ -91,21 +100,20 @@ class MomentumIndicator(BaseTradingIndicator):
         """
         if not cls.force_close_before_market_close:
             return False
-        
+
         est_tz = pytz.timezone("America/New_York")
         current_time_est = datetime.now(est_tz)
         market_close_time = time(16, 0)  # 4:00 PM ET
-        current_time_only = current_time_est.time()
         
         # Calculate minutes until market close
         close_datetime = datetime.combine(current_time_est.date(), market_close_time)
         close_datetime = est_tz.localize(close_datetime)
         current_datetime = current_time_est
-        
+
         if current_datetime >= close_datetime:
             # Already past market close
             return True
-        
+
         minutes_until_close = (close_datetime - current_datetime).total_seconds() / 60.0
         return minutes_until_close <= cls.minutes_before_close_to_exit
 
@@ -681,7 +689,7 @@ class MomentumIndicator(BaseTradingIndicator):
             stoch = technical_analysis.get("stoch", {})
             stoch_k = stoch.get("k", 50.0) if isinstance(stoch, dict) else 50.0
             stoch_d = stoch.get("d", 50.0) if isinstance(stoch, dict) else 50.0
-            
+
             # Don't short if stochastic is still bullish (K > D and K > 60)
             # This indicates upward momentum is still present
             if stoch_k > stoch_d and stoch_k > 60:
@@ -1295,6 +1303,20 @@ class MomentumIndicator(BaseTradingIndicator):
 
             action = "sell_to_open"
 
+            # Re-check stock quality filters before entry (even for golden tickers)
+            # This ensures RSI/stochastic filters are enforced at entry time
+            market_data_response = market_data_dict.get(ticker)
+            if market_data_response:
+                passes_filter, filter_reason = await cls._passes_stock_quality_filters(
+                    ticker, market_data_response, momentum_score
+                )
+                if not passes_filter:
+                    logger.info(
+                        f"Skipping {ticker} short entry: {filter_reason} "
+                        f"{'(was golden but failed filters at entry)' if is_golden else ''}"
+                    )
+                    continue
+
             quote_response = await MCPClient.get_quote(ticker)
             if not quote_response:
                 logger.warning(f"Failed to get quote for {ticker}, skipping")
@@ -1521,7 +1543,9 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"Exit signal for {ticker} - losing trade: {profit_percent:.2f}%"
                 )
 
-            elif peak_profit_percent > 0:
+            elif peak_profit_percent > 0 and profit_percent > 0:
+                # Trailing stop should only protect profits, not trigger on losses
+                # Only check trailing stop if current profit is still positive
                 # Check if trailing stop should be active (cooling-off period)
                 trailing_stop_active = True
                 if created_at:
@@ -1592,29 +1616,19 @@ class MomentumIndicator(BaseTradingIndicator):
                         else:
                             dynamic_trailing_stop = base_trailing_stop
 
-                    # Trailing stop should only protect profits, not trigger on losses
-                    # Only apply trailing stop if current profit is still positive
-                    if profit_percent > 0:
-                        drop_from_peak = peak_profit_percent - profit_percent
-                        if drop_from_peak >= dynamic_trailing_stop:
-                            should_exit = True
-                            exit_reason = (
-                                f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
-                                f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
-                                f"trailing stop: {dynamic_trailing_stop:.2f}%)"
-                            )
-                            logger.info(
-                                f"Exit signal for {ticker} - trailing stop: "
-                                f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%, "
-                                f"trailing stop: {dynamic_trailing_stop:.2f}%"
-                            )
-                    else:
-                        # Trade is already negative - trailing stop doesn't apply
-                        # The hard stop loss will handle it if it gets worse
-                        logger.debug(
-                            f"Trailing stop not applicable for {ticker}: "
-                            f"current profit {profit_percent:.2f}% is negative "
-                            f"(peak was {peak_profit_percent:.2f}%)"
+                    # Trailing stop should only protect profits (already checked at elif level)
+                    drop_from_peak = peak_profit_percent - profit_percent
+                    if drop_from_peak >= dynamic_trailing_stop:
+                        should_exit = True
+                        exit_reason = (
+                            f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
+                            f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
+                            f"trailing stop: {dynamic_trailing_stop:.2f}%)"
+                        )
+                        logger.info(
+                            f"Exit signal for {ticker} - trailing stop: "
+                            f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%, "
+                            f"trailing stop: {dynamic_trailing_stop:.2f}%"
                         )
 
             if not should_exit:
