@@ -26,6 +26,7 @@ class BaseTradingIndicator(ABC):
     ticker_cooldown_minutes: int = 60
     entry_cycle_seconds: int = 5
     exit_cycle_seconds: int = 5
+    position_size_dollars: float = 2000.0  # Fixed position size in dollars
 
     # Daily tracking
     daily_trades_count: int = 0
@@ -115,22 +116,26 @@ class BaseTradingIndicator(ABC):
         current_time_est = datetime.now(est_tz)
         today = current_time_est.date().isoformat()
         market_open_time = time(9, 30)  # 9:30 AM EST
-        
+
         # Check if it's after 9:30 AM EST
         current_time_only = current_time_est.time()
         is_after_market_open = current_time_only >= market_open_time
-        
+
         # Check if we've already reset today
         already_reset_today = (
             cls.mab_reset_timestamp is not None
             and cls.mab_reset_timestamp.date().isoformat() == today
         )
-        
+
         # Only reset if:
         # 1. It's after 9:30 AM EST
         # 2. We haven't reset today yet
         # 3. The date has changed (safety check)
-        if is_after_market_open and not already_reset_today and cls.mab_reset_date != today:
+        if (
+            is_after_market_open
+            and not already_reset_today
+            and cls.mab_reset_date != today
+        ):
             logger.info(
                 f"Resetting daily MAB statistics for {cls.indicator_name()} "
                 f"(market open: {current_time_est.strftime('%Y-%m-%d %H:%M:%S %Z')})"
@@ -282,13 +287,35 @@ class BaseTradingIndicator(ABC):
                 enter_reason=exit_reason,
             )
 
-            # Calculate profit/loss
-            if original_action == "buy_to_open":
-                profit_or_loss = exit_price - enter_price
-            elif original_action == "sell_to_open":
-                profit_or_loss = enter_price - exit_price
-            else:
+            # Calculate profit/loss using $2000 position size
+            # Buy $2000 worth of shares at enter_price, sell all at exit_price
+            if enter_price <= 0:
+                logger.warning(
+                    f"Invalid enter_price ({enter_price}) for {ticker}, setting profit_or_loss to 0"
+                )
                 profit_or_loss = 0.0
+            else:
+                # Calculate number of shares bought with $2000
+                number_of_shares = cls.position_size_dollars / enter_price
+
+                if original_action == "buy_to_open":
+                    # Long trade: buy at enter_price, sell at exit_price
+                    # Profit = (exit_price - enter_price) * number_of_shares
+                    profit_or_loss = (exit_price - enter_price) * number_of_shares
+                elif original_action == "sell_to_open":
+                    # Short trade: sell at enter_price, buy back at exit_price
+                    # Profit = (enter_price - exit_price) * number_of_shares
+                    profit_or_loss = (enter_price - exit_price) * number_of_shares
+                else:
+                    profit_or_loss = 0.0
+
+                logger.debug(
+                    f"Profit/loss calculation for {ticker}: "
+                    f"position_size=${cls.position_size_dollars:.2f}, "
+                    f"shares={number_of_shares:.4f}, "
+                    f"enter=${enter_price:.4f}, exit=${exit_price:.4f}, "
+                    f"profit/loss=${profit_or_loss:.2f}"
+                )
 
             # Record MAB reward
             profit_percent = cls._calculate_profit_percent(
