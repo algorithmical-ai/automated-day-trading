@@ -45,8 +45,12 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     stop_loss_threshold: float = -2.5
     trailing_stop_percent: float = 2.5
     min_adx_threshold: float = 20.0
-    rsi_oversold_for_long: float = 40.0  # Increased from 35.0 - require more oversold for longs
-    rsi_overbought_for_short: float = 70.0  # Increased from 65.0 - require truly overbought for shorts
+    rsi_oversold_for_long: float = (
+        40.0  # Increased from 35.0 - require more oversold for longs
+    )
+    rsi_overbought_for_short: float = (
+        70.0  # Increased from 65.0 - require truly overbought for shorts
+    )
     profit_target_strong_momentum: float = 5.0
     min_holding_period_seconds: int = 60
 
@@ -230,10 +234,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
     @classmethod
     async def _validate_with_unusual_whales(
-        cls,
-        ticker: str,
-        intended_direction: str,
-        enter_price: float
+        cls, ticker: str, intended_direction: str, enter_price: float
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """Validate trade against Unusual Whales options flow data"""
         if not cls.use_unusual_whales:
@@ -257,10 +258,14 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 details["penny_stock_risk_score"] = risk_score
                 details["penny_stock_risk_details"] = risk_details
                 if risk_score >= 75:
-                    return False, (
-                        f"Penny stock risk too high: {risk_score:.0f}/100 "
-                        f"({risk_details.get('risk_factors', [])})"
-                    ), details
+                    return (
+                        False,
+                        (
+                            f"Penny stock risk too high: {risk_score:.0f}/100 "
+                            f"({risk_details.get('risk_factors', [])})"
+                        ),
+                        details,
+                    )
 
             if not should_trade and cls.uw_reject_on_strong_opposing_flow:
                 logger.info(
@@ -279,7 +284,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         ticker: str,
         market_data: Dict[str, Any],
         momentum_score: float,
-        enter_price: float
+        enter_price: float,
     ) -> Tuple[bool, str]:
         """Check volatility filter and mean reversion detection"""
         technical_analysis = market_data.get("technical_analysis", {})
@@ -321,7 +326,10 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         current_price = technical_analysis.get("close_price", 0.0)
 
         if current_price < cls.min_stock_price:
-            return False, f"Price too low: ${current_price:.2f} < ${cls.min_stock_price:.2f}"
+            return (
+                False,
+                f"Price too low: ${current_price:.2f} < ${cls.min_stock_price:.2f}",
+            )
 
         # Check volatility filter using VolatilityUtils
         atr = technical_analysis.get("atr", 0)
@@ -350,17 +358,23 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         is_short = momentum_score < 0
 
         if is_long and rsi >= cls.rsi_oversold_for_long:
-            return False, f"RSI too high for long: {rsi:.2f} >= {cls.rsi_oversold_for_long}"
+            return (
+                False,
+                f"RSI too high for long: {rsi:.2f} >= {cls.rsi_oversold_for_long}",
+            )
 
         if is_short and rsi <= cls.rsi_overbought_for_short:
-            return False, f"RSI too low for short: {rsi:.2f} <= {cls.rsi_overbought_for_short}"
+            return (
+                False,
+                f"RSI too low for short: {rsi:.2f} <= {cls.rsi_overbought_for_short}",
+            )
 
         # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
         if is_short:
             stoch = technical_analysis.get("stoch", {})
             stoch_k = stoch.get("k", 50.0) if isinstance(stoch, dict) else 50.0
             stoch_d = stoch.get("d", 50.0) if isinstance(stoch, dict) else 50.0
-            
+
             # Don't short if stochastic is still bullish (K > D and K > 60)
             # OR if both K and D are extremely high (> 80), indicating strong upward momentum
             # This prevents shorting when stock is extremely overbought but still rising
@@ -368,7 +382,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 return (
                     False,
                     f"Stochastic still bullish for short: K={stoch_k:.2f}, D={stoch_d:.2f} "
-                    f"(upward momentum present or extremely overbought)"
+                    f"(upward momentum present or extremely overbought)",
                 )
 
         # Check for mean reversion risk
@@ -570,7 +584,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             try:
                 await cls._run_entry_cycle()
             except Exception as e:
-                logger.exception(f"Error in UW-Enhanced Momentum entry service: {str(e)}")
+                logger.exception(
+                    f"Error in UW-Enhanced Momentum entry service: {str(e)}"
+                )
                 await asyncio.sleep(10)
 
     @classmethod
@@ -607,7 +623,8 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         logger.info(f"Current active trades: {active_count}/{cls.max_active_trades}")
 
         candidates_to_fetch = [
-            ticker for ticker in all_tickers
+            ticker
+            for ticker in all_tickers
             if ticker not in active_ticker_set
             and not cls._is_ticker_in_cooldown(ticker)
         ]
@@ -666,29 +683,43 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             )
             if not passes_filter:
                 stats["failed_quality_filters"] += 1
-                inactive_ticker_logs.append({
-                    "ticker": ticker,
-                    "indicator": cls.indicator_name(),
-                    "reason_not_to_enter_long": filter_reason if momentum_score > 0 else None,
-                    "reason_not_to_enter_short": filter_reason if momentum_score < 0 else None,
-                    "technical_indicators": technical_analysis,
-                })
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": (
+                            filter_reason if momentum_score > 0 else None
+                        ),
+                        "reason_not_to_enter_short": (
+                            filter_reason if momentum_score < 0 else None
+                        ),
+                        "technical_indicators": technical_analysis,
+                    }
+                )
                 continue
 
             # Volatility and mean reversion filters
-            passes_vol, vol_reason = await cls._passes_volatility_and_mean_reversion_filters(
-                ticker, market_data_response, momentum_score, current_price
+            passes_vol, vol_reason = (
+                await cls._passes_volatility_and_mean_reversion_filters(
+                    ticker, market_data_response, momentum_score, current_price
+                )
             )
             if not passes_vol:
                 stats["failed_volatility_filters"] += 1
                 logger.debug(f"Skipping {ticker}: {vol_reason}")
-                inactive_ticker_logs.append({
-                    "ticker": ticker,
-                    "indicator": cls.indicator_name(),
-                    "reason_not_to_enter_long": vol_reason if momentum_score > 0 else None,
-                    "reason_not_to_enter_short": vol_reason if momentum_score < 0 else None,
-                    "technical_indicators": technical_analysis,
-                })
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": (
+                            vol_reason if momentum_score > 0 else None
+                        ),
+                        "reason_not_to_enter_short": (
+                            vol_reason if momentum_score < 0 else None
+                        ),
+                        "technical_indicators": technical_analysis,
+                    }
+                )
                 continue
 
             # Unusual Whales validation
@@ -699,13 +730,19 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if not passes_uw:
                 stats["failed_uw_validation"] += 1
                 logger.info(f"UW rejected {ticker}: {uw_reason}")
-                inactive_ticker_logs.append({
-                    "ticker": ticker,
-                    "indicator": cls.indicator_name(),
-                    "reason_not_to_enter_long": uw_reason if momentum_score > 0 else None,
-                    "reason_not_to_enter_short": uw_reason if momentum_score < 0 else None,
-                    "technical_indicators": technical_analysis,
-                })
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": (
+                            uw_reason if momentum_score > 0 else None
+                        ),
+                        "reason_not_to_enter_short": (
+                            uw_reason if momentum_score < 0 else None
+                        ),
+                        "technical_indicators": technical_analysis,
+                    }
+                )
                 continue
 
             stats["passed"] += 1
@@ -719,15 +756,15 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
         # Batch write inactive ticker logs
         if inactive_ticker_logs:
+
             async def log_one(log_data):
                 await DynamoDBClient.log_inactive_ticker_reason(**log_data)
 
             batch_size = 20
             for i in range(0, len(inactive_ticker_logs), batch_size):
-                batch = inactive_ticker_logs[i:i + batch_size]
+                batch = inactive_ticker_logs[i : i + batch_size]
                 await asyncio.gather(
-                    *[log_one(log_data) for log_data in batch],
-                    return_exceptions=True
+                    *[log_one(log_data) for log_data in batch], return_exceptions=True
                 )
 
         logger.info(
@@ -777,14 +814,18 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 if not is_golden:
                     logger.info(f"Daily limit reached, skipping {ticker} (not golden)")
                     break
-                logger.info(f"Daily limit reached, but {ticker} is GOLDEN - allowing entry")
+                logger.info(
+                    f"Daily limit reached, but {ticker} is GOLDEN - allowing entry"
+                )
 
             active_trades = await cls._get_active_trades()
             active_count = len(active_trades)
 
             if active_count >= cls.max_active_trades:
                 if abs(momentum_score) >= cls.exceptional_momentum_threshold:
-                    preempted = await cls._preempt_low_profit_trade(ticker, momentum_score)
+                    preempted = await cls._preempt_low_profit_trade(
+                        ticker, momentum_score
+                    )
                     if not preempted:
                         continue
                 else:
@@ -811,13 +852,19 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 ticker, enter_price, technical_analysis
             )
             if atr > 0:
-                dynamic_stop_loss = VolatilityUtils.calculate_volatility_adjusted_stop_loss(
-                    enter_price, atr, cls.stop_loss_threshold
+                dynamic_stop_loss = (
+                    VolatilityUtils.calculate_volatility_adjusted_stop_loss(
+                        enter_price, atr, cls.stop_loss_threshold
+                    )
                 )
 
-            position_multiplier = VolatilityUtils.calculate_position_size_multiplier(enter_price, atr)
-            volatility_trailing_stop = VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
-                enter_price, enter_price, atr, cls.trailing_stop_percent
+            position_multiplier = VolatilityUtils.calculate_position_size_multiplier(
+                enter_price, atr
+            )
+            volatility_trailing_stop = (
+                VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
+                    enter_price, enter_price, atr, cls.trailing_stop_percent
+                )
             )
 
             golden_prefix = "🟡 GOLDEN: " if is_golden else ""
@@ -864,14 +911,18 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 is_golden = cls._is_golden_ticker(momentum_score, market_data_response)
                 if not is_golden:
                     break
-                logger.info(f"Daily limit reached, but {ticker} is GOLDEN - allowing entry")
+                logger.info(
+                    f"Daily limit reached, but {ticker} is GOLDEN - allowing entry"
+                )
 
             active_trades = await cls._get_active_trades()
             active_count = len(active_trades)
 
             if active_count >= cls.max_active_trades:
                 if abs(momentum_score) >= cls.exceptional_momentum_threshold:
-                    preempted = await cls._preempt_low_profit_trade(ticker, abs(momentum_score))
+                    preempted = await cls._preempt_low_profit_trade(
+                        ticker, abs(momentum_score)
+                    )
                     if not preempted:
                         continue
                 else:
@@ -920,13 +971,19 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 ticker, enter_price, technical_analysis
             )
             if atr > 0:
-                dynamic_stop_loss = VolatilityUtils.calculate_volatility_adjusted_stop_loss(
-                    enter_price, atr, cls.stop_loss_threshold
+                dynamic_stop_loss = (
+                    VolatilityUtils.calculate_volatility_adjusted_stop_loss(
+                        enter_price, atr, cls.stop_loss_threshold
+                    )
                 )
 
-            position_multiplier = VolatilityUtils.calculate_position_size_multiplier(enter_price, atr)
-            volatility_trailing_stop = VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
-                enter_price, enter_price, atr, cls.trailing_stop_percent
+            position_multiplier = VolatilityUtils.calculate_position_size_multiplier(
+                enter_price, atr
+            )
+            volatility_trailing_stop = (
+                VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
+                    enter_price, enter_price, atr, cls.trailing_stop_percent
+                )
             )
 
             golden_prefix = "🟡 GOLDEN: " if is_golden else ""
@@ -970,7 +1027,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             try:
                 await cls._run_exit_cycle()
             except Exception as e:
-                logger.exception(f"Error in UW-Enhanced Momentum exit service: {str(e)}")
+                logger.exception(
+                    f"Error in UW-Enhanced Momentum exit service: {str(e)}"
+                )
                 await asyncio.sleep(5)
 
     @classmethod
@@ -986,7 +1045,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             await asyncio.sleep(cls.exit_cycle_seconds)
             return
 
-        logger.info(f"Monitoring {len(active_trades)}/{cls.max_active_trades} active trades")
+        logger.info(
+            f"Monitoring {len(active_trades)}/{cls.max_active_trades} active trades"
+        )
 
         for trade in active_trades:
             if not cls.running:
@@ -1000,7 +1061,8 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             created_at = trade.get("created_at")
             dynamic_stop_loss = trade.get("dynamic_stop_loss")
             stop_loss_threshold = (
-                float(dynamic_stop_loss) if dynamic_stop_loss is not None
+                float(dynamic_stop_loss)
+                if dynamic_stop_loss is not None
                 else cls.stop_loss_threshold
             )
 
@@ -1036,12 +1098,16 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             # Check if trailing stop should apply (cooling period)
             # Trailing stop should only protect profits, not trigger on losses
             if not should_exit and peak_profit_percent > 0 and profit_percent > 0:
-                should_apply_trailing, cooling_reason = VolatilityUtils.should_apply_trailing_stop(
-                    enter_price, created_at, profit_percent
+                should_apply_trailing, cooling_reason = (
+                    VolatilityUtils.should_apply_trailing_stop(
+                        enter_price, created_at, profit_percent
+                    )
                 )
                 if should_apply_trailing:
-                    volatility_trailing_stop = VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
-                        enter_price, current_price, atr, cls.trailing_stop_percent
+                    volatility_trailing_stop = (
+                        VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
+                            enter_price, current_price, atr, cls.trailing_stop_percent
+                        )
                     )
                     drop_from_peak = peak_profit_percent - profit_percent
                     if drop_from_peak >= volatility_trailing_stop:
@@ -1071,8 +1137,10 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if not should_exit:
                 if profit_percent > peak_profit_percent:
                     peak_profit_percent = profit_percent
-                    trailing_stop = VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
-                        enter_price, current_price, atr, cls.trailing_stop_percent
+                    trailing_stop = (
+                        VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
+                            enter_price, current_price, atr, cls.trailing_stop_percent
+                        )
                     )
 
                 skipped_reason = (
@@ -1100,7 +1168,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     exit_event_type = "exit_short"
                     exit_action = "buy_to_close"
 
-                technical_indicators_for_enter = trade.get("technical_indicators_for_enter")
+                technical_indicators_for_enter = trade.get(
+                    "technical_indicators_for_enter"
+                )
                 technical_indicators_for_exit = {
                     k: v for k, v in technical_analysis.items() if k != "datetime_price"
                 }
@@ -1126,4 +1196,3 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 )
 
         await asyncio.sleep(cls.exit_cycle_seconds)
-
