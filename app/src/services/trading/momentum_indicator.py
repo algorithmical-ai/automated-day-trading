@@ -26,21 +26,32 @@ class MomentumIndicator(BaseTradingIndicator):
     profit_threshold: float = 1.5
     top_k: int = 2
     exceptional_momentum_threshold: float = 5.0
-    min_momentum_threshold: float = 3.0
+    min_momentum_threshold: float = 0.2  # Raised from 3.0% to 0.2% for stronger signals
     max_momentum_threshold: float = (
         50.0  # Avoid entering on extreme momentum (likely at peak)
     )
     min_daily_volume: int = 1000
-    stop_loss_threshold: float = -2.5  # Increased from -1.5% to give trades more room
-    trailing_stop_percent: float = 2.5  # Increased from 1.5% to reduce premature exits
+    min_volume_ratio: float = 1.5  # Volume must be >1.5x SMA for entry
+    stop_loss_threshold: float = (
+        -2.5
+    )  # Default, will be overridden by ATR-based calculation
+    trailing_stop_percent: float = (
+        2.5  # Base trailing stop, will be adjusted for shorts
+    )
+    trailing_stop_short_multiplier: float = 1.5  # Wider trailing stop for shorts (3-4%)
     min_adx_threshold: float = 20.0
     rsi_oversold_for_long: float = (
         40.0  # Increased from 35.0 - require more oversold for longs
     )
     rsi_overbought_for_short: float = (
-        70.0  # Increased from 65.0 - require truly overbought for shorts
+        60.0  # Lowered from 70.0 to 60.0 per judge recommendation
     )
     profit_target_strong_momentum: float = 5.0
+    profit_target_multiplier: float = 2.0  # Profit target = 2x stop distance
+    trailing_stop_activation_profit: float = (
+        1.0  # Activate trailing stop after +1% profit
+    )
+    max_entry_hour_et: int = 15  # No entries after 3:00 PM ET (15:00)
     min_holding_period_seconds: int = (
         60  # Minimum 60 seconds before allowing exit (prevent instant exits)
     )
@@ -116,6 +127,17 @@ class MomentumIndicator(BaseTradingIndicator):
 
         minutes_until_close = (close_datetime - current_datetime).total_seconds() / 60.0
         return minutes_until_close <= cls.minutes_before_close_to_exit
+
+    @classmethod
+    def _is_after_entry_cutoff(cls) -> bool:
+        """
+        Check if current time is after the entry cutoff time (15:00 ET).
+        No new entries allowed after this time to avoid late-day volatility.
+        """
+        est_tz = pytz.timezone("America/New_York")
+        current_time_est = datetime.now(est_tz)
+        current_hour = current_time_est.hour
+        return current_hour >= cls.max_entry_hour_et
 
     @classmethod
     def _calculate_atr_percent(cls, atr: float, current_price: float) -> float:
@@ -236,14 +258,18 @@ class MomentumIndicator(BaseTradingIndicator):
         ticker: str,
         enter_price: float,
         technical_analysis: Optional[Dict[str, Any]] = None,
+        action: Optional[str] = None,
     ) -> float:
         """
-        Calculate dynamic stop loss based on ATR and intraday volatility.
+        Calculate dynamic stop loss based on 2x ATR as recommended by judge.
+        Long: enter_price - 2*ATR
+        Short: enter_price + 2*ATR
 
         Args:
             ticker: Stock ticker symbol
             enter_price: Entry price for the trade
             technical_analysis: Technical indicators including ATR
+            action: Trade action ('buy_to_open' or 'sell_to_open') to determine direction
 
         Returns:
             Dynamic stop loss percentage (negative value, e.g., -3.5 for -3.5%)
@@ -251,39 +277,32 @@ class MomentumIndicator(BaseTradingIndicator):
         # Default stop loss if we can't calculate dynamic one
         default_stop_loss = cls.stop_loss_threshold
 
-        # Use ATR if available (preferred method)
+        # Use ATR if available (preferred method) - use 2x ATR as recommended
         if technical_analysis:
             atr = technical_analysis.get("atr", 0.0)
             if atr > 0 and enter_price > 0:
                 atr_percent = cls._calculate_atr_percent(atr, enter_price)
 
-                # For low-priced stocks, use wider stop loss based on ATR
+                # Use 2x ATR for stop loss as recommended by judge
+                stop_loss_atr_multiple = 2.0
+                dynamic_stop_loss = -(atr_percent * stop_loss_atr_multiple)
+
+                # Cap at reasonable levels to prevent excessive risk
+                # For low-priced stocks, allow wider stops
                 is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
-
                 if is_low_price:
-                    # Use 2x ATR for penny stocks, but cap at reasonable levels
-                    stop_loss_atr_multiple = 2.0
-                    dynamic_stop_loss = -(atr_percent * stop_loss_atr_multiple)
-                    # Cap between -3.5% and -7.0% for penny stocks
-                    dynamic_stop_loss = max(-7.0, min(-3.5, dynamic_stop_loss))
-
-                    logger.info(
-                        f"ATR-based stop loss for {ticker}: {dynamic_stop_loss:.2f}% "
-                        f"(ATR: {atr_percent:.2f}%, enter_price: ${enter_price:.2f})"
-                    )
-                    return dynamic_stop_loss
+                    # Cap between -4.0% and -8.0% for penny stocks
+                    dynamic_stop_loss = max(-8.0, min(-4.0, dynamic_stop_loss))
                 else:
-                    # For higher-priced stocks, use 1.5x ATR
-                    stop_loss_atr_multiple = 1.5
-                    dynamic_stop_loss = -(atr_percent * stop_loss_atr_multiple)
-                    # Cap between -2.5% and -5.0% for regular stocks
-                    dynamic_stop_loss = max(-5.0, min(-2.5, dynamic_stop_loss))
+                    # Cap between -2.5% and -6.0% for regular stocks
+                    dynamic_stop_loss = max(-6.0, min(-2.5, dynamic_stop_loss))
 
-                    logger.info(
-                        f"ATR-based stop loss for {ticker}: {dynamic_stop_loss:.2f}% "
-                        f"(ATR: {atr_percent:.2f}%, enter_price: ${enter_price:.2f})"
-                    )
-                    return dynamic_stop_loss
+                logger.info(
+                    f"ATR-based stop loss (2x ATR) for {ticker}: {dynamic_stop_loss:.2f}% "
+                    f"(ATR: {atr_percent:.2f}%, enter_price: ${enter_price:.2f}, "
+                    f"action: {action or 'unknown'})"
+                )
+                return dynamic_stop_loss
 
         # Fallback to Alpaca API for stocks under $3 if ATR not available
         if enter_price >= cls.max_stock_price_for_penny_treatment:
@@ -658,6 +677,15 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"Volume too low: {avg_volume:,} < {cls.min_daily_volume:,} minimum",
             )
 
+        # Check volume ratio (must be >1.5x SMA as recommended by judge)
+        volume_ratio = volume / volume_sma if volume_sma > 0 else 0
+        if volume_ratio < cls.min_volume_ratio:
+            return (
+                False,
+                f"Volume ratio too low: {volume_ratio:.2f}x < {cls.min_volume_ratio}x SMA "
+                f"(volume: {volume:,}, SMA: {volume_sma:,})",
+            )
+
         adx = technical_analysis.get("adx")
         if adx is None:
             return False, "Missing ADX data"
@@ -896,6 +924,17 @@ class MomentumIndicator(BaseTradingIndicator):
         logger.info(
             "Market is open, proceeding with momentum entry logic (HIGHLY SELECTIVE)"
         )
+
+        # Check if we're past entry cutoff time (15:00 ET)
+        if cls._is_after_entry_cutoff():
+            est_tz = pytz.timezone("America/New_York")
+            current_time_est = datetime.now(est_tz)
+            logger.info(
+                f"Past entry cutoff time ({cls.max_entry_hour_et}:00 ET), "
+                f"skipping new entries (current: {current_time_est.strftime('%H:%M %Z')})"
+            )
+            await asyncio.sleep(cls.entry_cycle_seconds)
+            return
 
         await cls._reset_daily_stats_if_needed()
 
@@ -1228,9 +1267,9 @@ class MomentumIndicator(BaseTradingIndicator):
                     if k != "datetime_price"
                 }
 
-            # Calculate dynamic stop loss for penny stocks
+            # Calculate dynamic stop loss using 2x ATR
             dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
-                ticker, enter_price, technical_indicators_for_enter
+                ticker, enter_price, technical_indicators_for_enter, action=action
             )
 
             await cls._enter_trade(
@@ -1365,9 +1404,9 @@ class MomentumIndicator(BaseTradingIndicator):
                     if k != "datetime_price"
                 }
 
-            # Calculate dynamic stop loss for penny stocks
+            # Calculate dynamic stop loss using 2x ATR
             dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
-                ticker, enter_price, technical_indicators_for_enter
+                ticker, enter_price, technical_indicators_for_enter, action=action
             )
 
             await cls._enter_trade(
@@ -1545,101 +1584,123 @@ class MomentumIndicator(BaseTradingIndicator):
 
             elif peak_profit_percent > 0 and profit_percent > 0:
                 # Trailing stop should only protect profits, not trigger on losses
-                # Only check trailing stop if current profit is still positive
-                # Check if trailing stop should be active (cooling-off period)
-                trailing_stop_active = True
-                if created_at:
-                    try:
-                        enter_time = datetime.fromisoformat(
-                            created_at.replace("Z", "+00:00")
-                        )
-                        if enter_time.tzinfo is None:
-                            enter_time = enter_time.replace(tzinfo=timezone.utc)
-                        elapsed_seconds = (
-                            datetime.now(timezone.utc) - enter_time
-                        ).total_seconds()
+                # Only activate trailing stop after +1% profit as recommended by judge
+                if peak_profit_percent >= cls.trailing_stop_activation_profit:
+                    # Check if trailing stop should be active (cooling-off period)
+                    trailing_stop_active = True
+                    if created_at:
+                        try:
+                            enter_time = datetime.fromisoformat(
+                                created_at.replace("Z", "+00:00")
+                            )
+                            if enter_time.tzinfo is None:
+                                enter_time = enter_time.replace(tzinfo=timezone.utc)
+                            elapsed_seconds = (
+                                datetime.now(timezone.utc) - enter_time
+                            ).total_seconds()
 
-                        # Apply minimum cooldown for ALL stocks to prevent whipsaw exits
-                        # For penny stocks, use longer cooldown
-                        is_low_price = (
-                            enter_price < cls.max_stock_price_for_penny_treatment
-                        )
-                        required_cooldown = (
-                            cls.trailing_stop_cooldown_seconds
-                            if is_low_price
-                            else cls.min_trailing_stop_cooldown_seconds
-                        )
-                        if elapsed_seconds < required_cooldown:
-                            trailing_stop_active = False
+                            # Apply minimum cooldown for ALL stocks to prevent whipsaw exits
+                            # For penny stocks, use longer cooldown
+                            is_low_price = (
+                                enter_price < cls.max_stock_price_for_penny_treatment
+                            )
+                            required_cooldown = (
+                                cls.trailing_stop_cooldown_seconds
+                                if is_low_price
+                                else cls.min_trailing_stop_cooldown_seconds
+                            )
+                            if elapsed_seconds < required_cooldown:
+                                trailing_stop_active = False
+                                logger.debug(
+                                    f"Trailing stop not active for {ticker}: "
+                                    f"cooling period ({elapsed_seconds:.0f}s < {required_cooldown}s) "
+                                    f"{'(penny stock)' if is_low_price else '(standard)'}"
+                                )
+                        except Exception as e:
                             logger.debug(
-                                f"Trailing stop not active for {ticker}: "
-                                f"cooling period ({elapsed_seconds:.0f}s < {required_cooldown}s) "
-                                f"{'(penny stock)' if is_low_price else '(standard)'}"
+                                f"Error checking trailing stop cooldown for {ticker}: {str(e)}"
                             )
-                    except Exception as e:
-                        logger.debug(
-                            f"Error checking trailing stop cooldown for {ticker}: {str(e)}"
-                        )
 
-                if trailing_stop_active:
-                    # Calculate ATR-based trailing stop
-                    atr = technical_analysis.get("atr", 0.0)
-                    if atr > 0:
-                        # Use ATR-based trailing stop (more sophisticated)
-                        dynamic_trailing_stop = (
-                            cls._calculate_volatility_adjusted_trailing_stop(
-                                enter_price, atr, current_price
-                            )
-                        )
-                    else:
-                        # Fallback to multiplier-based approach if no ATR
-                        is_low_price = (
-                            enter_price < cls.max_stock_price_for_penny_treatment
-                        )
-                        atr_percent = (
-                            cls._calculate_atr_percent(atr, current_price)
-                            if atr > 0 and current_price > 0
-                            else 0.0
-                        )
+                    if trailing_stop_active:
+                        # Calculate ATR-based trailing stop: max(2%, 1.5*ATR) as recommended
+                        atr = technical_analysis.get("atr", 0.0)
+                        is_short = original_action == "sell_to_open"
 
-                        base_trailing_stop = cls.trailing_stop_percent
-                        if is_low_price:
-                            dynamic_trailing_stop = (
-                                base_trailing_stop
-                                * cls.trailing_stop_penny_stock_multiplier
+                        if atr > 0:
+                            atr_percent = cls._calculate_atr_percent(atr, current_price)
+                            # Use max(2%, 1.5*ATR) for trailing stop
+                            atr_based_trailing = 1.5 * atr_percent
+                            base_trailing = 2.0
+                            dynamic_trailing_stop = max(
+                                base_trailing, atr_based_trailing
                             )
-                        elif atr_percent > 3.0:  # High volatility
-                            dynamic_trailing_stop = (
-                                base_trailing_stop
-                                * cls.trailing_stop_volatile_multiplier
-                            )
+
+                            # Widen trailing stop for shorts (3-4%) as recommended
+                            if is_short:
+                                dynamic_trailing_stop = (
+                                    dynamic_trailing_stop
+                                    * cls.trailing_stop_short_multiplier
+                                )
+                                # Cap at 4% for shorts
+                                dynamic_trailing_stop = min(4.0, dynamic_trailing_stop)
                         else:
-                            dynamic_trailing_stop = base_trailing_stop
+                            # Fallback to multiplier-based approach if no ATR
+                            is_low_price = (
+                                enter_price < cls.max_stock_price_for_penny_treatment
+                            )
+                            base_trailing_stop = cls.trailing_stop_percent
 
-                    # Trailing stop should only protect profits (already checked at elif level)
-                    drop_from_peak = peak_profit_percent - profit_percent
-                    if drop_from_peak >= dynamic_trailing_stop:
-                        should_exit = True
-                        exit_reason = (
-                            f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
-                            f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
-                            f"trailing stop: {dynamic_trailing_stop:.2f}%)"
-                        )
-                        logger.info(
-                            f"Exit signal for {ticker} - trailing stop: "
-                            f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%, "
-                            f"trailing stop: {dynamic_trailing_stop:.2f}%"
-                        )
+                            if is_short:
+                                # Wider trailing for shorts
+                                dynamic_trailing_stop = (
+                                    base_trailing_stop
+                                    * cls.trailing_stop_short_multiplier
+                                )
+                            elif is_low_price:
+                                dynamic_trailing_stop = (
+                                    base_trailing_stop
+                                    * cls.trailing_stop_penny_stock_multiplier
+                                )
+                            else:
+                                dynamic_trailing_stop = base_trailing_stop
+
+                        # Trailing stop should only protect profits (already checked at elif level)
+                        drop_from_peak = peak_profit_percent - profit_percent
+                        if drop_from_peak >= dynamic_trailing_stop:
+                            should_exit = True
+                            exit_reason = (
+                                f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
+                                f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
+                                f"trailing stop: {dynamic_trailing_stop:.2f}%)"
+                            )
+                            logger.info(
+                                f"Exit signal for {ticker} - trailing stop: "
+                                f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%, "
+                                f"trailing stop: {dynamic_trailing_stop:.2f}%"
+                            )
+                else:
+                    logger.debug(
+                        f"Trailing stop not active for {ticker}: "
+                        f"peak profit {peak_profit_percent:.2f}% < activation threshold "
+                        f"{cls.trailing_stop_activation_profit:.2f}%"
+                    )
 
             if not should_exit:
-                profit_target_to_exit = cls.profit_target_strong_momentum
+                # Calculate dynamic profit target: 2x stop distance as recommended
+                # If stop loss is -3%, profit target should be +6%
+                stop_distance = abs(stop_loss_threshold)
+                profit_target_to_exit = stop_distance * cls.profit_target_multiplier
+
+                # Cap profit target at reasonable level (e.g., 10%)
+                profit_target_to_exit = min(10.0, profit_target_to_exit)
 
                 is_profitable = profit_percent >= profit_target_to_exit
                 if is_profitable:
                     should_exit = True
                     exit_reason = (
                         f"Profit target reached: {profit_percent:.2f}% profit "
-                        f"(target: {profit_target_to_exit:.2f}%)"
+                        f"(target: {profit_target_to_exit:.2f}% = {cls.profit_target_multiplier}x "
+                        f"stop distance of {stop_distance:.2f}%)"
                     )
 
             if not should_exit:
@@ -1647,32 +1708,37 @@ class MomentumIndicator(BaseTradingIndicator):
                     peak_profit_percent = profit_percent
                     # Calculate dynamic trailing stop for updating (use ATR-based if available)
                     atr = technical_analysis.get("atr", 0.0)
+                    is_short = original_action == "sell_to_open"
+
                     if atr > 0:
-                        trailing_stop = (
-                            cls._calculate_volatility_adjusted_trailing_stop(
-                                enter_price, atr, current_price
+                        # Use max(2%, 1.5*ATR) for trailing stop
+                        atr_percent = cls._calculate_atr_percent(atr, current_price)
+                        atr_based_trailing = 1.5 * atr_percent
+                        base_trailing = 2.0
+                        trailing_stop = max(base_trailing, atr_based_trailing)
+
+                        # Widen trailing stop for shorts (3-4%)
+                        if is_short:
+                            trailing_stop = (
+                                trailing_stop * cls.trailing_stop_short_multiplier
                             )
-                        )
+                            trailing_stop = min(4.0, trailing_stop)
                     else:
                         # Fallback to multiplier-based approach
                         is_low_price = (
                             enter_price < cls.max_stock_price_for_penny_treatment
                         )
-                        atr_percent = (
-                            cls._calculate_atr_percent(atr, current_price)
-                            if atr > 0 and current_price > 0
-                            else 0.0
-                        )
+                        base_trailing_stop = cls.trailing_stop_percent
 
-                        if is_low_price:
+                        if is_short:
+                            # Wider trailing for shorts
+                            trailing_stop = (
+                                base_trailing_stop * cls.trailing_stop_short_multiplier
+                            )
+                        elif is_low_price:
                             trailing_stop = (
                                 cls.trailing_stop_percent
                                 * cls.trailing_stop_penny_stock_multiplier
-                            )
-                        elif atr_percent > 3.0:
-                            trailing_stop = (
-                                cls.trailing_stop_percent
-                                * cls.trailing_stop_volatile_multiplier
                             )
                         else:
                             trailing_stop = cls.trailing_stop_percent

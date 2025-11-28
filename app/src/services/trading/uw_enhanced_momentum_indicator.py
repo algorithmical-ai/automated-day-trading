@@ -13,6 +13,7 @@ import asyncio
 import os
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, timezone
+import pytz
 
 import aiohttp
 
@@ -39,20 +40,25 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     profit_threshold: float = 1.5
     top_k: int = 2
     exceptional_momentum_threshold: float = 5.0
-    min_momentum_threshold: float = 3.0
+    min_momentum_threshold: float = 0.2  # Raised from 3.0% to 0.2% for stronger signals
     max_momentum_threshold: float = 50.0
     min_daily_volume: int = 1000
-    stop_loss_threshold: float = -2.5
-    trailing_stop_percent: float = 2.5
+    min_volume_ratio: float = 1.5  # Volume must be >1.5x SMA for entry
+    stop_loss_threshold: float = -4.0  # Loosened from -2.5% to -4% as recommended by judge
+    trailing_stop_percent: float = 2.5  # Base trailing stop, will be adjusted for shorts
+    trailing_stop_short_multiplier: float = 1.5  # Wider trailing stop for shorts (3-4%)
     min_adx_threshold: float = 20.0
     rsi_oversold_for_long: float = (
         40.0  # Increased from 35.0 - require more oversold for longs
     )
     rsi_overbought_for_short: float = (
-        70.0  # Increased from 65.0 - require truly overbought for shorts
+        60.0  # Lowered from 70.0 to 60.0 per judge recommendation
     )
     profit_target_strong_momentum: float = 5.0
+    profit_target_multiplier: float = 2.0  # Profit target = 2x stop distance
+    trailing_stop_activation_profit: float = 1.0  # Activate trailing stop after +1% profit
     min_holding_period_seconds: int = 60
+    max_entry_hour_et: int = 15  # No entries after 3:00 PM ET (15:00)
 
     # Unusual Whales integration
     use_unusual_whales: bool = True
@@ -78,6 +84,17 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         if current_price <= 0 or atr <= 0:
             return 0.0
         return (atr / current_price) * 100
+
+    @classmethod
+    def _is_after_entry_cutoff(cls) -> bool:
+        """
+        Check if current time is after the entry cutoff time (15:00 ET).
+        No new entries allowed after this time to avoid late-day volatility.
+        """
+        est_tz = pytz.timezone("America/New_York")
+        current_time_est = datetime.now(est_tz)
+        current_hour = current_time_est.hour
+        return current_hour >= cls.max_entry_hour_et
 
     @classmethod
     async def _check_bid_ask_spread(
@@ -123,17 +140,37 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         ticker: str,
         enter_price: float,
         technical_analysis: Optional[Dict[str, Any]] = None,
+        action: Optional[str] = None,
     ) -> float:
-        """Calculate dynamic stop loss based on ATR"""
+        """
+        Calculate dynamic stop loss based on 2x ATR as recommended by judge.
+        Long: enter_price - 2*ATR
+        Short: enter_price + 2*ATR
+        """
         default_stop_loss = cls.stop_loss_threshold
 
         # Use ATR if available (preferred method via VolatilityUtils)
         if technical_analysis:
             atr = technical_analysis.get("atr", 0.0)
             if atr > 0 and enter_price > 0:
-                return VolatilityUtils.calculate_volatility_adjusted_stop_loss(
-                    enter_price, atr, default_stop_loss
+                # Use 2x ATR for stop loss as recommended
+                atr_percent = (atr / enter_price) * 100
+                stop_loss_atr_multiple = 2.0
+                dynamic_stop_loss = -(atr_percent * stop_loss_atr_multiple)
+                
+                # Cap at reasonable levels (allow up to -4% for UW-Enhanced as recommended)
+                is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
+                if is_low_price:
+                    dynamic_stop_loss = max(-8.0, min(-4.0, dynamic_stop_loss))
+                else:
+                    dynamic_stop_loss = max(-6.0, min(-4.0, dynamic_stop_loss))
+                
+                logger.info(
+                    f"ATR-based stop loss (2x ATR) for {ticker}: {dynamic_stop_loss:.2f}% "
+                    f"(ATR: {atr_percent:.2f}%, enter_price: ${enter_price:.2f}, "
+                    f"action: {action or 'unknown'})"
                 )
+                return dynamic_stop_loss
 
         # Fallback to Alpaca API for stocks under $3 if ATR not available
         if enter_price >= cls.max_stock_price_for_penny_treatment:
@@ -345,6 +382,15 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
         if avg_volume < cls.min_daily_volume:
             return False, f"Volume too low: {avg_volume:,} < {cls.min_daily_volume:,}"
+
+        # Check volume ratio (must be >1.5x SMA as recommended by judge)
+        volume_ratio = volume / volume_sma if volume_sma > 0 else 0
+        if volume_ratio < cls.min_volume_ratio:
+            return (
+                False,
+                f"Volume ratio too low: {volume_ratio:.2f}x < {cls.min_volume_ratio}x SMA "
+                f"(volume: {volume:,}, SMA: {volume_sma:,})",
+            )
 
         adx = technical_analysis.get("adx")
         if adx is None:
@@ -601,6 +647,17 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
         logger.info("Market is open, proceeding with UW-Enhanced Momentum entry logic")
 
+        # Check if we're past entry cutoff time (15:00 ET)
+        if cls._is_after_entry_cutoff():
+            est_tz = pytz.timezone("America/New_York")
+            current_time_est = datetime.now(est_tz)
+            logger.info(
+                f"Past entry cutoff time ({cls.max_entry_hour_et}:00 ET), "
+                f"skipping new entries (current: {current_time_est.strftime('%H:%M %Z')})"
+            )
+            await asyncio.sleep(cls.entry_cycle_seconds)
+            return
+
         await cls._reset_daily_stats_if_needed()
 
         daily_limit_reached = await cls._has_reached_daily_trade_limit()
@@ -847,9 +904,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             technical_analysis = market_data_response.get("technical_analysis", {})
             atr = technical_analysis.get("atr", 0)
 
-            # Calculate volatility-adjusted settings
+            # Calculate volatility-adjusted settings using 2x ATR
             dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
-                ticker, enter_price, technical_analysis
+                ticker, enter_price, technical_analysis, action=action
             )
             if atr > 0:
                 dynamic_stop_loss = (
@@ -967,15 +1024,10 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             technical_analysis = market_data_response.get("technical_analysis", {})
             atr = technical_analysis.get("atr", 0)
 
+            # Calculate dynamic stop loss using 2x ATR
             dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
-                ticker, enter_price, technical_analysis
+                ticker, enter_price, technical_analysis, action=action
             )
-            if atr > 0:
-                dynamic_stop_loss = (
-                    VolatilityUtils.calculate_volatility_adjusted_stop_loss(
-                        enter_price, atr, cls.stop_loss_threshold
-                    )
-                )
 
             position_multiplier = VolatilityUtils.calculate_position_size_multiplier(
                 enter_price, atr
@@ -1095,30 +1147,58 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     f"(threshold: {stop_loss_threshold:.2f}%)"
                 )
 
-            # Check if trailing stop should apply (cooling period)
+            # Check if trailing stop should apply (only after +1% profit as recommended)
             # Trailing stop should only protect profits, not trigger on losses
             if not should_exit and peak_profit_percent > 0 and profit_percent > 0:
-                should_apply_trailing, cooling_reason = (
-                    VolatilityUtils.should_apply_trailing_stop(
-                        enter_price, created_at, profit_percent
-                    )
-                )
-                if should_apply_trailing:
-                    volatility_trailing_stop = (
-                        VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
-                            enter_price, current_price, atr, cls.trailing_stop_percent
+                # Only activate trailing stop after +1% profit as recommended by judge
+                if peak_profit_percent >= cls.trailing_stop_activation_profit:
+                    should_apply_trailing, cooling_reason = (
+                        VolatilityUtils.should_apply_trailing_stop(
+                            enter_price, created_at, profit_percent
                         )
                     )
-                    drop_from_peak = peak_profit_percent - profit_percent
-                    if drop_from_peak >= volatility_trailing_stop:
-                        should_exit = True
-                        exit_reason = (
-                            f"Volatility-adjusted trailing stop: profit dropped {drop_from_peak:.2f}% "
-                            f"from peak {peak_profit_percent:.2f}% "
-                            f"(threshold: {volatility_trailing_stop:.2f}%, current: {profit_percent:.2f}%)"
-                        )
+                    if should_apply_trailing:
+                        # Calculate ATR-based trailing stop: max(2%, 1.5*ATR)
+                        is_short = original_action == "sell_to_open"
+                        
+                        if atr > 0:
+                            atr_percent = cls._calculate_atr_percent(atr, current_price)
+                            # Use max(2%, 1.5*ATR) for trailing stop
+                            atr_based_trailing = 1.5 * atr_percent
+                            base_trailing = 2.0
+                            volatility_trailing_stop = max(base_trailing, atr_based_trailing)
+                            
+                            # Widen trailing stop for shorts (3-4%) as recommended
+                            if is_short:
+                                volatility_trailing_stop = (
+                                    volatility_trailing_stop * cls.trailing_stop_short_multiplier
+                                )
+                                # Cap at 4% for shorts
+                                volatility_trailing_stop = min(4.0, volatility_trailing_stop)
+                        else:
+                            # Fallback to base trailing stop
+                            volatility_trailing_stop = cls.trailing_stop_percent
+                            if is_short:
+                                volatility_trailing_stop = (
+                                    volatility_trailing_stop * cls.trailing_stop_short_multiplier
+                                )
+                        
+                        drop_from_peak = peak_profit_percent - profit_percent
+                        if drop_from_peak >= volatility_trailing_stop:
+                            should_exit = True
+                            exit_reason = (
+                                f"Volatility-adjusted trailing stop: profit dropped {drop_from_peak:.2f}% "
+                                f"from peak {peak_profit_percent:.2f}% "
+                                f"(threshold: {volatility_trailing_stop:.2f}%, current: {profit_percent:.2f}%)"
+                            )
+                    else:
+                        logger.debug(f"{ticker}: {cooling_reason}")
                 else:
-                    logger.debug(f"{ticker}: {cooling_reason}")
+                    logger.debug(
+                        f"Trailing stop not active for {ticker}: "
+                        f"peak profit {peak_profit_percent:.2f}% < activation threshold "
+                        f"{cls.trailing_stop_activation_profit:.2f}%"
+                    )
             elif not should_exit and peak_profit_percent > 0 and profit_percent <= 0:
                 # Trade is already negative - trailing stop doesn't apply
                 # The hard stop loss will handle it if it gets worse
@@ -1128,20 +1208,44 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     f"(peak was {peak_profit_percent:.2f}%)"
                 )
 
-            # Profit target
+            # Profit target: 2x stop distance as recommended
             if not should_exit:
-                if profit_percent >= cls.profit_target_strong_momentum:
+                # Calculate dynamic profit target: 2x stop distance
+                stop_distance = abs(stop_loss_threshold)
+                profit_target_to_exit = stop_distance * cls.profit_target_multiplier
+                
+                # Cap profit target at reasonable level (e.g., 10%)
+                profit_target_to_exit = min(10.0, profit_target_to_exit)
+                
+                if profit_percent >= profit_target_to_exit:
                     should_exit = True
-                    exit_reason = f"Profit target reached: {profit_percent:.2f}%"
+                    exit_reason = (
+                        f"Profit target reached: {profit_percent:.2f}% profit "
+                        f"(target: {profit_target_to_exit:.2f}% = {cls.profit_target_multiplier}x "
+                        f"stop distance of {stop_distance:.2f}%)"
+                    )
 
             if not should_exit:
                 if profit_percent > peak_profit_percent:
                     peak_profit_percent = profit_percent
-                    trailing_stop = (
-                        VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
-                            enter_price, current_price, atr, cls.trailing_stop_percent
-                        )
-                    )
+                    # Calculate dynamic trailing stop: max(2%, 1.5*ATR)
+                    is_short = original_action == "sell_to_open"
+                    
+                    if atr > 0:
+                        atr_percent = cls._calculate_atr_percent(atr, current_price)
+                        atr_based_trailing = 1.5 * atr_percent
+                        base_trailing = 2.0
+                        trailing_stop = max(base_trailing, atr_based_trailing)
+                        
+                        # Widen trailing stop for shorts (3-4%)
+                        if is_short:
+                            trailing_stop = trailing_stop * cls.trailing_stop_short_multiplier
+                            trailing_stop = min(4.0, trailing_stop)
+                    else:
+                        # Fallback to base trailing stop
+                        trailing_stop = cls.trailing_stop_percent
+                        if is_short:
+                            trailing_stop = trailing_stop * cls.trailing_stop_short_multiplier
 
                 skipped_reason = (
                     f"Profit: {profit_percent:.2f}%, "
