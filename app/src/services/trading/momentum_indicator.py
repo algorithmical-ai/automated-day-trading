@@ -104,7 +104,7 @@ class MomentumIndicator(BaseTradingIndicator):
         est_tz = pytz.timezone("America/New_York")
         current_time_est = datetime.now(est_tz)
         market_close_time = time(16, 0)  # 4:00 PM ET
-        
+
         # Calculate minutes until market close
         close_datetime = datetime.combine(current_time_est.date(), market_close_time)
         close_datetime = est_tz.localize(close_datetime)
