@@ -228,6 +228,7 @@ class DynamoDBClient:
         enter_reason: str,
         technical_indicators_for_enter: Optional[Dict[str, Any]] = None,
         dynamic_stop_loss: Optional[float] = None,
+        entry_score: Optional[float] = None,
     ) -> bool:
         """Add a momentum-based trade to ActiveTickersForAutomatedDayTrader table"""
         try:
@@ -246,6 +247,10 @@ class DynamoDBClient:
             # Add dynamic stop loss if provided
             if dynamic_stop_loss is not None:
                 item["dynamic_stop_loss"] = cls._convert_to_decimal(dynamic_stop_loss)
+            
+            # Add entry score if provided (for Deep Analyzer degradation checks)
+            if entry_score is not None:
+                item["entry_score"] = cls._convert_to_decimal(entry_score)
             
             # Add technical indicators if provided
             if technical_indicators_for_enter:

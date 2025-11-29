@@ -5,7 +5,7 @@ Abstract base class for trading indicators with shared infrastructure
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, ClassVar
 from datetime import datetime, date, timezone, time
 import pytz
 
@@ -31,9 +31,10 @@ class BaseTradingIndicator(ABC):
     # Daily tracking
     daily_trades_count: int = 0
     daily_trades_date: Optional[str] = None
-    ticker_exit_timestamps: Dict[str, datetime] = {}
+    ticker_exit_timestamps: ClassVar[Optional[Dict[str, datetime]]] = None  # Per-subclass dict, initialized on first use
     mab_reset_date: Optional[str] = None
     mab_reset_timestamp: Optional[datetime] = None  # Track when reset happened (EST)
+    _daily_count_lock: ClassVar[Optional[asyncio.Lock]] = None  # Lock for thread-safe daily count updates
 
     @classmethod
     @abstractmethod
@@ -52,7 +53,11 @@ class BaseTradingIndicator(ABC):
         cls.mab_reset_timestamp = None
         cls.daily_trades_count = 0
         cls.daily_trades_date = None
-        cls.ticker_exit_timestamps.clear()
+        # Initialize class-level mutable state properly for each subclass
+        cls.ticker_exit_timestamps = {}
+        # Initialize lock for thread-safe daily count updates
+        if cls._daily_count_lock is None:
+            cls._daily_count_lock = asyncio.Lock()
 
     @classmethod
     def stop(cls):
@@ -60,18 +65,27 @@ class BaseTradingIndicator(ABC):
         cls.running = False
 
     @classmethod
+    def _get_ticker_exit_timestamps(cls) -> Dict[str, datetime]:
+        """Get or initialize ticker_exit_timestamps dict for this class"""
+        if not hasattr(cls, 'ticker_exit_timestamps') or cls.ticker_exit_timestamps is None:
+            cls.ticker_exit_timestamps = {}
+        return cls.ticker_exit_timestamps
+
+    @classmethod
     def _is_ticker_in_cooldown(cls, ticker: str) -> bool:
         """Check if ticker is in cooldown period"""
-        if ticker not in cls.ticker_exit_timestamps:
+        exit_timestamps = cls._get_ticker_exit_timestamps()
+        if ticker not in exit_timestamps:
             return False
 
-        exit_time = cls.ticker_exit_timestamps[ticker]
+        exit_time = exit_timestamps[ticker]
         elapsed_minutes = (
             datetime.now(timezone.utc) - exit_time
         ).total_seconds() / 60.0
 
         if elapsed_minutes >= cls.ticker_cooldown_minutes:
-            del cls.ticker_exit_timestamps[ticker]
+            exit_timestamps = cls._get_ticker_exit_timestamps()
+            del exit_timestamps[ticker]
             return False
 
         return True
@@ -89,15 +103,20 @@ class BaseTradingIndicator(ABC):
         return cls.daily_trades_count >= cls.max_daily_trades
 
     @classmethod
-    def _increment_daily_trade_count(cls):
-        """Increment daily trade counter"""
-        today = date.today().isoformat()
+    async def _increment_daily_trade_count(cls):
+        """Increment daily trade counter (thread-safe)"""
+        # Ensure lock is initialized
+        if cls._daily_count_lock is None:
+            cls._daily_count_lock = asyncio.Lock()
+        
+        async with cls._daily_count_lock:
+            today = date.today().isoformat()
 
-        if cls.daily_trades_date != today:
-            cls.daily_trades_count = 0
-            cls.daily_trades_date = today
+            if cls.daily_trades_date != today:
+                cls.daily_trades_count = 0
+                cls.daily_trades_date = today
 
-        cls.daily_trades_count += 1
+            cls.daily_trades_count += 1
 
     @classmethod
     async def _check_market_open(cls) -> bool:
@@ -111,20 +130,27 @@ class BaseTradingIndicator(ABC):
 
     @classmethod
     async def _reset_daily_stats_if_needed(cls):
-        """Reset daily stats only once per day at 9:30 AM EST (market open)"""
+        """Reset daily stats only once per day at 9:30 AM EST (market open)
+        
+        Uses EST only for market-hour logic, stores timestamps in UTC internally.
+        """
+        # Use UTC internally
+        current_time_utc = datetime.now(timezone.utc)
+        
+        # Convert to EST only for market-hour logic
         est_tz = pytz.timezone("America/New_York")
-        current_time_est = datetime.now(est_tz)
-        today = current_time_est.date().isoformat()
+        current_time_est = current_time_utc.astimezone(est_tz)
+        today = current_time_est.date().isoformat()  # Use EST date for market day
         market_open_time = time(9, 30)  # 9:30 AM EST
 
-        # Check if it's after 9:30 AM EST
+        # Check if it's after 9:30 AM EST (market-hour logic)
         current_time_only = current_time_est.time()
         is_after_market_open = current_time_only >= market_open_time
 
-        # Check if we've already reset today
+        # Check if we've already reset today (using EST date for market day)
         already_reset_today = (
             cls.mab_reset_timestamp is not None
-            and cls.mab_reset_timestamp.date().isoformat() == today
+            and cls.mab_reset_timestamp.astimezone(est_tz).date().isoformat() == today
         )
 
         # Only reset if:
@@ -142,10 +168,11 @@ class BaseTradingIndicator(ABC):
             )
             await MABService.reset_daily_stats(cls.indicator_name())
             cls.mab_reset_date = today
-            cls.mab_reset_timestamp = current_time_est
+            # Store UTC timestamp internally (convert EST datetime to UTC)
+            cls.mab_reset_timestamp = current_time_est.astimezone(timezone.utc)
             cls.daily_trades_count = 0
             cls.daily_trades_date = today
-            cls.ticker_exit_timestamps.clear()
+            cls._get_ticker_exit_timestamps().clear()
         elif not is_after_market_open:
             # Log if we're before market open (only once to avoid spam)
             if cls.mab_reset_date != today:
@@ -233,6 +260,7 @@ class BaseTradingIndicator(ABC):
         enter_reason: str,
         technical_indicators: Optional[Dict[str, Any]] = None,
         dynamic_stop_loss: Optional[float] = None,
+        entry_score: Optional[float] = None,
     ) -> bool:
         """Enter a trade and save to DynamoDB"""
         try:
@@ -244,9 +272,10 @@ class BaseTradingIndicator(ABC):
                 enter_reason=enter_reason,
                 technical_indicators_for_enter=technical_indicators,
                 dynamic_stop_loss=dynamic_stop_loss,
+                entry_score=entry_score,
             )
 
-            cls._increment_daily_trade_count()
+            await cls._increment_daily_trade_count()
 
             logger.info(
                 f"Entered {cls.indicator_name()} trade for {ticker} - {action} at {enter_price} "
@@ -380,7 +409,7 @@ class BaseTradingIndicator(ABC):
             await DynamoDBClient.delete_momentum_trade(ticker, cls.indicator_name())
 
             # Track exit timestamp for cooldown
-            cls.ticker_exit_timestamps[ticker] = datetime.now(timezone.utc)
+            cls._get_ticker_exit_timestamps()[ticker] = datetime.now(timezone.utc)
 
             logger.info(
                 f"Exited {cls.indicator_name()} trade for {ticker}. "

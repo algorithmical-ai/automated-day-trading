@@ -26,6 +26,17 @@ from app.src.services.mab.mab_service import MABService
 from app.src.services.trading.base_trading_indicator import BaseTradingIndicator
 from app.src.services.market_data.market_data_service import MarketDataService
 from app.src.services.trading.volatility_utils import VolatilityUtils
+from app.src.services.trading.trading_config import (
+    ATR_STOP_LOSS_MULTIPLIER,
+    ATR_TRAILING_STOP_MULTIPLIER,
+    BASE_TRAILING_STOP_PERCENT,
+    TRAILING_STOP_SHORT_MULTIPLIER,
+    MAX_TRAILING_STOP_SHORT,
+    PENNY_STOCK_STOP_LOSS_MIN,
+    PENNY_STOCK_STOP_LOSS_MAX,
+    STANDARD_STOCK_STOP_LOSS_MIN,
+    STANDARD_STOCK_STOP_LOSS_MAX,
+)
 from app.src.services.unusual_whales.uw_client import (
     UnusualWhalesClient,
     FlowSentiment,
@@ -76,6 +87,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     _alpaca_api_key = os.environ.get("REAL_TRADE_API_KEY", "")
     _alpaca_api_secret = os.environ.get("REAL_TRADE_SECRET_KEY", "")
     _alpaca_base_url = "https://data.alpaca.markets/v2/stocks/bars"
+    _alpaca_session: Optional[aiohttp.ClientSession] = None  # Shared session for API calls
 
     @classmethod
     def indicator_name(cls) -> str:
@@ -177,17 +189,16 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         if technical_analysis:
             atr = technical_analysis.get("atr", 0.0)
             if atr > 0 and enter_price > 0:
-                # Use 2x ATR for stop loss as recommended
+                # Use standardized ATR multiplier for stop loss
                 atr_percent = (atr / enter_price) * 100
-                stop_loss_atr_multiple = 2.0
-                dynamic_stop_loss = -(atr_percent * stop_loss_atr_multiple)
+                dynamic_stop_loss = -(atr_percent * ATR_STOP_LOSS_MULTIPLIER)
                 
-                # Cap at reasonable levels (allow up to -4% for UW-Enhanced as recommended)
+                # Cap at reasonable levels using standardized bounds
                 is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
                 if is_low_price:
-                    dynamic_stop_loss = max(-8.0, min(-4.0, dynamic_stop_loss))
+                    dynamic_stop_loss = max(PENNY_STOCK_STOP_LOSS_MIN, min(PENNY_STOCK_STOP_LOSS_MAX, dynamic_stop_loss))
                 else:
-                    dynamic_stop_loss = max(-6.0, min(-4.0, dynamic_stop_loss))
+                    dynamic_stop_loss = max(STANDARD_STOCK_STOP_LOSS_MIN, min(STANDARD_STOCK_STOP_LOSS_MAX, dynamic_stop_loss))
                 
                 logger.info(
                     f"ATR-based stop loss (2x ATR) for {ticker}: {dynamic_stop_loss:.2f}% "
@@ -226,13 +237,16 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 "APCA-API-SECRET-KEY": cls._alpaca_api_secret,
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    params={k: str(v) for k, v in params.items()},
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as response:
+            # Use shared session for efficiency
+            if cls._alpaca_session is None or cls._alpaca_session.closed:
+                cls._alpaca_session = aiohttp.ClientSession()
+            
+            async with cls._alpaca_session.get(
+                url,
+                params={k: str(v) for k, v in params.items()},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
                     if response.status != 200:
                         return default_stop_loss
 
@@ -292,47 +306,6 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         if is_golden:
             logger.info(f"Golden ticker detected: {reason}")
         return is_golden
-
-    @classmethod
-    async def _calculate_combined_entry_score(
-        cls,
-        ticker: str,
-        momentum_score: float,
-        technical_filters_reason: str,
-        enter_price: float
-    ) -> Tuple[float, str, Dict]:
-        """Combine momentum, technical, and UW flow into unified score"""
-        
-        # Base score from momentum (0-40 points)
-        abs_momentum = abs(momentum_score)
-        momentum_points = min(40, abs_momentum * 8)  # 5% momentum = 40 points
-        
-        # Technical filter quality (0-30 points)
-        # Parse from filters_reason or recalculate
-        technical_points = 20  # Placeholder - extract from actual analysis
-        
-        # UW flow alignment (0-30 points, can be negative)
-        sentiment, uw_reason, uw_details = await cls._validate_with_unusual_whales(
-            ticker, "long" if momentum_score > 0 else "short", enter_price
-        )
-        
-        flow_score = uw_details.get("flow_details", {}).get("sentiment_score", 0)
-        intended_direction = 1 if momentum_score > 0 else -1
-        
-        # Flow alignment: +1 score with +1 direction = +30 points
-        # Flow alignment: -1 score with +1 direction = -30 points (opposing)
-        flow_points = flow_score * intended_direction * 30
-        
-        total_score = momentum_points + technical_points + flow_points
-        max_score = 100
-        normalized_score = total_score / max_score
-        
-        return normalized_score, f"Combined: mom={momentum_points:.0f}, tech={technical_points:.0f}, flow={flow_points:.0f}", {
-            "momentum_points": momentum_points,
-            "technical_points": technical_points,
-            "flow_points": flow_points,
-            "uw_details": uw_details
-        }
 
     @classmethod
     async def _validate_with_unusual_whales(
@@ -493,10 +466,10 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 f"RSI {rsi:.1f} outside acceptable range [{cls.rsi_min_for_long}-{cls.rsi_max_for_long}] for long entry",
             )
 
-        if is_short and rsi <= cls.rsi_overbought_for_short:
+        if is_short and rsi < cls.rsi_overbought_for_short:
             return (
                 False,
-                f"RSI too low for short: {rsi:.2f} <= {cls.rsi_overbought_for_short}",
+                f"RSI too low for short: {rsi:.2f} < {cls.rsi_overbought_for_short} (need overbought conditions)",
             )
 
         # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
@@ -988,15 +961,17 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             technical_analysis = market_data_response.get("technical_analysis", {})
             atr = technical_analysis.get("atr", 0)
 
-            # Calculate volatility-adjusted settings using 2x ATR
-            dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
-                ticker, enter_price, technical_analysis, action=action
-            )
+            # Calculate volatility-adjusted stop loss using 2x ATR
+            # Use ATR-based calculation if available, otherwise fall back to dynamic calculation
             if atr > 0:
                 dynamic_stop_loss = (
                     VolatilityUtils.calculate_volatility_adjusted_stop_loss(
                         enter_price, atr, cls.stop_loss_threshold
                     )
+                )
+            else:
+                dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
+                    ticker, enter_price, technical_analysis, action=action
                 )
 
             # Calculate risk-adjusted position size
@@ -1276,8 +1251,8 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 )
 
             # Check if trailing stop should apply (only after +1% profit as recommended)
-            # Trailing stop should only protect profits, not trigger on losses
-            if not should_exit and peak_profit_percent > 0 and profit_percent > 0:
+            # Trailing stop protects against drops from peak (can trigger even if currently at loss)
+            elif not should_exit and peak_profit_percent > 0:
                 # Only activate trailing stop after +1% profit as recommended by judge
                 if peak_profit_percent >= cls.trailing_stop_activation_profit:
                     should_apply_trailing, cooling_reason = (
@@ -1291,18 +1266,17 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         
                         if atr > 0:
                             atr_percent = cls._calculate_atr_percent(atr, current_price)
-                            # Use max(2%, 1.5*ATR) for trailing stop
-                            atr_based_trailing = 1.5 * atr_percent
-                            base_trailing = 2.0
-                            volatility_trailing_stop = max(base_trailing, atr_based_trailing)
+                            # Use standardized ATR multiplier for trailing stop
+                            atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
+                            volatility_trailing_stop = max(BASE_TRAILING_STOP_PERCENT, atr_based_trailing)
                             
-                            # Widen trailing stop for shorts (3-4%) as recommended
+                            # Widen trailing stop for shorts
                             if is_short:
                                 volatility_trailing_stop = (
-                                    volatility_trailing_stop * cls.trailing_stop_short_multiplier
+                                    volatility_trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
                                 )
-                                # Cap at 4% for shorts
-                                volatility_trailing_stop = min(4.0, volatility_trailing_stop)
+                                # Cap at maximum for shorts
+                                volatility_trailing_stop = min(MAX_TRAILING_STOP_SHORT, volatility_trailing_stop)
                         else:
                             # Fallback to base trailing stop
                             volatility_trailing_stop = cls.trailing_stop_percent
@@ -1327,14 +1301,6 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         f"peak profit {peak_profit_percent:.2f}% < activation threshold "
                         f"{cls.trailing_stop_activation_profit:.2f}%"
                     )
-            elif not should_exit and peak_profit_percent > 0 and profit_percent <= 0:
-                # Trade is already negative - trailing stop doesn't apply
-                # The hard stop loss will handle it if it gets worse
-                logger.debug(
-                    f"Trailing stop not applicable for {ticker}: "
-                    f"current profit {profit_percent:.2f}% is negative "
-                    f"(peak was {peak_profit_percent:.2f}%)"
-                )
 
             # Profit target: 2x stop distance as recommended
             if not should_exit:
@@ -1361,14 +1327,13 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     
                     if atr > 0:
                         atr_percent = cls._calculate_atr_percent(atr, current_price)
-                        atr_based_trailing = 1.5 * atr_percent
-                        base_trailing = 2.0
-                        trailing_stop = max(base_trailing, atr_based_trailing)
+                        atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
+                        trailing_stop = max(BASE_TRAILING_STOP_PERCENT, atr_based_trailing)
                         
-                        # Widen trailing stop for shorts (3-4%)
+                        # Widen trailing stop for shorts
                         if is_short:
-                            trailing_stop = trailing_stop * cls.trailing_stop_short_multiplier
-                            trailing_stop = min(4.0, trailing_stop)
+                            trailing_stop = trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
+                            trailing_stop = min(MAX_TRAILING_STOP_SHORT, trailing_stop)
                     else:
                         # Fallback to base trailing stop
                         trailing_stop = cls.trailing_stop_percent

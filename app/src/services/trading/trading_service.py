@@ -60,17 +60,38 @@ class TradingService:
 
     @classmethod
     async def run(cls):
-        """Run all indicators concurrently"""
+        """Run all indicators concurrently with graceful shutdown handling"""
         logger.info("Starting Trading Service Coordinator with all indicators...")
         logger.info("- Momentum Trading Indicator")
         logger.info("- Deep Analyzer Indicator")
         logger.info("- UW-Enhanced Momentum Indicator (with Unusual Whales & Volatility)")
 
-        # Run all indicators concurrently
-        # Each indicator runs its own entry_service and exit_service concurrently
-        await asyncio.gather(
+        # Run all indicators concurrently with error handling
+        # Using return_exceptions=True to capture exceptions without stopping others
+        results = await asyncio.gather(
             MomentumIndicator.run(),
             DeepAnalyzerIndicator.run(),
             UWEnhancedMomentumIndicator.run(),
+            return_exceptions=True,
         )
+        
+        # Check for exceptions and log them
+        indicator_names = [
+            "Momentum Trading Indicator",
+            "Deep Analyzer Indicator",
+            "UW-Enhanced Momentum Indicator",
+        ]
+        
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(
+                    f"{indicator_names[i]} crashed with exception: {type(result).__name__}: {result}",
+                    exc_info=result,
+                )
+            elif result is not None:
+                logger.warning(
+                    f"{indicator_names[i]} returned unexpected result: {result}"
+                )
+        
+        logger.info("All trading indicators have completed")
 

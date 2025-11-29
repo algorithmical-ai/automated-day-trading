@@ -467,52 +467,6 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                         "technical_indicators": technical_analysis,
                     }
                 )
-                    # Log reason based on action
-                    if action == "buy_to_open":
-                        reason_long = f"Entry score {entry_score:.2f} < minimum {cls.min_entry_score}"
-                        reason_short = None
-                    else:  # sell_to_open
-                        reason_long = None
-                        reason_short = f"Entry score {entry_score:.2f} < minimum {cls.min_entry_score}"
-
-                    inactive_ticker_logs.append(
-                        {
-                            "ticker": ticker,
-                            "indicator": cls.indicator_name(),
-                            "reason_not_to_enter_long": reason_long,
-                            "reason_not_to_enter_short": reason_short,
-                            "technical_indicators": technical_analysis,
-                        }
-                    )
-            else:
-                stats["no_entry_signal"] += 1
-                logger.debug(f"Skipping {ticker}: {reason}")
-
-                # Use detailed_results from evaluation to avoid double API calls
-                reason_long = None
-                reason_short = None
-
-                if detailed_results:
-                    long_result = detailed_results.get("long_result", {})
-                    short_result = detailed_results.get("short_result", {})
-
-                    long_enter = long_result.get("enter", False)
-                    short_enter = short_result.get("enter", False)
-
-                    if not long_enter:
-                        reason_long = long_result.get("message", "No entry signal")
-                    if not short_enter:
-                        reason_short = short_result.get("message", "No entry signal")
-
-                inactive_ticker_logs.append(
-                    {
-                        "ticker": ticker,
-                        "indicator": cls.indicator_name(),
-                        "reason_not_to_enter_long": reason_long,
-                        "reason_not_to_enter_short": reason_short,
-                        "technical_indicators": technical_analysis,
-                    }
-                )
 
         # Batch write all inactive ticker reasons in parallel
         if inactive_ticker_logs:
@@ -709,13 +663,16 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                     if k != "datetime_price"
                 }
 
-            await cls._enter_trade(
+            success = await cls._enter_trade(
                 ticker=ticker,
                 action=action,
                 enter_price=enter_price,
                 enter_reason=ranked_reason,
                 technical_indicators=technical_indicators_for_enter,
+                entry_score=entry_score,
             )
+            if success:
+                long_entries_successful += 1
 
         # Log long entry summary
         if long_entries_attempted > 0:
@@ -829,6 +786,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 enter_price=enter_price,
                 enter_reason=ranked_reason,
                 technical_indicators=technical_indicators_for_enter,
+                entry_score=entry_score,
             )
             if success:
                 short_entries_successful += 1
