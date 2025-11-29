@@ -161,7 +161,7 @@ class ThresholdAdjustmentService:
             )
 
         # Store event in DayTraderEvents table (always store if we got LLM response)
-        await DynamoDBClient.store_day_trader_event(
+        store_success = await DynamoDBClient.store_day_trader_event(
             date=current_date,
             indicator=indicator_name,
             threshold_change=threshold_changes,
@@ -169,6 +169,19 @@ class ThresholdAdjustmentService:
             max_short_trades=max_short,
             llm_response=llm_response,
         )
+        
+        if not store_success:
+            logger.error(
+                f"❌ Failed to store day trader event for {indicator_name} on {current_date}. "
+                f"Check DynamoDB table 'DayTraderEvents' exists with schema: "
+                f"partition_key='date' (String), sort_key='indicator' (String). "
+                f"Check logs for detailed error information."
+            )
+        else:
+            logger.info(
+                f"✅ Successfully stored day trader event for {indicator_name} on {current_date} "
+                f"in DayTraderEvents table"
+            )
 
         if threshold_changes or max_long != 5 or max_short != 5:
             logger.info(

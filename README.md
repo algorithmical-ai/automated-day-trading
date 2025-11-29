@@ -1,81 +1,274 @@
 # Automated Day Trading Application
 
-An automated day trading application that monitors market conditions and executes trades using multiple strategies: technical indicator-based trading and momentum-based trading.
+An automated day trading application that monitors market conditions and executes trades using multiple sophisticated trading strategies with real-time threshold adjustment and comprehensive risk management.
 
 ## Features
 
-- **Dual Trading Strategies**:
-  - **Standard Trading**: Uses MCP tools (`enter()` and `exit()`) to make trading decisions based on technical analysis
-  - **Momentum Trading**: Analyzes price momentum patterns and exits when profit targets are reached
-- **Market Clock Monitoring**: Checks if the market is open before executing trades
-- **Ticker Screening**: Automatically identifies trading opportunities from gainers, losers, and most active stocks
-- **Blacklist Support**: Filters out blacklisted tickers from trading operations
-- **DynamoDB Integration**: Stores active trades in separate tables for each strategy
-- **Webhook Integration**: Sends trading signals to external systems
-- **Tool Discovery Service**: Background service for discovering and caching available MCP tools (currently uses HTTP fallback)
+### Multi-Strategy Trading System
+- **Momentum Trading Indicator**: Price momentum analysis with technical filters (RSI, ADX, stochastic, Bollinger Bands)
+- **Deep Analyzer Indicator**: Advanced technical analysis via MarketDataService with signal scoring and degradation detection
+- **UW-Enhanced Momentum Indicator**: Momentum trading enhanced with Unusual Whales options flow validation and volatility-aware risk management
+
+### Advanced Features
+- **Dynamic Threshold Adjustment**: LLM-powered analysis of inactive tickers to optimize trading thresholds in real-time
+- **Multi-Armed Bandit (MAB)**: Contextual bandit algorithm for intelligent ticker selection with Thompson Sampling
+- **Market-Aware Execution**: Comprehensive market clock monitoring and time-based trade management
+- **Risk Management**: 
+  - ATR-based dynamic stop losses and trailing stops
+  - Volatility-adjusted position sizing
+  - Portfolio correlation checks
+  - Entry/exit cooldown periods
+- **Comprehensive Filtering**: Price, volume, ADX, RSI, stochastic, Bollinger Bands, mean reversion detection
+- **DynamoDB Integration**: Multi-table architecture for active trades, completed trades, inactive tickers, and events
+- **Webhook Integration**: Real-time trading signals to external systems
+- **Tool Discovery Service**: Background service for discovering and caching available MCP tools
 
 ## Architecture
 
-The application consists of three main async services running concurrently:
+The application consists of multiple async services running concurrently:
 
-### 1. Tool Discovery Service
+### Core Services
 
-- Runs in the background, refreshing every 5 minutes (default)
+#### 1. Trading Service Coordinator (`trading_service.py`)
+Orchestrates three trading indicators running in parallel:
+- **Momentum Trading Indicator**: Price momentum-based strategy
+- **Deep Analyzer Indicator**: MarketDataService-based deep technical analysis
+- **UW-Enhanced Momentum Indicator**: Momentum + Unusual Whales validation
+
+Each indicator runs independent entry and exit services with graceful error handling.
+
+#### 2. Tool Discovery Service (`tool_discovery.py`)
+- Runs in the background, refreshing every 5 minutes
 - Discovers available MCP tools from the Market Data Analyzer API
-- Currently uses HTTP fallback since MCP protocol has compatibility issues
+- Uses HTTP fallback for compatibility
 - Caches tool metadata for efficient lookups
 
-### 2. Trading Service (Standard Strategy)
+#### 3. Screener Monitor Service (`screener_monitor_service.py`)
+- Monitors Alpaca screener for trading candidates
+- Provides ticker screening for all indicators
 
-- **Entry Service** (runs every 10 seconds):
+#### 4. Threshold Adjustment Service (`threshold_adjustment_service.py`)
+- Runs every 5 minutes during market hours
+- Analyzes inactive ticker reasons using AWS Bedrock LLM
+- Dynamically adjusts trading thresholds based on market conditions
+- Stores adjustment events in `DayTraderEvents` DynamoDB table
+- Supports Momentum Trading and Deep Analyzer indicators
 
-  - Checks market status via `get_market_clock()`
-  - Gets screened tickers (gainers, losers, most active) via `get_alpaca_screened_tickers()`
-  - Filters out blacklisted tickers
-  - For gainers/most_actives: Calls `enter()` MCP tool with `buy_to_open` action
-  - For losers/most_actives: Calls `enter()` MCP tool with `sell_to_open` action
-  - Gets current quote prices (ask for buys, bid for sells)
-  - Sends webhook signals and stores entries in `ActiveTradesForAutomatedWorkflow` table when entry conditions are met
+## Trading Indicators
 
-- **Exit Service** (runs every 5 seconds):
-  - Monitors active trades in `ActiveTradesForAutomatedWorkflow` table
-  - Skips blacklisted tickers
-  - Calls `exit()` MCP tool for each active trade with appropriate exit action
-  - Sends webhook signals and removes from DynamoDB when exit conditions are met
+### 1. Momentum Trading Indicator (`momentum_indicator.py`)
 
-### 3. Momentum Trading Service
+**Entry Logic** (runs every 5 seconds):
+- Analyzes `datetime_price` array from market data
+- Calculates momentum: compares early 30% vs recent 30% of price data
+- Technical filters:
+  - ADX ≥ 20 (trend strength)
+  - RSI 45-70 for longs, ≥50 for shorts
+  - Stochastic confirmation
+  - Bollinger Band position
+  - Volume > 1.5x SMA
+  - Price > $0.10
+- Upward momentum (>1.5% change) → Long position
+- Downward momentum (<-1.5% change) → Short position
+- Uses MAB for ticker selection (top-k per direction)
+- Dynamic stop loss: 2.0x ATR (standardized)
+- Position size: $2000 fixed
 
-- **Entry Service** (runs every 10 seconds):
+**Exit Logic** (runs every 5 seconds):
+- Hard stop loss: dynamic (2.0x ATR, capped at -4%)
+- Trailing stop: 1.5x ATR after activation threshold
+- Profit target: 2x stop distance
+- Tiered trailing stop activation based on peak profit
+- End-of-day forced closure (15 minutes before close)
+- Minimum holding period: 60 seconds
 
-  - Checks market status
-  - Gets screened tickers and filters blacklisted ones
-  - For each ticker, gets market data via `get_market_data()`
-  - Calculates price momentum from `datetime_price` array:
-    - Compares early 30% vs recent 30% of price data
-    - Identifies upward momentum (>0.1% change with positive trend) → `buy_to_open`
-    - Identifies downward momentum (<-0.1% change with negative trend) → `sell_to_open`
-  - Skips tickers that already have active momentum trades
-  - Sends webhook signals and stores entries in `ActiveTickersForAutomatedDayTrader` table
+**Configuration**:
+- `max_active_trades`: 5
+- `max_daily_trades`: 5
+- `min_momentum_threshold`: 1.5%
+- `max_momentum_threshold`: 15%
+- `ticker_cooldown_minutes`: 60
 
-- **Exit Service** (runs every 5 seconds):
-  - Checks market status
-  - Monitors active momentum trades in `ActiveTickersForAutomatedDayTrader` table
-  - Gets current market data to check profitability
-  - Exits when profit threshold is reached (default: 0.5%):
-    - Long trades: exits when current price ≥ enter_price × 1.005
-    - Short trades: exits when current price ≤ enter_price × 0.995
-  - Sends webhook signals and removes from DynamoDB when profitable
+### 2. Deep Analyzer Indicator (`deep_analyzer_indicator.py`)
+
+**Entry Logic** (runs every 5 seconds):
+- Uses `MarketDataService.enter_trade()` for deep technical analysis
+- Evaluates both long and short opportunities
+- Entry score threshold: 0.60 (dynamic, adjusts based on market conditions)
+- Golden ticker detection: exceptional scores (≥0.75) bypass daily limits
+- Portfolio correlation check: max 3 positions in same direction
+- MAB selection: top-k tickers per direction
+- Stores entry_score for degradation checks on exit
+
+**Exit Logic** (runs every 5 seconds):
+- Signal reversal detection: exits if opposite signal qualifies
+- Entry score degradation: exits if score drops >50% from entry
+- Uses `MarketDataService.exit_trade()` for exit signals
+- Fallback to comprehensive technical analysis
+
+**Configuration**:
+- `min_entry_score`: 0.60
+- `exceptional_entry_score`: 0.75
+- `top_k`: 2
+
+### 3. UW-Enhanced Momentum Indicator (`uw_enhanced_momentum_indicator.py`)
+
+**Entry Logic** (runs every 5 seconds):
+- Combines momentum analysis with Unusual Whales options flow validation
+- Same momentum calculation as Momentum Indicator
+- Additional filters:
+  - Unusual Whales sentiment alignment check
+  - Penny stock risk scoring
+  - Volatility and mean reversion filters
+  - Bid-ask spread validation
+- Entry cutoff: 3:00 PM ET (no new entries after this time)
+- Risk-adjusted position sizing based on volatility and penny stock risk
+
+**Exit Logic** (runs every 5 seconds):
+- Dynamic stop loss: 2.0x ATR
+- Trailing stop: 1.5x ATR (wider for shorts: 1.5x multiplier)
+- Protects against losses from peak profit (even if current profit is negative)
+- Profit target: 2x stop distance
+
+**Configuration**:
+- Uses Unusual Whales API for options flow validation
+- Volatility-aware position sizing
+- Enhanced risk management for penny stocks
+
+## Base Trading Indicator Infrastructure (`base_trading_indicator.py`)
+
+All indicators inherit from `BaseTradingIndicator`, providing:
+
+### Shared Features
+- **Market Clock Monitoring**: All operations check market status
+- **Ticker Screening**: Integrated Alpaca screener access
+- **Cooldown Management**: Per-ticker cooldown periods (60 minutes default)
+- **Daily Trade Limits**: Configurable limits with golden ticker bypass
+- **Thread-Safe Operations**: Async locks for concurrent operations
+- **Timezone Handling**: UTC internally, EST for market-hour logic only
+- **MAB Integration**: Multi-armed bandit for intelligent ticker selection
+- **DynamoDB Operations**: Standardized trade entry/exit handling
+
+### Common Configuration
+- `max_active_trades`: 5 (configurable per indicator)
+- `max_daily_trades`: 5 (configurable per indicator)
+- `ticker_cooldown_minutes`: 60
+- `entry_cycle_seconds`: 5
+- `exit_cycle_seconds`: 5
+- `position_size_dollars`: $2000
+
+## Centralized Configuration (`trading_config.py`)
+
+Standardized constants for consistency across all indicators:
+
+- **ATR Multipliers**:
+  - Stop Loss: 2.0x ATR
+  - Trailing Stop: 1.5x ATR
+  - Legacy Volatility Utils: 2.5x ATR (trailing), 3.0x ATR (stop loss)
+
+- **Stop Loss Bounds**:
+  - Penny stocks: -8.0% to -4.0%
+  - Standard stocks: -6.0% to -4.0%
+
+- **Trailing Stop Bounds**:
+  - Base: 2.0%
+  - Short multiplier: 1.5x
+  - Max for shorts: 4.0%
+
+## DynamoDB Tables
+
+### Active Trades Tables
+
+#### 1. ActiveTickersForAutomatedDayTrader
+**Partition Key**: `ticker` (String)
+
+Stores active trades for all trading indicators:
+- `ticker` (String): Stock symbol
+- `action` (String): "buy_to_open" or "sell_to_open"
+- `indicator` (String): Indicator name ("Momentum Trading", "Deep Analyzer", "UW-Enhanced Momentum Trading")
+- `enter_price` (Number): Entry price
+- `enter_reason` (String): Reason for entry
+- `technical_indicators_for_enter` (Map): Technical indicators at entry
+- `dynamic_stop_loss` (Number): ATR-based stop loss percentage
+- `trailing_stop` (Number): Current trailing stop percentage
+- `peak_profit_percent` (Number): Highest profit achieved
+- `entry_score` (Number): Entry score (for Deep Analyzer)
+- `created_at` (String): ISO timestamp
+
+### Completed Trades Table
+
+#### 2. CompletedTradesForMarketData
+**Partition Key**: `date` (String, format: yyyy-mm-dd)
+**Sort Key**: `ticker#indicator` (String)
+
+Stores completed trades:
+- `date` (String): Trading date
+- `ticker#indicator` (String): Composite key
+- `ticker` (String): Stock symbol
+- `indicator` (String): Indicator name
+- `action` (String): Trade action
+- `enter_price`, `exit_price` (Number): Prices
+- `enter_timestamp`, `exit_timestamp` (String): ISO timestamps
+- `profit_or_loss` (Number): Profit/loss in dollars
+- `enter_reason`, `exit_reason` (String): Reasons
+- `technical_indicators_for_enter`, `technical_indicators_for_exit` (Map)
+
+### Inactive Tickers Tables
+
+#### 3. InactiveTickersForDayTrading
+**Partition Key**: `ticker` (String)
+**Sort Key**: `timestamp` (String)
+
+Logs reasons why tickers were not traded:
+- `ticker` (String): Stock symbol
+- `indicator` (String): Indicator name
+- `timestamp` (String): ISO timestamp
+- `reason_not_to_enter_long` (String): Reason for long
+- `reason_not_to_enter_short` (String): Reason for short
+- `technical_indicators` (Map): Technical indicators at time of evaluation
+
+### Events Table
+
+#### 4. DayTraderEvents
+**Partition Key**: `date` (String, format: yyyy-mm-dd)
+**Sort Key**: `indicator` (String)
+
+Stores threshold adjustment events:
+- `date` (String): Trading date
+- `indicator` (String): Indicator name
+- `last_updated` (String): ISO timestamp (EST)
+- `threshold_change` (Map): Dictionary of threshold adjustments
+- `max_long_trades` (Number): Maximum long trades recommended
+- `max_short_trades` (Number): Maximum short trades recommended
+- `llm_response` (String): Full LLM analysis response
+
+### Other Tables
+
+#### 5. TickerBlackList
+**Partition Key**: `ticker` (String)
+- Excludes tickers from all trading operations
+
+#### 6. MABStats
+**Partition Key**: `indicator#ticker` (String)
+- Stores multi-armed bandit statistics for ticker selection
 
 ## Setup
 
 ### Prerequisites
 
-- Python 3.9+ (required for MCP library)
+- Python 3.9+
 - AWS credentials configured (for DynamoDB access)
-- Three DynamoDB tables must exist:
-  - `ActiveTradesForAutomatedWorkflow` (for standard trading strategy)
-  - `ActiveTickersForAutomatedDayTrader` (for momentum trading strategy)
-  - `TickerBlackList` (for blacklisted tickers)
+- AWS Bedrock access (for threshold adjustment service)
+- Unusual Whales API token (optional, for UW-Enhanced indicator)
+
+### Required DynamoDB Tables
+
+1. `ActiveTickersForAutomatedDayTrader` - Active trades (partition key: `ticker`)
+2. `CompletedTradesForMarketData` - Completed trades (partition key: `date`, sort key: `ticker#indicator`)
+3. `InactiveTickersForDayTrading` - Inactive ticker logs (partition key: `ticker`, sort key: `timestamp`)
+4. `DayTraderEvents` - Threshold adjustment events (partition key: `date`, sort key: `indicator`)
+5. `TickerBlackList` - Blacklisted tickers (partition key: `ticker`)
+6. `MABStats` - Multi-armed bandit statistics (partition key: `indicator#ticker`)
 
 ### Installation
 
@@ -85,10 +278,7 @@ The application consists of three main async services running concurrently:
 pip install -r requirements.txt
 ```
 
-2. Configure AWS credentials (for DynamoDB):
-
-   - Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables
-   - Or use AWS IAM role if running on EC2/ECS
+2. Configure environment variables (see Environment Variables section)
 
 3. Run the application:
 
@@ -113,6 +303,9 @@ heroku config:set MARKET_DATA_MCP_TOKEN=your_mcp_token
 heroku config:set AWS_ACCESS_KEY_ID=your_key
 heroku config:set AWS_SECRET_ACCESS_KEY=your_secret
 heroku config:set AWS_DEFAULT_REGION=us-east-1
+heroku config:set UW_API_TOKEN=your_uw_token  # Optional, for UW-Enhanced indicator
+heroku config:set REAL_TRADE_API_KEY=your_alpaca_key  # For Alpaca API fallback
+heroku config:set REAL_TRADE_SECRET_KEY=your_alpaca_secret
 ```
 
 3. Deploy:
@@ -129,141 +322,173 @@ heroku ps:scale worker=1
 
 ## Environment Variables
 
+### Required
+
 - `MARKET_DATA_MCP_URL`: MCP API base URL (default: https://market-data-analyzer-d1d18da61b50.herokuapp.com/mcp)
 - `MCP_AUTH_HEADER_NAME`: Authorization header name (default: Authorization)
-- `MARKET_DATA_MCP_TOKEN`: MCP API authentication token (required)
+- `MARKET_DATA_MCP_TOKEN`: MCP API authentication token
 - `AWS_ACCESS_KEY_ID`: AWS access key for DynamoDB
 - `AWS_SECRET_ACCESS_KEY`: AWS secret key for DynamoDB
 - `AWS_DEFAULT_REGION`: AWS region (default: us-east-1)
-- `DYNAMODB_TABLE_NAME`: DynamoDB table name for standard trades (default: ActiveTradesForAutomatedWorkflow)
+
+### Optional
+
+- `UW_API_TOKEN`: Unusual Whales API token (required for UW-Enhanced indicator)
+- `REAL_TRADE_API_KEY`: Alpaca API key (for fallback ATR calculations)
+- `REAL_TRADE_SECRET_KEY`: Alpaca API secret key
+- `WEBHOOK_URL`: Comma-separated list of webhook URLs for trade notifications
 - `DEBUG_DAY_TRADING`: Set to "true" to force market clock to always return open (for testing)
 
 ## MCP API Integration
 
 The application connects to the Market Data Analyzer MCP API:
 
-- Base URL: `https://market-data-analyzer-d1d18da61b50.herokuapp.com/mcp`
-- **Protocol**: Uses HTTP POST requests (MCP protocol discovery disabled due to server compatibility issues)
-- **Authentication**: Bearer token via `Authorization` header (or custom header name via `MCP_AUTH_HEADER_NAME`)
+- **Base URL**: `https://market-data-analyzer-d1d18da61b50.herokuapp.com/mcp`
+- **Protocol**: Uses HTTP POST requests (MCP protocol discovery disabled due to server compatibility)
+- **Authentication**: Bearer token via `Authorization` header
 
 ### Available MCP Tools
-
-The application uses the following MCP tools:
 
 - `get_market_clock`: Check if market is open
 - `get_alpaca_screened_tickers`: Get gainers, losers, and most active tickers
 - `get_quote`: Get current bid/ask prices for a ticker
 - `get_market_data`: Get market data including technical analysis and price history
-- `enter`: Determine if entry conditions are met (standard trading strategy)
-- `exit`: Determine if exit conditions are met (standard trading strategy)
+- `enter`: Determine if entry conditions are met (Deep Analyzer uses this)
+- `exit`: Determine if exit conditions are met (Deep Analyzer uses this)
 - `send_webhook_signal`: Send trading signals to external webhook endpoints
 
-## DynamoDB Tables
+## Risk Management
 
-### 1. ActiveTradesForAutomatedWorkflow (Standard Trading Strategy)
+### Stop Loss System
+- **Dynamic Stop Loss**: Based on 2.0x ATR (standardized across all indicators)
+- **Bounds**: Capped between -4% and -8% depending on stock price category
+- **Hard Stop**: Always applies, cannot be bypassed
 
-**Partition Key**: `ticker` (String)
+### Trailing Stop System
+- **Activation**: After reaching profit threshold (varies by indicator)
+- **Multiplier**: 1.5x ATR (standardized)
+- **Base Minimum**: 2.0% minimum trailing distance
+- **Short Adjustment**: 1.5x multiplier for shorts (wider stops)
+- **Protection**: Protects against losses from peak profit even if current profit becomes negative
 
-**Attributes**:
+### Position Sizing
+- **Base**: $2000 fixed position size
+- **Volatility Adjustment**: Reduced size for high-volatility stocks
+- **Penny Stock Risk**: Additional reduction for high-risk penny stocks
+- **Minimum**: Never less than $500
 
-- `ticker` (String): Stock symbol
-- `action` (String): "buy_to_open" or "sell_to_open"
-- `indicator` (String): Indicator name ("Automated Trading" for buy_to_open, "Automated workflow" for sell_to_open)
-- `enter_price` (Number): Entry price (ask price for buys, bid price for sells)
-- `enter_reason` (String): Reason for entry from MCP tool
-- `enter_response` (Map): Full response from `enter()` API call
-- `created_at` (String): ISO timestamp when trade was created
+### Entry Filters
+- **Momentum**: Minimum 1.5% momentum, maximum 15%
+- **Technical Indicators**: ADX ≥20, RSI ranges, stochastic confirmation
+- **Volume**: Must be >1.5x SMA
+- **Price**: Minimum $0.10
+- **Volatility**: ATR-based filters prevent extreme volatility entries
 
-### 2. ActiveTickersForAutomatedDayTrader (Momentum Trading Strategy)
+### Exit Conditions
+- **Profit Target**: 2x stop distance (e.g., 4% if stop is 2%)
+- **Stop Loss**: Hard stop at dynamic threshold
+- **Trailing Stop**: Activates after profit threshold, protects peak gains
+- **Signal Reversal**: Deep Analyzer exits on opposite signal
+- **Score Degradation**: Deep Analyzer exits if entry score drops >50%
+- **Time-Based**: End-of-day forced closure (15 minutes before close)
 
-**Partition Key**: `ticker` (String)
+## Threshold Adjustment Service
 
-**Attributes**:
+The Threshold Adjustment Service uses AWS Bedrock LLM to analyze why tickers are not entering trades and suggests threshold optimizations:
 
-- `ticker` (String): Stock symbol
-- `action` (String): "buy_to_open" or "sell_to_open"
-- `indicator` (String): Always "Momentum Trading"
-- `enter_price` (Number): Entry price (ask price for buys, bid price for sells)
-- `enter_reason` (String): Momentum calculation details (e.g., "Momentum: 0.25% change (early_avg: 100.50, recent_avg: 100.75)")
-- `created_at` (String): ISO timestamp when trade was created
+### Process
+1. Every 5 minutes during market hours, analyzes inactive tickers from last 5 minutes
+2. Groups tickers by rejection reason
+3. Calls AWS Bedrock LLM with current thresholds and rejection patterns
+4. LLM suggests threshold adjustments and optimal max trades
+5. Applies changes to indicator classes (in-memory)
+6. Stores event in `DayTraderEvents` table for audit trail
 
-### 3. TickerBlackList (Blacklisted Tickers)
+### Supported Adjustments
+- Momentum thresholds (min/max)
+- ADX threshold
+- RSI ranges
+- Volume requirements
+- Stop loss and trailing stop percentages
+- Entry score thresholds (Deep Analyzer)
+- Max daily trades (long and short separately)
 
-**Partition Key**: `ticker` (String)
-
-**Attributes**:
-
-- `ticker` (String): Stock symbol to blacklist
-
-**Usage**: Tickers in this table are automatically excluded from all trading operations (both entry and exit logic)
-
-## Trading Strategies Details
-
-### Standard Trading Strategy
-
-Uses MCP tools (`enter()` and `exit()`) to make trading decisions:
-
-- **Entry**: Calls `enter()` MCP tool which uses technical analysis to determine if entry conditions are met
-- **Exit**: Calls `exit()` MCP tool which uses technical analysis to determine if exit conditions are met
-- **Indicators**:
-  - "Automated Trading" for long positions (buy_to_open)
-  - "Automated workflow" for short positions (sell_to_open)
-
-### Momentum Trading Strategy
-
-Uses price momentum analysis to make trading decisions:
-
-- **Entry Logic**:
-  - Analyzes `datetime_price` array from market data
-  - Compares average of first 30% of prices vs last 30% of prices
-  - Upward momentum (>0.1% change with positive recent trend) → Long position
-  - Downward momentum (<-0.1% change with negative recent trend) → Short position
-- **Exit Logic**:
-  - Monitors current price vs entry price
-  - Exits when profit threshold is reached (default: 0.5%)
-  - Long trades: exit when profit ≥ 0.5%
-  - Short trades: exit when profit ≥ 0.5%
-- **Profit Threshold**: Configurable via `self.profit_threshold` in `MomentumTradingService` (default: 0.5%)
+### Table Schema
+- **Partition Key**: `date` (String, yyyy-mm-dd)
+- **Sort Key**: `indicator` (String)
+- Stores threshold changes, max trades, and full LLM response
 
 ## Logging
 
-The application uses Loguru for structured logging and logs to stdout with INFO level by default. Logs include:
+The application uses Loguru for structured logging:
 
-- Service initialization and startup
-- Market status checks
-- Entry/exit signals for both strategies
-- Webhook notifications
-- DynamoDB operations (add, get, delete)
-- Blacklist filtering operations
-- Tool discovery events
-- Errors and exceptions with full stack traces
+- **Service initialization and startup**
+- **Market status checks**
+- **Entry/exit signals for all indicators**
+- **Webhook notifications**
+- **DynamoDB operations** (add, get, delete, update)
+- **Threshold adjustments** (with success/failure status)
+- **Error handling** with full stack traces
+- **Performance metrics** (latency measurements)
 
 ## Error Handling
 
-The application includes comprehensive error handling:
+Comprehensive error handling throughout:
 
-- Network errors when calling MCP APIs (with retry logic)
-- DynamoDB operation failures (graceful degradation)
-- Invalid data handling (skips invalid trades)
-- Blacklist checks at multiple points (entry and exit)
-- Graceful shutdown on SIGINT/SIGTERM signals
-- Service-level error isolation (one service failure doesn't stop others)
+- **Network errors**: Retry logic for MCP API calls
+- **DynamoDB failures**: Graceful degradation with detailed error logging
+- **Invalid data**: Skips invalid trades with logging
+- **Market status**: Handles closed market scenarios
+- **Graceful shutdown**: SIGINT/SIGTERM signal handling
+- **Service isolation**: One service failure doesn't stop others (uses `return_exceptions=True`)
+- **HTTP session cleanup**: Proper resource management
+- **Thread safety**: Async locks for concurrent operations
 
 ## Key Design Decisions
 
-1. **Dual Strategy Architecture**: Separates standard (MCP-based) and momentum (algorithm-based) trading into independent services
-2. **Separate DynamoDB Tables**: Each strategy uses its own table to avoid conflicts and enable independent monitoring
-3. **Blacklist Support**: Centralized blacklist table prevents trading on specific tickers across all strategies
-4. **HTTP Fallback**: Uses HTTP POST requests instead of MCP protocol due to server compatibility issues
-5. **Concurrent Execution**: All services run concurrently using `asyncio.gather()` for optimal performance
-6. **Market-Aware**: All trading operations check market status before execution
+1. **Multi-Strategy Architecture**: Three independent indicators allow diversification and strategy comparison
+2. **Base Class Pattern**: Shared infrastructure reduces code duplication
+3. **Centralized Configuration**: `trading_config.py` ensures consistency across indicators
+4. **Thread-Safe Operations**: Async locks prevent race conditions
+5. **Timezone Standardization**: UTC internally, EST only for market-hour logic
+6. **MAB Integration**: Intelligent ticker selection based on historical performance
+7. **Dynamic Threshold Adjustment**: LLM-powered optimization adapts to market conditions
+8. **Comprehensive Filtering**: Multi-layer filters reduce false signals
+9. **Resource Management**: Shared HTTP sessions and proper cleanup
+10. **Observability**: Detailed logging and event tracking
+
+## Recent Improvements (Nov 2024)
+
+### Critical Bug Fixes
+- Fixed duplicate code blocks
+- Fixed inverted RSI filter logic for shorts
+- Fixed short exit pricing (now uses ask price, not bid)
+- Added missing success tracking for long trades
+- Fixed trailing stop to protect against losses from peak
+
+### High Priority Improvements
+- Added thread-safe daily trade counting with async locks
+- Fixed class-level mutable state using ClassVar
+- Standardized timezone usage (UTC internally)
+- Added entry_score storage for degradation checks
+- Added graceful shutdown handling with error monitoring
+
+### Standardization
+- Created centralized `trading_config.py` for ATR multipliers
+- Standardized all indicators to use same ATR multipliers
+- Improved error logging with detailed diagnostics
+
+### Resource Management
+- Optimized HTTP session usage (shared sessions)
+- Added session cleanup in stop() methods
+- Added LRU cache size limits (500 entries)
 
 ## Notes
 
 - The application runs continuously until stopped (SIGINT/SIGTERM)
-- All three services (Tool Discovery, Trading Service, Momentum Trading Service) run concurrently using asyncio
+- All services run concurrently using `asyncio.gather()`
+- Entry services run every 5 seconds, exit services run every 5 seconds
+- Threshold adjustment runs every 5 minutes during market hours
 - Market checks occur before all trading operations
-- Entry services run every 10 seconds, exit services run every 5 seconds
-- Tool discovery refreshes every 5 minutes (currently disabled, uses HTTP fallback)
-- Blacklisted tickers are filtered at multiple points: during ticker screening, before entry calls, and before exit calls
-- Momentum trades are prevented from duplicate entries (checks for existing active trades)
+- All timestamps stored in UTC internally
+- Golden tickers (exceptional opportunities) can bypass daily trade limits

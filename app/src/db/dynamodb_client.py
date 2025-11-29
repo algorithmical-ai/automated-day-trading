@@ -39,6 +39,7 @@ INACTIVE_TICKERS_FOR_DAY_TRADING_TABLE_NAME = "InactiveTickersForDayTrading"
 # Day trader events table for LLM threshold adjustments
 DAY_TRADER_EVENTS_TABLE_NAME = "DayTraderEvents"
 
+
 class DynamoDBClient:
     """Client for DynamoDB operations"""
 
@@ -51,12 +52,12 @@ class DynamoDBClient:
     _inactive_tickers_table = None
     _inactive_tickers_for_day_trading_table = None
     _day_trader_events_table = None
-    
+
     @classmethod
     def configure(cls):
         """Configure and pre-initialize DynamoDB client resources"""
         cls._ensure_tables()
-    
+
     @classmethod
     def _ensure_tables(cls):
         if cls._table:
@@ -75,10 +76,12 @@ class DynamoDBClient:
         cls._table = cls._dynamodb.Table(DYNAMODB_TABLE_NAME)
         cls._momentum_table = cls._dynamodb.Table(MOMENTUM_TRADING_TABLE_NAME)
         cls._blacklist_table = cls._dynamodb.Table(TICKER_BLACKLIST_TABLE_NAME)
-        cls._mab_table = cls._dynamodb.Table(MAB_TABLE_NAME)    
+        cls._mab_table = cls._dynamodb.Table(MAB_TABLE_NAME)
         cls._completed_trades_table = cls._dynamodb.Table(COMPLETED_TRADES_TABLE_NAME)
         cls._inactive_tickers_table = cls._dynamodb.Table(INACTIVE_TICKERS_TABLE_NAME)
-        cls._inactive_tickers_for_day_trading_table = cls._dynamodb.Table(INACTIVE_TICKERS_FOR_DAY_TRADING_TABLE_NAME)
+        cls._inactive_tickers_for_day_trading_table = cls._dynamodb.Table(
+            INACTIVE_TICKERS_FOR_DAY_TRADING_TABLE_NAME
+        )
         cls._day_trader_events_table = cls._dynamodb.Table(DAY_TRADER_EVENTS_TABLE_NAME)
 
     @classmethod
@@ -243,21 +246,21 @@ class DynamoDBClient:
                 "peak_profit_percent": cls._convert_to_decimal(0.0),  # Initialize to 0%
                 "created_at": datetime.utcnow().isoformat(),
             }
-            
+
             # Add dynamic stop loss if provided
             if dynamic_stop_loss is not None:
                 item["dynamic_stop_loss"] = cls._convert_to_decimal(dynamic_stop_loss)
-            
+
             # Add entry score if provided (for Deep Analyzer degradation checks)
             if entry_score is not None:
                 item["entry_score"] = cls._convert_to_decimal(entry_score)
-            
+
             # Add technical indicators if provided
             if technical_indicators_for_enter:
                 item["technical_indicators_for_enter"] = cls._convert_to_decimal(
                     technical_indicators_for_enter
                 )
-            
+
             cls._momentum_table.put_item(Item=item)
             logger.info(f"Added momentum trade to DynamoDB: {ticker} - {action}")
             return True
@@ -296,16 +299,18 @@ class DynamoDBClient:
             if "Item" not in response:
                 logger.warning(f"Momentum trade not found for ticker: {ticker}")
                 return False
-            
+
             item_indicator = response["Item"].get("indicator")
             if item_indicator != indicator:
                 logger.warning(
                     f"Indicator mismatch for {ticker}: expected {indicator}, got {item_indicator}"
                 )
                 return False
-            
+
             cls._momentum_table.delete_item(Key={"ticker": ticker})
-            logger.info(f"Deleted momentum trade from DynamoDB: {ticker} (indicator: {indicator})")
+            logger.info(
+                f"Deleted momentum trade from DynamoDB: {ticker} (indicator: {indicator})"
+            )
             return True
         except Exception as e:
             logger.error(f"Error deleting momentum trade from DynamoDB: {str(e)}")
@@ -323,14 +328,14 @@ class DynamoDBClient:
             if "Item" not in response:
                 logger.warning(f"Momentum trade not found for ticker: {ticker}")
                 return False
-            
+
             item_indicator = response["Item"].get("indicator")
             if item_indicator != indicator:
                 logger.warning(
                     f"Indicator mismatch for {ticker}: expected {indicator}, got {item_indicator}"
                 )
                 return False
-            
+
             # Get EST timezone
             est_tz = pytz.timezone("US/Eastern")
             # Get current time in EST
@@ -375,14 +380,14 @@ class DynamoDBClient:
             if "Item" not in response:
                 logger.warning(f"Momentum trade not found for ticker: {ticker}")
                 return False
-            
+
             item_indicator = response["Item"].get("indicator")
             if item_indicator != indicator:
                 logger.warning(
                     f"Indicator mismatch for {ticker}: expected {indicator}, got {item_indicator}"
                 )
                 return False
-            
+
             # Get EST timezone
             est_tz = pytz.timezone("US/Eastern")
             # Get current time in EST
@@ -412,9 +417,7 @@ class DynamoDBClient:
             )
             return True
         except Exception as e:
-            logger.error(
-                f"Error updating trailing stop for {ticker}: {str(e)}"
-            )
+            logger.error(f"Error updating trailing stop for {ticker}: {str(e)}")
             return False
 
     # Methods for TickerBlackList table
@@ -809,11 +812,11 @@ class DynamoDBClient:
     async def get_completed_trade_count(cls, date: str, indicator: str) -> int:
         """
         Get the count of completed trades for a specific date and indicator
-        
+
         Args:
             date: Date in yyyy-mm-dd format
             indicator: Indicator name
-            
+
         Returns:
             Number of completed trades (0 if not found or error)
         """
@@ -855,7 +858,9 @@ class DynamoDBClient:
             return False
 
     @classmethod
-    async def batch_check_tickers_exist_in_inactive(cls, tickers: List[str]) -> Dict[str, bool]:
+    async def batch_check_tickers_exist_in_inactive(
+        cls, tickers: List[str]
+    ) -> Dict[str, bool]:
         """
         Batch check if multiple tickers exist in InactiveTickers table using parallel async calls
 
@@ -871,9 +876,10 @@ class DynamoDBClient:
         try:
             # Use asyncio.gather to check all tickers in parallel
             import asyncio
+
             tasks = [cls.ticker_exists_in_inactive(ticker) for ticker in tickers]
             results = await asyncio.gather(*tasks)
-            
+
             return dict(zip(tickers, results))
         except Exception as e:
             logger.error(f"Error batch checking tickers in InactiveTickers: {str(e)}")
@@ -884,7 +890,11 @@ class DynamoDBClient:
             return result
 
     @classmethod
-    async def add_ticker_to_inactive(cls, ticker: str, reason: str = "Auto-added from Alpaca screener (most actives/movers)") -> bool:
+    async def add_ticker_to_inactive(
+        cls,
+        ticker: str,
+        reason: str = "Auto-added from Alpaca screener (most actives/movers)",
+    ) -> bool:
         """
         Add a ticker to InactiveTickers table if it doesn't exist
 
@@ -898,7 +908,9 @@ class DynamoDBClient:
         try:
             # Check if ticker already exists
             if await cls.ticker_exists_in_inactive(ticker):
-                logger.debug(f"Ticker {ticker.upper()} already exists in InactiveTickers")
+                logger.debug(
+                    f"Ticker {ticker.upper()} already exists in InactiveTickers"
+                )
                 return False
 
             # Add ticker with minimal structure
@@ -917,13 +929,13 @@ class DynamoDBClient:
                 "ttl": ttl_timestamp,
                 # Add minimal details structure to match expected format
                 "details": {
-                        "checks": {},
-                        "conditions_met": "0/5",
-                        "trend_analysis": { # noqa: C0301
-                                "description": "Auto-added from screener",
-                                "favorable": False,
-                                "strength": 0.0,
-                            } # noqa: C0301
+                    "checks": {},
+                    "conditions_met": "0/5",
+                    "trend_analysis": {  # noqa: C0301
+                        "description": "Auto-added from screener",
+                        "favorable": False,
+                        "strength": 0.0,
+                    },  # noqa: C0301
                 },
             }
 
@@ -936,14 +948,18 @@ class DynamoDBClient:
         except Exception as e:
             logger.error(f"Error adding ticker to InactiveTickers: {str(e)}")
             return False
-        
+
     @classmethod
     async def get_all_inactive_tickers(cls) -> List[str]:
         """Get all inactive tickers from InactiveTickers table"""
         try:
             cls._ensure_tables()
             response = cls._inactive_tickers_table.scan()
-            tickers = [item.get("ticker") for item in response.get("Items", []) if item.get("ticker")]
+            tickers = [
+                item.get("ticker")
+                for item in response.get("Items", [])
+                if item.get("ticker")
+            ]
             return tickers
         except Exception as e:
             logger.error(f"Error getting all inactive tickers from DynamoDB: {str(e)}")
@@ -961,49 +977,50 @@ class DynamoDBClient:
     ) -> bool:
         """
         Log why a ticker is not entering a trade in InactiveTickersForDayTrading table
-        
+
         Args:
             ticker: Ticker symbol (partition key)
             indicator: Indicator name (sort key)
             reason_not_to_enter_long: Reason for not entering long position
             reason_not_to_enter_short: Reason for not entering short position
             technical_indicators: Technical indicators data
-            
+
         Returns:
             True if logged successfully, False otherwise
         """
         try:
             cls._ensure_tables()
-            
+
             # Use EST timezone for timestamps (NYSE trading timezone)
             est_tz = pytz.timezone("America/New_York")
             last_updated_est = datetime.now(est_tz).isoformat()
-            
+
             item = {
                 "ticker": ticker,
                 "indicator": indicator,
                 "last_updated": last_updated_est,
             }
-            
+
             if reason_not_to_enter_long is not None:
                 item["reason_not_to_enter_long"] = reason_not_to_enter_long
-                
+
             if reason_not_to_enter_short is not None:
                 item["reason_not_to_enter_short"] = reason_not_to_enter_short
-                
+
             if technical_indicators:
                 # Convert technical indicators, removing datetime_price if present
                 tech_indicators_clean = {
-                    k: v for k, v in technical_indicators.items()
+                    k: v
+                    for k, v in technical_indicators.items()
                     if k != "datetime_price"
                 }
                 item["technical_indicators"] = tech_indicators_clean
-            
+
             if is_shortable is not None:
                 item["is_shortable"] = is_shortable
-            
+
             item = cls._ensure_all_floats_converted(item)
-            
+
             cls._inactive_tickers_for_day_trading_table.put_item(Item=item)
             logger.debug(
                 f"Logged inactive ticker reason for {ticker} ({indicator}): "
@@ -1022,11 +1039,11 @@ class DynamoDBClient:
     ) -> Optional[bool]:
         """
         Get is_shortable value from InactiveTickersForDayTrading table.
-        
+
         Args:
             ticker: Ticker symbol
             indicator: Indicator name
-            
+
         Returns:
             is_shortable value if found, None otherwise
         """
@@ -1053,21 +1070,21 @@ class DynamoDBClient:
     ) -> List[Dict[str, Any]]:
         """
         Get inactive tickers for a specific indicator within the last N minutes
-        
+
         Args:
             indicator: Indicator name
             minutes_window: Number of minutes to look back (default: 5)
-            
+
         Returns:
             List of inactive ticker records
         """
         try:
             cls._ensure_tables()
-            
+
             # Calculate cutoff time
             cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=minutes_window)
             cutoff_iso = cutoff_time.isoformat()
-            
+
             # Scan table and filter by indicator and time
             response = cls._inactive_tickers_for_day_trading_table.scan(
                 FilterExpression="#ind = :ind AND #lu >= :cutoff",
@@ -1080,17 +1097,15 @@ class DynamoDBClient:
                     ":cutoff": cutoff_iso,
                 },
             )
-            
+
             items = []
             for item in response.get("Items", []):
                 converted_item = cls._convert_from_decimal(item)
                 items.append(converted_item)
-            
+
             return items
         except Exception as e:
-            logger.error(
-                f"Error getting inactive tickers for {indicator}: {str(e)}"
-            )
+            logger.error(f"Error getting inactive tickers for {indicator}: {str(e)}")
             return []
 
     @classmethod
@@ -1105,7 +1120,7 @@ class DynamoDBClient:
     ) -> bool:
         """
         Store a day trader event (LLM threshold adjustment) in DayTraderEvents table
-        
+
         Args:
             date: Date in yyyy-mm-dd format (partition key)
             indicator: Indicator name (sort key)
@@ -1113,16 +1128,16 @@ class DynamoDBClient:
             max_long_trades: Maximum long trades
             max_short_trades: Maximum short trades
             llm_response: Optional LLM response text
-            
+
         Returns:
             True if stored successfully, False otherwise
         """
         try:
             cls._ensure_tables()
-            
+
             est_tz = pytz.timezone("America/New_York")
             last_updated_est = datetime.now(est_tz).isoformat()
-            
+
             item = {
                 "date": date,
                 "indicator": indicator,
@@ -1131,20 +1146,26 @@ class DynamoDBClient:
                 "max_long_trades": max_long_trades,
                 "max_short_trades": max_short_trades,
             }
-            
+
             if llm_response:
                 item["llm_response"] = llm_response
-            
+
             item = cls._ensure_all_floats_converted(item)
-            
+
             cls._day_trader_events_table.put_item(Item=item)
             logger.info(
-                f"Stored day trader event for {indicator} on {date}: "
-                f"max_long={max_long_trades}, max_short={max_short_trades}"
+                f"✅ Stored day trader event in DayTraderEvents table: "
+                f"date={date}, indicator={indicator}, "
+                f"max_long={max_long_trades}, max_short={max_short_trades}, "
+                f"threshold_changes={len(threshold_change) if threshold_change else 0}"
             )
             return True
         except Exception as e:
             logger.error(
-                f"Error storing day trader event for {indicator} on {date}: {str(e)}"
+                f"❌ Error storing day trader event for {indicator} on {date}: {str(e)}",
+                exc_info=True,
+            )
+            logger.error(
+                f"Item that failed to store: {json.dumps(item, default=str)[:500]}"
             )
             return False
