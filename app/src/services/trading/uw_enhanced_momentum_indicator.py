@@ -1125,12 +1125,24 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if not market_data_response:
                 continue
 
-            technical_analysis = market_data_response.get("technical_analysis", {})
-            current_price = technical_analysis.get("close_price", 0.0)
-            atr = technical_analysis.get("atr", 0)
+            quote_response = await MCPClient.get_quote(ticker)
+            if not quote_response:
+                logger.warning(
+                    f"Failed to get quote for {ticker} for exit check - will retry in next cycle"
+                )
+                continue
+
+            quote_data = quote_response.get("quote", {})
+            quotes = quote_data.get("quotes", {})
+            ticker_quote = quotes.get(ticker, {})
+            current_price = ticker_quote.get("bp", 0.0)  # Bid price for exit (selling)
 
             if current_price <= 0:
+                logger.warning(f"Failed to get valid current price for {ticker}")
                 continue
+
+            technical_analysis = market_data_response.get("technical_analysis", {})
+            atr = technical_analysis.get("atr", 0)
 
             profit_percent = cls._calculate_profit_percent(
                 enter_price, current_price, original_action

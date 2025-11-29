@@ -782,13 +782,13 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 exit_price = exit_data.get("current_price", 0.0) if exit_data else 0.0
 
                 if exit_price <= 0:
-                    # Fallback: get current price from market data
-                    market_data_response = await MCPClient.get_market_data(ticker)
-                    if market_data_response:
-                        technical_analysis = market_data_response.get(
-                            "technical_analysis", {}
-                        )
-                        exit_price = technical_analysis.get("close_price", 0.0)
+                    # Fallback: get current price from quote
+                    quote_response = await MCPClient.get_quote(ticker)
+                    if quote_response:
+                        quote_data = quote_response.get("quote", {})
+                        quotes = quote_data.get("quotes", {})
+                        ticker_quote = quotes.get(ticker, {})
+                        exit_price = ticker_quote.get("bp", 0.0)  # Bid price for exit (selling)
 
                 if exit_price <= 0:
                     logger.warning(f"Failed to get valid exit price for {ticker}")
