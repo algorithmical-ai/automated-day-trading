@@ -40,8 +40,8 @@ class MomentumIndicator(BaseTradingIndicator):
     min_adx_threshold: float = 20.0
     rsi_min_for_long: float = 45.0  # Not oversold (avoiding catching falling knives)
     rsi_max_for_long: float = 70.0  # Not overbought (avoiding tops)
-    rsi_overbought_for_short: float = (
-        50.0  # Lowered to 50.0 to allow shorting stocks with negative momentum (falling RSI)
+    rsi_min_for_short: float = (
+        50.0  # Minimum RSI to short (avoid oversold bounces, allow shorting stocks with negative momentum)
     )
     profit_target_strong_momentum: float = 5.0
     profit_target_multiplier: float = 2.0  # Profit target = 2x stop distance
@@ -721,12 +721,12 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"RSI {rsi:.1f} outside acceptable range [{cls.rsi_min_for_long}-{cls.rsi_max_for_long}] for long entry",
             )
 
-        # For shorts, we want to avoid shorting oversold stocks (RSI < 30) as they may bounce
+        # For shorts, we want to avoid shorting oversold stocks (RSI < 50) as they may bounce
         # But we allow shorting stocks with declining momentum even if RSI is moderate (50+)
-        if is_short and rsi < cls.rsi_overbought_for_short:
+        if is_short and rsi < cls.rsi_min_for_short:
             return (
                 False,
-                f"RSI too low for short: {rsi:.2f} < {cls.rsi_overbought_for_short} (may be oversold, risk of bounce)",
+                f"RSI too low for short: {rsi:.2f} < {cls.rsi_min_for_short} (may be oversold, risk of bounce)",
             )
 
         # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
@@ -735,12 +735,12 @@ class MomentumIndicator(BaseTradingIndicator):
             stoch_k = stoch.get("k", 50.0) if isinstance(stoch, dict) else 50.0
             stoch_d = stoch.get("d", 50.0) if isinstance(stoch, dict) else 50.0
 
-            # Don't short if stochastic is still bullish (K > D and K > 60)
-            # This indicates upward momentum is still present
-            if stoch_k > stoch_d and stoch_k > 60:
+            # Don't short if stochastic is still bullish (K > D means upward momentum present)
+            # This prevents shorting during active bullish momentum crossovers
+            if stoch_k > stoch_d:
                 return (
                     False,
-                    f"Stochastic still bullish for short: K={stoch_k:.2f} > D={stoch_d:.2f} and K > 60 (upward momentum present)",
+                    f"Stochastic not bearish for short: K={stoch_k:.2f} > D={stoch_d:.2f} (upward momentum still present)",
                 )
 
         # Check for mean reversion risk (Bollinger Band extremes)
@@ -1290,6 +1290,10 @@ class MomentumIndicator(BaseTradingIndicator):
                         f"attempting to preempt for exceptional trade {ticker} "
                         f"(momentum: {momentum_score:.2f})"
                     )
+                    # Note: There's a potential race condition between preemption and entry.
+                    # Another concurrent process could claim the slot between preempt and enter.
+                    # For production robustness, consider using DynamoDB conditional writes
+                    # or an asyncio.Lock to make preemption+entry atomic.
                     preempted = await cls._preempt_low_profit_trade(
                         ticker, momentum_score
                     )
@@ -1411,6 +1415,10 @@ class MomentumIndicator(BaseTradingIndicator):
                         f"attempting to preempt for exceptional trade {ticker} "
                         f"(momentum: {momentum_score:.2f})"
                     )
+                    # Note: There's a potential race condition between preemption and entry.
+                    # Another concurrent process could claim the slot between preempt and enter.
+                    # For production robustness, consider using DynamoDB conditional writes
+                    # or an asyncio.Lock to make preemption+entry atomic.
                     preempted = await cls._preempt_low_profit_trade(
                         ticker, abs(momentum_score)
                     )
