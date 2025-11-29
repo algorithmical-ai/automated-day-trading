@@ -40,11 +40,8 @@ class MomentumIndicator(BaseTradingIndicator):
     min_adx_threshold: float = 20.0
     rsi_min_for_long: float = 45.0  # Not oversold (avoiding catching falling knives)
     rsi_max_for_long: float = 70.0  # Not overbought (avoiding tops)
-    rsi_oversold_for_long: float = (
-        40.0  # Kept for backward compatibility, but using rsi_min/max_for_long instead
-    )
     rsi_overbought_for_short: float = (
-        60.0  # Lowered from 70.0 to 60.0 per judge recommendation
+        50.0  # Lowered to 50.0 to allow shorting stocks with negative momentum (falling RSI)
     )
     profit_target_strong_momentum: float = 5.0
     profit_target_multiplier: float = 2.0  # Profit target = 2x stop distance
@@ -184,7 +181,8 @@ class MomentumIndicator(BaseTradingIndicator):
         trailing_stop = atr_percent * 2.5
 
         # Bounds: minimum 2%, maximum 8% for penny stocks
-        if enter_price < 5.0:  # Penny stock threshold
+        # Use consistent threshold with max_stock_price_for_penny_treatment
+        if enter_price < cls.max_stock_price_for_penny_treatment:
             trailing_stop = max(3.0, min(8.0, trailing_stop))
         else:
             trailing_stop = max(2.0, min(5.0, trailing_stop))
@@ -723,10 +721,12 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"RSI {rsi:.1f} outside acceptable range [{cls.rsi_min_for_long}-{cls.rsi_max_for_long}] for long entry",
             )
 
-        if is_short and rsi <= cls.rsi_overbought_for_short:
+        # For shorts, we want to avoid shorting oversold stocks (RSI < 30) as they may bounce
+        # But we allow shorting stocks with declining momentum even if RSI is moderate (50+)
+        if is_short and rsi < cls.rsi_overbought_for_short:
             return (
                 False,
-                f"RSI too low for short: {rsi:.2f} <= {cls.rsi_overbought_for_short} (not overbought enough)",
+                f"RSI too low for short: {rsi:.2f} < {cls.rsi_overbought_for_short} (may be oversold, risk of bounce)",
             )
 
         # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
@@ -1612,7 +1612,17 @@ class MomentumIndicator(BaseTradingIndicator):
             quote_data = quote_response.get("quote", {})
             quotes = quote_data.get("quotes", {})
             ticker_quote = quotes.get(ticker, {})
-            current_price = ticker_quote.get("bp", 0.0)  # Bid price for exit (selling)
+
+            # Use correct price for exit: bid for longs (selling), ask for shorts (buying to cover)
+            is_short = original_action == "sell_to_open"
+            if is_short:
+                current_price = ticker_quote.get(
+                    "ap", 0.0
+                )  # Ask price for short exit (buying to cover)
+            else:
+                current_price = ticker_quote.get(
+                    "bp", 0.0
+                )  # Bid price for long exit (selling)
 
             if current_price <= 0:
                 logger.warning(f"Failed to get valid current price for {ticker}")
@@ -1681,17 +1691,18 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"Exit signal for {ticker} - losing trade: {profit_percent:.2f}%"
                 )
 
-            elif peak_profit_percent > 0 and profit_percent > 0:
-                # Trailing stop should only protect profits, not trigger on losses
-                # Tiered trailing stop activation based on profit level
+            elif peak_profit_percent > 0:
+                # Trailing stop protects against drops from peak profit
+                # Check if we should apply trailing stop even if currently at a loss
+                # Tiered trailing stop activation based on peak profit level
                 trailing_stop_distance = cls._calculate_trailing_stop_activation(
-                    profit_percent, stop_loss_threshold
+                    peak_profit_percent, stop_loss_threshold
                 )
                 if trailing_stop_distance is None:
-                    # No trailing stop yet (profit < 0.5%)
+                    # No trailing stop yet (peak profit < 0.5%)
                     logger.debug(
                         f"Trailing stop not active for {ticker}: "
-                        f"profit {profit_percent:.2f}% < 0.5% activation threshold"
+                        f"peak profit {peak_profit_percent:.2f}% < 0.5% activation threshold"
                     )
                 elif peak_profit_percent >= cls.trailing_stop_activation_profit:
                     # Check if trailing stop should be active (cooling-off period)
@@ -1780,7 +1791,7 @@ class MomentumIndicator(BaseTradingIndicator):
                                     * cls.trailing_stop_penny_stock_multiplier
                                 )
 
-                        # Trailing stop should only protect profits (already checked at elif level)
+                        # Trailing stop protects against drops from peak (can trigger even if currently at loss)
                         drop_from_peak = peak_profit_percent - profit_percent
                         if drop_from_peak >= dynamic_trailing_stop:
                             should_exit = True
