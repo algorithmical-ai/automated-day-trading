@@ -111,6 +111,21 @@ class MomentumIndicator(BaseTradingIndicator):
         return "Momentum Trading"
 
     @classmethod
+    def stop(cls):
+        """Stop the trading indicator and close HTTP session"""
+        super().stop()
+        if cls._alpaca_session and not cls._alpaca_session.closed:
+            # Close session in a task to avoid blocking
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(cls._alpaca_session.close())
+                else:
+                    loop.run_until_complete(cls._alpaca_session.close())
+            except Exception as e:
+                logger.warning(f"Error closing Alpaca session: {e}")
+
+    @classmethod
     def _is_near_market_close(cls) -> bool:
         """
         Check if we're within the specified minutes before market close.

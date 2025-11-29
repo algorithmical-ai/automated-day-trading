@@ -55,9 +55,8 @@ class BaseTradingIndicator(ABC):
         cls.daily_trades_date = None
         # Initialize class-level mutable state properly for each subclass
         cls.ticker_exit_timestamps = {}
-        # Initialize lock for thread-safe daily count updates
-        if cls._daily_count_lock is None:
-            cls._daily_count_lock = asyncio.Lock()
+        # Always initialize lock for thread-safe daily count updates
+        cls._daily_count_lock = asyncio.Lock()
 
     @classmethod
     def stop(cls):
@@ -105,10 +104,6 @@ class BaseTradingIndicator(ABC):
     @classmethod
     async def _increment_daily_trade_count(cls):
         """Increment daily trade counter (thread-safe)"""
-        # Ensure lock is initialized
-        if cls._daily_count_lock is None:
-            cls._daily_count_lock = asyncio.Lock()
-        
         async with cls._daily_count_lock:
             today = date.today().isoformat()
 

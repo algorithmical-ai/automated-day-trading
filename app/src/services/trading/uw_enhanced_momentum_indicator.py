@@ -65,8 +65,8 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     rsi_oversold_for_long: float = (
         40.0  # Kept for backward compatibility, but using rsi_min/max_for_long instead
     )
-    rsi_overbought_for_short: float = (
-        60.0  # Lowered from 70.0 to 60.0 per judge recommendation
+    rsi_min_for_short: float = (
+        60.0  # Minimum RSI to short (avoid oversold bounces, require some strength)
     )
     profit_target_strong_momentum: float = 5.0
     profit_target_multiplier: float = 2.0  # Profit target = 2x stop distance
@@ -92,6 +92,21 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     @classmethod
     def indicator_name(cls) -> str:
         return "UW-Enhanced Momentum Trading"
+
+    @classmethod
+    def stop(cls):
+        """Stop the trading indicator and close HTTP session"""
+        super().stop()
+        if cls._alpaca_session and not cls._alpaca_session.closed:
+            # Close session in a task to avoid blocking
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(cls._alpaca_session.close())
+                else:
+                    loop.run_until_complete(cls._alpaca_session.close())
+            except Exception as e:
+                logger.warning(f"Error closing Alpaca session: {e}")
 
     @classmethod
     def _calculate_atr_percent(cls, atr: float, current_price: float) -> float:
@@ -466,10 +481,10 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 f"RSI {rsi:.1f} outside acceptable range [{cls.rsi_min_for_long}-{cls.rsi_max_for_long}] for long entry",
             )
 
-        if is_short and rsi < cls.rsi_overbought_for_short:
+        if is_short and rsi < cls.rsi_min_for_short:
             return (
                 False,
-                f"RSI too low for short: {rsi:.2f} < {cls.rsi_overbought_for_short} (need overbought conditions)",
+                f"RSI too low for short: {rsi:.2f} < {cls.rsi_min_for_short} (avoid oversold bounces)",
             )
 
         # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
@@ -1226,7 +1241,13 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             quote_data = quote_response.get("quote", {})
             quotes = quote_data.get("quotes", {})
             ticker_quote = quotes.get(ticker, {})
-            current_price = ticker_quote.get("bp", 0.0)  # Bid price for exit (selling)
+            
+            # Use correct price for exit: bid for longs (selling), ask for shorts (buying to cover)
+            is_short = original_action == "sell_to_open"
+            if is_short:
+                current_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit (buying to cover)
+            else:
+                current_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit (selling)
 
             if current_price <= 0:
                 logger.warning(f"Failed to get valid current price for {ticker}")

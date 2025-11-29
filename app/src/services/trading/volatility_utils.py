@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional
 
 from app.src.common.loguru_logger import logger
+from app.src.services.trading.trading_config import (
+    ATR_TRAILING_STOP_MULTIPLIER_LEGACY,
+    ATR_STOP_LOSS_MULTIPLIER_VOLATILITY_UTILS,
+)
 
 
 class VolatilityUtils:
@@ -19,7 +23,8 @@ class VolatilityUtils:
     MID_PRICE_THRESHOLD = 10.0  # Stocks below $10
 
     # ATR-based trailing stop multipliers
-    ATR_TRAILING_STOP_MULTIPLIER = 2.5  # Use 2.5x ATR for trailing stop
+    # Note: Imported from trading_config for consistency, but keeping as class attribute for backward compatibility
+    ATR_TRAILING_STOP_MULTIPLIER = ATR_TRAILING_STOP_MULTIPLIER_LEGACY  # Use 2.5x ATR for trailing stop
 
     # Minimum holding periods (seconds) before trailing stop activates
     PENNY_STOCK_MIN_HOLD_SECONDS = 180  # 3 minutes for penny stocks
@@ -111,8 +116,8 @@ class VolatilityUtils:
 
         atr_percent = cls.calculate_atr_percent(atr, enter_price)
 
-        # Base stop loss on 3x ATR
-        dynamic_stop = -(atr_percent * 3.0)
+        # Base stop loss on ATR multiplier from config (3.0x for VolatilityUtils)
+        dynamic_stop = -(atr_percent * ATR_STOP_LOSS_MULTIPLIER_VOLATILITY_UTILS)
 
         # Apply bounds based on price category
         if enter_price < cls.PENNY_STOCK_THRESHOLD:

@@ -10,6 +10,7 @@ API Documentation: https://api.unusualwhales.com/docs
 
 import os
 import asyncio
+from collections import OrderedDict
 from datetime import datetime, date, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from enum import Enum
@@ -805,26 +806,39 @@ _client_instance: Optional[UnusualWhalesClient] = None
 
 
 class UWFlowCache:
-    """Cache UW flow data to reduce API calls"""
+    """Cache UW flow data to reduce API calls with LRU eviction"""
     
-    _cache: Dict[str, Tuple[datetime, Dict]] = {}
+    _cache: OrderedDict = OrderedDict()
     _cache_ttl_seconds = 60  # 1 minute cache
+    _max_cache_size = 500  # Maximum number of cached entries
     
     @classmethod
     async def get_flow_sentiment(cls, ticker: str) -> Tuple[FlowSentiment, Dict]:
-        """Get flow sentiment with caching"""
+        """Get flow sentiment with caching and LRU eviction"""
         now = datetime.now(timezone.utc)
         
+        # Check cache (move to end if found - LRU)
         if ticker in cls._cache:
             cached_time, cached_data = cls._cache[ticker]
             if (now - cached_time).total_seconds() < cls._cache_ttl_seconds:
+                # Move to end (most recently used)
+                cls._cache.move_to_end(ticker)
                 return cached_data["sentiment"], cached_data["details"]
+            else:
+                # Expired - remove it
+                del cls._cache[ticker]
         
         # Cache miss - fetch fresh
         client = get_unusual_whales_client()
         sentiment, details = await client.analyze_flow_sentiment(ticker)
         
+        # Add to cache (at end - most recently used)
         cls._cache[ticker] = (now, {"sentiment": sentiment, "details": details})
+        
+        # Evict oldest entries if over limit
+        while len(cls._cache) > cls._max_cache_size:
+            cls._cache.popitem(last=False)  # Remove oldest (first) item
+        
         return sentiment, details
 
 
