@@ -26,10 +26,8 @@ class MomentumIndicator(BaseTradingIndicator):
     profit_threshold: float = 1.5
     top_k: int = 2
     exceptional_momentum_threshold: float = 5.0
-    min_momentum_threshold: float = 0.2  # Raised from 3.0% to 0.2% for stronger signals
-    max_momentum_threshold: float = (
-        50.0  # Avoid entering on extreme momentum (likely at peak)
-    )
+    min_momentum_threshold: float = 1.5  # Meaningful momentum (not noise)
+    max_momentum_threshold: float = 15.0  # Reduced from 50% - 15%+ is already extreme
     min_daily_volume: int = 1000
     min_volume_ratio: float = 1.5  # Volume must be >1.5x SMA for entry
     stop_loss_threshold: float = (
@@ -40,8 +38,10 @@ class MomentumIndicator(BaseTradingIndicator):
     )
     trailing_stop_short_multiplier: float = 1.5  # Wider trailing stop for shorts (3-4%)
     min_adx_threshold: float = 20.0
+    rsi_min_for_long: float = 45.0  # Not oversold (avoiding catching falling knives)
+    rsi_max_for_long: float = 70.0  # Not overbought (avoiding tops)
     rsi_oversold_for_long: float = (
-        40.0  # Increased from 35.0 - require more oversold for longs
+        40.0  # Kept for backward compatibility, but using rsi_min/max_for_long instead
     )
     rsi_overbought_for_short: float = (
         60.0  # Lowered from 70.0 to 60.0 per judge recommendation
@@ -49,7 +49,7 @@ class MomentumIndicator(BaseTradingIndicator):
     profit_target_strong_momentum: float = 5.0
     profit_target_multiplier: float = 2.0  # Profit target = 2x stop distance
     trailing_stop_activation_profit: float = (
-        1.0  # Activate trailing stop after +1% profit
+        0.5  # Activate trailing stop after +0.5% profit (tiered system)
     )
     max_entry_hour_et: int = 15  # No entries after 3:00 PM ET (15:00)
     min_holding_period_seconds: int = (
@@ -145,6 +145,22 @@ class MomentumIndicator(BaseTradingIndicator):
         if current_price <= 0 or atr <= 0:
             return 0.0
         return (atr / current_price) * 100
+
+    @classmethod
+    def _calculate_trailing_stop_activation(
+        cls, profit_percent: float, stop_loss: float
+    ) -> Optional[float]:
+        """Dynamic trailing stop that tightens as profit increases"""
+        stop_distance = abs(stop_loss)
+
+        if profit_percent < 0.5:
+            return None  # No trailing stop yet
+        elif profit_percent < stop_distance * 0.5:  # Less than 50% of target
+            return stop_distance * 0.8  # Wide trailing (80% of stop distance)
+        elif profit_percent < stop_distance:  # Less than 100% of target
+            return stop_distance * 0.5  # Medium trailing
+        else:  # Beyond stop distance in profit
+            return stop_distance * 0.3  # Tight trailing to lock in gains
 
     @classmethod
     def _calculate_volatility_adjusted_trailing_stop(
@@ -700,10 +716,11 @@ class MomentumIndicator(BaseTradingIndicator):
         is_long = momentum_score > 0
         is_short = momentum_score < 0
 
-        if is_long and rsi >= cls.rsi_oversold_for_long:
+        # For momentum longs, you want RSI showing strength but not exhaustion
+        if is_long and (rsi < cls.rsi_min_for_long or rsi > cls.rsi_max_for_long):
             return (
                 False,
-                f"RSI too high for long: {rsi:.2f} >= {cls.rsi_oversold_for_long} (not oversold enough)",
+                f"RSI {rsi:.1f} outside acceptable range [{cls.rsi_min_for_long}-{cls.rsi_max_for_long}] for long entry",
             )
 
         if is_short and rsi <= cls.rsi_overbought_for_short:
@@ -737,6 +754,34 @@ class MomentumIndicator(BaseTradingIndicator):
             True,
             f"Passed all quality filters (ADX: {adx:.2f}, RSI: {rsi:.2f}, {volatility_reason})",
         )
+
+    @classmethod
+    def _confirm_trend_structure(
+        cls, prices: List[float], is_long: bool
+    ) -> Tuple[bool, str]:
+        """Confirm trend structure with swing highs/lows"""
+        if len(prices) < 10:
+            return True, "Insufficient data for structure check"
+
+        # Find local peaks and troughs (simplified)
+        recent_prices = prices[-20:] if len(prices) >= 20 else prices
+        mid_idx = len(recent_prices) // 2
+
+        first_half_high = max(recent_prices[:mid_idx])
+        first_half_low = min(recent_prices[:mid_idx])
+        second_half_high = max(recent_prices[mid_idx:])
+        second_half_low = min(recent_prices[mid_idx:])
+
+        if is_long:
+            # Uptrend: higher highs AND higher lows
+            if second_half_high > first_half_high and second_half_low > first_half_low:
+                return True, "Uptrend confirmed: HH + HL"
+            return False, "No clear uptrend structure"
+        else:
+            # Downtrend: lower highs AND lower lows
+            if second_half_high < first_half_high and second_half_low < first_half_low:
+                return True, "Downtrend confirmed: LH + LL"
+            return False, "No clear downtrend structure"
 
     @classmethod
     def _calculate_momentum(cls, datetime_price: List[Any]) -> Tuple[float, str]:
@@ -1076,6 +1121,49 @@ class MomentumIndicator(BaseTradingIndicator):
                     }
                 )
                 continue
+
+            # Check price action confirmation before other filters
+            technical_analysis = market_data_response.get("technical_analysis", {})
+            datetime_price = technical_analysis.get("datetime_price", [])
+            if datetime_price:
+                prices = []
+                for entry in datetime_price:
+                    try:
+                        if isinstance(entry, list) and len(entry) >= 2:
+                            prices.append(float(entry[1]))
+                        elif isinstance(entry, dict):
+                            price = (
+                                entry.get("price")
+                                or entry.get("close")
+                                or entry.get("close_price")
+                            )
+                            if price is not None:
+                                prices.append(float(price))
+                    except (ValueError, TypeError, KeyError, IndexError):
+                        continue
+
+                if len(prices) >= 10:
+                    is_long = momentum_score > 0
+                    structure_confirmed, structure_reason = (
+                        cls._confirm_trend_structure(prices, is_long)
+                    )
+                    if not structure_confirmed:
+                        stats["failed_quality_filters"] += 1
+                        logger.debug(f"Skipping {ticker}: {structure_reason}")
+                        inactive_ticker_logs.append(
+                            {
+                                "ticker": ticker,
+                                "indicator": cls.indicator_name(),
+                                "reason_not_to_enter_long": (
+                                    structure_reason if is_long else None
+                                ),
+                                "reason_not_to_enter_short": (
+                                    structure_reason if not is_long else None
+                                ),
+                                "technical_indicators": technical_analysis,
+                            }
+                        )
+                        continue
 
             passes_filter, filter_reason = await cls._passes_stock_quality_filters(
                 ticker, market_data_response, momentum_score
@@ -1595,8 +1683,17 @@ class MomentumIndicator(BaseTradingIndicator):
 
             elif peak_profit_percent > 0 and profit_percent > 0:
                 # Trailing stop should only protect profits, not trigger on losses
-                # Only activate trailing stop after +1% profit as recommended by judge
-                if peak_profit_percent >= cls.trailing_stop_activation_profit:
+                # Tiered trailing stop activation based on profit level
+                trailing_stop_distance = cls._calculate_trailing_stop_activation(
+                    profit_percent, stop_loss_threshold
+                )
+                if trailing_stop_distance is None:
+                    # No trailing stop yet (profit < 0.5%)
+                    logger.debug(
+                        f"Trailing stop not active for {ticker}: "
+                        f"profit {profit_percent:.2f}% < 0.5% activation threshold"
+                    )
+                elif peak_profit_percent >= cls.trailing_stop_activation_profit:
                     # Check if trailing stop should be active (cooling-off period)
                     trailing_stop_active = True
                     if created_at:
@@ -1633,6 +1730,14 @@ class MomentumIndicator(BaseTradingIndicator):
                             )
 
                     if trailing_stop_active:
+                        # Use tiered trailing stop distance
+                        tiered_trailing_distance = trailing_stop_distance
+                        if tiered_trailing_distance is None:
+                            stop_distance = abs(stop_loss_threshold)
+                            tiered_trailing_distance = (
+                                stop_distance * 0.8
+                            )  # Default wide trailing
+
                         # Calculate ATR-based trailing stop: max(2%, 1.5*ATR) as recommended
                         atr = technical_analysis.get("atr", 0.0)
                         is_short = original_action == "sell_to_open"
@@ -1642,38 +1747,38 @@ class MomentumIndicator(BaseTradingIndicator):
                             # Use max(2%, 1.5*ATR) for trailing stop
                             atr_based_trailing = 1.5 * atr_percent
                             base_trailing = 2.0
-                            dynamic_trailing_stop = max(
-                                base_trailing, atr_based_trailing
-                            )
+                            atr_trailing = max(base_trailing, atr_based_trailing)
 
                             # Widen trailing stop for shorts (3-4%) as recommended
+                            if is_short:
+                                atr_trailing = (
+                                    atr_trailing * cls.trailing_stop_short_multiplier
+                                )
+                                # Cap at 4% for shorts
+                                atr_trailing = min(4.0, atr_trailing)
+
+                            # Use the tighter of tiered distance or ATR-based
+                            dynamic_trailing_stop = min(
+                                tiered_trailing_distance, atr_trailing
+                            )
+                        else:
+                            # Fallback to tiered distance if no ATR
+                            dynamic_trailing_stop = tiered_trailing_distance
+
+                            # Apply multipliers for shorts/penny stocks
+                            is_low_price = (
+                                enter_price < cls.max_stock_price_for_penny_treatment
+                            )
                             if is_short:
                                 dynamic_trailing_stop = (
                                     dynamic_trailing_stop
                                     * cls.trailing_stop_short_multiplier
                                 )
-                                # Cap at 4% for shorts
-                                dynamic_trailing_stop = min(4.0, dynamic_trailing_stop)
-                        else:
-                            # Fallback to multiplier-based approach if no ATR
-                            is_low_price = (
-                                enter_price < cls.max_stock_price_for_penny_treatment
-                            )
-                            base_trailing_stop = cls.trailing_stop_percent
-
-                            if is_short:
-                                # Wider trailing for shorts
-                                dynamic_trailing_stop = (
-                                    base_trailing_stop
-                                    * cls.trailing_stop_short_multiplier
-                                )
                             elif is_low_price:
                                 dynamic_trailing_stop = (
-                                    base_trailing_stop
+                                    dynamic_trailing_stop
                                     * cls.trailing_stop_penny_stock_multiplier
                                 )
-                            else:
-                                dynamic_trailing_stop = base_trailing_stop
 
                         # Trailing stop should only protect profits (already checked at elif level)
                         drop_from_peak = peak_profit_percent - profit_percent

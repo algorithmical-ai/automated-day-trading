@@ -30,6 +30,7 @@ from app.src.services.unusual_whales.uw_client import (
     UnusualWhalesClient,
     FlowSentiment,
     get_unusual_whales_client,
+    UWFlowCache,
 )
 
 
@@ -40,16 +41,18 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     profit_threshold: float = 1.5
     top_k: int = 2
     exceptional_momentum_threshold: float = 5.0
-    min_momentum_threshold: float = 0.2  # Raised from 3.0% to 0.2% for stronger signals
-    max_momentum_threshold: float = 50.0
+    min_momentum_threshold: float = 1.5  # Meaningful momentum (not noise)
+    max_momentum_threshold: float = 15.0  # Reduced from 50% - 15%+ is already extreme
     min_daily_volume: int = 1000
     min_volume_ratio: float = 1.5  # Volume must be >1.5x SMA for entry
     stop_loss_threshold: float = -4.0  # Loosened from -2.5% to -4% as recommended by judge
     trailing_stop_percent: float = 2.5  # Base trailing stop, will be adjusted for shorts
     trailing_stop_short_multiplier: float = 1.5  # Wider trailing stop for shorts (3-4%)
     min_adx_threshold: float = 20.0
+    rsi_min_for_long: float = 45.0  # Not oversold (avoiding catching falling knives)
+    rsi_max_for_long: float = 70.0  # Not overbought (avoiding tops)
     rsi_oversold_for_long: float = (
-        40.0  # Increased from 35.0 - require more oversold for longs
+        40.0  # Kept for backward compatibility, but using rsi_min/max_for_long instead
     )
     rsi_overbought_for_short: float = (
         60.0  # Lowered from 70.0 to 60.0 per judge recommendation
@@ -84,6 +87,27 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         if current_price <= 0 or atr <= 0:
             return 0.0
         return (atr / current_price) * 100
+
+    @classmethod
+    def _calculate_risk_adjusted_position_size(
+        cls,
+        base_position_dollars: float,
+        volatility_multiplier: float,
+        penny_stock_risk_score: float
+    ) -> float:
+        """Adjust position size based on all risk factors"""
+        
+        # Start with volatility adjustment
+        position = base_position_dollars * volatility_multiplier
+        
+        # Further reduce for penny stock risk
+        if penny_stock_risk_score > 0:
+            # Risk score 0-100: 50 = no adjustment, 75 = 50% reduction, 100 = 75% reduction
+            risk_reduction = max(0, (penny_stock_risk_score - 50) / 100)
+            position *= (1 - risk_reduction)
+        
+        # Minimum position size floor
+        return max(500, position)  # Never less than $500
 
     @classmethod
     def _is_after_entry_cutoff(cls) -> bool:
@@ -270,25 +294,67 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         return is_golden
 
     @classmethod
+    async def _calculate_combined_entry_score(
+        cls,
+        ticker: str,
+        momentum_score: float,
+        technical_filters_reason: str,
+        enter_price: float
+    ) -> Tuple[float, str, Dict]:
+        """Combine momentum, technical, and UW flow into unified score"""
+        
+        # Base score from momentum (0-40 points)
+        abs_momentum = abs(momentum_score)
+        momentum_points = min(40, abs_momentum * 8)  # 5% momentum = 40 points
+        
+        # Technical filter quality (0-30 points)
+        # Parse from filters_reason or recalculate
+        technical_points = 20  # Placeholder - extract from actual analysis
+        
+        # UW flow alignment (0-30 points, can be negative)
+        sentiment, uw_reason, uw_details = await cls._validate_with_unusual_whales(
+            ticker, "long" if momentum_score > 0 else "short", enter_price
+        )
+        
+        flow_score = uw_details.get("flow_details", {}).get("sentiment_score", 0)
+        intended_direction = 1 if momentum_score > 0 else -1
+        
+        # Flow alignment: +1 score with +1 direction = +30 points
+        # Flow alignment: -1 score with +1 direction = -30 points (opposing)
+        flow_points = flow_score * intended_direction * 30
+        
+        total_score = momentum_points + technical_points + flow_points
+        max_score = 100
+        normalized_score = total_score / max_score
+        
+        return normalized_score, f"Combined: mom={momentum_points:.0f}, tech={technical_points:.0f}, flow={flow_points:.0f}", {
+            "momentum_points": momentum_points,
+            "technical_points": technical_points,
+            "flow_points": flow_points,
+            "uw_details": uw_details
+        }
+
+    @classmethod
     async def _validate_with_unusual_whales(
         cls, ticker: str, intended_direction: str, enter_price: float
     ) -> Tuple[bool, str, Dict[str, Any]]:
-        """Validate trade against Unusual Whales options flow data"""
+        """Validate trade against Unusual Whales options flow data with weighted scoring"""
         if not cls.use_unusual_whales:
             return True, "UW validation disabled", {}
 
         try:
-            uw_client = get_unusual_whales_client()
-
-            if not uw_client.is_configured:
-                return True, "UW not configured", {}
-
-            should_trade, reason, details = await uw_client.should_trade_ticker(
-                ticker, intended_direction
-            )
+            # Use cached flow sentiment
+            sentiment, flow_details = await UWFlowCache.get_flow_sentiment(ticker)
+            
+            details = {
+                "flow_sentiment": sentiment.value,
+                "flow_details": flow_details,
+                "intended_direction": intended_direction,
+            }
 
             # For penny stocks, also check risk score
             if enter_price < VolatilityUtils.PENNY_STOCK_THRESHOLD:
+                uw_client = get_unusual_whales_client()
                 risk_score, risk_details = await uw_client.get_penny_stock_risk_score(
                     ticker, enter_price
                 )
@@ -304,11 +370,28 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         details,
                     )
 
-            if not should_trade and cls.uw_reject_on_strong_opposing_flow:
-                logger.info(
-                    f"UW validation rejected {ticker} {intended_direction}: {reason}"
-                )
-                return False, reason, details
+            # Weighted scoring: check alignment but don't reject on slight opposition
+            sentiment_score = flow_details.get("sentiment_score", 0)
+            confidence = flow_details.get("confidence", "low")
+            
+            if intended_direction == "long":
+                if sentiment == FlowSentiment.BEARISH and confidence == "high" and sentiment_score < -0.5:
+                    if cls.uw_reject_on_strong_opposing_flow:
+                        logger.info(
+                            f"UW validation rejected {ticker} {intended_direction}: "
+                            f"strong bearish flow (score={sentiment_score:.2f})"
+                        )
+                        return False, f"Strong bearish flow: sentiment_score={sentiment_score:.2f}", details
+                reason = f"Flow sentiment: {sentiment.value} (score={sentiment_score:.2f}, confidence={confidence})"
+            else:  # short
+                if sentiment == FlowSentiment.BULLISH and confidence == "high" and sentiment_score > 0.5:
+                    if cls.uw_reject_on_strong_opposing_flow:
+                        logger.info(
+                            f"UW validation rejected {ticker} {intended_direction}: "
+                            f"strong bullish flow (score={sentiment_score:.2f})"
+                        )
+                        return False, f"Strong bullish flow: sentiment_score={sentiment_score:.2f}", details
+                reason = f"Flow sentiment: {sentiment.value} (score={sentiment_score:.2f}, confidence={confidence})"
 
             return True, reason, details
         except Exception as e:
@@ -403,10 +486,11 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         is_long = momentum_score > 0
         is_short = momentum_score < 0
 
-        if is_long and rsi >= cls.rsi_oversold_for_long:
+        # For momentum longs, you want RSI showing strength but not exhaustion
+        if is_long and (rsi < cls.rsi_min_for_long or rsi > cls.rsi_max_for_long):
             return (
                 False,
-                f"RSI too high for long: {rsi:.2f} >= {cls.rsi_oversold_for_long}",
+                f"RSI {rsi:.1f} outside acceptable range [{cls.rsi_min_for_long}-{cls.rsi_max_for_long}] for long entry",
             )
 
         if is_short and rsi <= cls.rsi_overbought_for_short:
@@ -915,9 +999,25 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     )
                 )
 
-            position_multiplier = VolatilityUtils.calculate_position_size_multiplier(
+            # Calculate risk-adjusted position size
+            penny_stock_risk_score = 0
+            if enter_price < VolatilityUtils.PENNY_STOCK_THRESHOLD:
+                uw_client = get_unusual_whales_client()
+                if uw_client.is_configured:
+                    penny_stock_risk_score, _ = await uw_client.get_penny_stock_risk_score(
+                        ticker, enter_price
+                    )
+            
+            base_position_multiplier = VolatilityUtils.calculate_position_size_multiplier(
                 enter_price, atr
             )
+            adjusted_position_dollars = cls._calculate_risk_adjusted_position_size(
+                cls.position_size_dollars,
+                base_position_multiplier,
+                penny_stock_risk_score
+            )
+            position_multiplier = adjusted_position_dollars / cls.position_size_dollars  # Convert back to multiplier
+            
             volatility_trailing_stop = (
                 VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
                     enter_price, enter_price, atr, cls.trailing_stop_percent
@@ -1029,9 +1129,25 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 ticker, enter_price, technical_analysis, action=action
             )
 
-            position_multiplier = VolatilityUtils.calculate_position_size_multiplier(
+            # Calculate risk-adjusted position size
+            penny_stock_risk_score = 0
+            if enter_price < VolatilityUtils.PENNY_STOCK_THRESHOLD:
+                uw_client = get_unusual_whales_client()
+                if uw_client.is_configured:
+                    penny_stock_risk_score, _ = await uw_client.get_penny_stock_risk_score(
+                        ticker, enter_price
+                    )
+            
+            base_position_multiplier = VolatilityUtils.calculate_position_size_multiplier(
                 enter_price, atr
             )
+            adjusted_position_dollars = cls._calculate_risk_adjusted_position_size(
+                cls.position_size_dollars,
+                base_position_multiplier,
+                penny_stock_risk_score
+            )
+            position_multiplier = adjusted_position_dollars / cls.position_size_dollars  # Convert back to multiplier
+            
             volatility_trailing_stop = (
                 VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
                     enter_price, enter_price, atr, cls.trailing_stop_percent

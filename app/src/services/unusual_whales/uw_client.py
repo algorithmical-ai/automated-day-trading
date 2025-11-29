@@ -10,7 +10,7 @@ API Documentation: https://api.unusualwhales.com/docs
 
 import os
 import asyncio
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from enum import Enum
 import aiohttp
@@ -802,6 +802,30 @@ class UnusualWhalesClient:
 
 # Singleton instance for convenience
 _client_instance: Optional[UnusualWhalesClient] = None
+
+
+class UWFlowCache:
+    """Cache UW flow data to reduce API calls"""
+    
+    _cache: Dict[str, Tuple[datetime, Dict]] = {}
+    _cache_ttl_seconds = 60  # 1 minute cache
+    
+    @classmethod
+    async def get_flow_sentiment(cls, ticker: str) -> Tuple[FlowSentiment, Dict]:
+        """Get flow sentiment with caching"""
+        now = datetime.now(timezone.utc)
+        
+        if ticker in cls._cache:
+            cached_time, cached_data = cls._cache[ticker]
+            if (now - cached_time).total_seconds() < cls._cache_ttl_seconds:
+                return cached_data["sentiment"], cached_data["details"]
+        
+        # Cache miss - fetch fresh
+        client = get_unusual_whales_client()
+        sentiment, details = await client.analyze_flow_sentiment(ticker)
+        
+        cls._cache[ticker] = (now, {"sentiment": sentiment, "details": details})
+        return sentiment, details
 
 
 def get_unusual_whales_client() -> UnusualWhalesClient:

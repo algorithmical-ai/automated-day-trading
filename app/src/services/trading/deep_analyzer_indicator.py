@@ -6,6 +6,7 @@ Uses MarketDataService for deep technical analysis to identify entry and exit si
 import asyncio
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, date, timezone
+import pytz
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
@@ -31,6 +32,51 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
     @classmethod
     def indicator_name(cls) -> str:
         return "Deep Analyzer"
+
+    @classmethod
+    async def _get_dynamic_entry_threshold(cls) -> float:
+        """Adjust entry threshold based on market conditions"""
+        # Get market-wide data (simplified - could use VIX or other indicators)
+        base_threshold = 0.70
+        
+        # During first/last hour, require stronger signals (more noise)
+        est_tz = pytz.timezone("America/New_York")
+        current_hour = datetime.now(est_tz).hour
+        if current_hour == 9 or current_hour >= 15:
+            base_threshold += 0.05
+        
+        # Could add VIX-based adjustment here if VIX data is available
+        # market_tide = await cls._get_market_volatility_index()
+        # if market_tide.get("vix_level", 20) > 25:
+        #     base_threshold += 0.05
+        # elif market_tide.get("vix_level", 20) < 15:
+        #     base_threshold -= 0.03
+        
+        return min(0.85, max(0.60, base_threshold))
+
+    @classmethod
+    async def _check_portfolio_correlation(
+        cls,
+        new_ticker: str,
+        action: str,
+        active_trades: List[Dict]
+    ) -> Tuple[bool, str]:
+        """Prevent over-concentration in correlated assets"""
+        if not active_trades:
+            return True, "First position"
+        
+        # Simplified correlation check - count same-direction trades
+        # In a full implementation, you'd check sectors, industries, etc.
+        same_direction_count = sum(
+            1 for trade in active_trades
+            if trade.get("action") == action
+        )
+        
+        max_same_direction = 3  # Max 3 positions in same direction
+        if same_direction_count >= max_same_direction:
+            return False, f"Already have {same_direction_count} {action} positions (max: {max_same_direction})"
+        
+        return True, f"Correlation check passed ({same_direction_count} same-direction positions)"
 
     @classmethod
     def _is_golden_ticker(
@@ -176,12 +222,32 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
         ticker: str,
         enter_price: float,
         action: str,
+        entry_score: Optional[float] = None,  # Store from entry
     ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
         """
-        Evaluate ticker for exit using MarketDataService
+        Enhanced exit with Deep Analyzer specific logic including signal reversal detection
         Returns: (should_exit, exit_reason, exit_data)
         """
         try:
+            # Get current entry score to detect degradation
+            market_data = await MCPClient.get_market_data(ticker)
+            if market_data:
+                current_action, current_signal, _, _ = await cls._evaluate_ticker_for_entry(ticker, market_data)
+                
+                # Signal reversal detection
+                if current_signal:
+                    current_score = current_signal.get("entry_score", 0)
+                    
+                    # If entry score has dropped significantly, consider exiting
+                    if entry_score and current_score < entry_score * 0.5:  # Score dropped by 50%+
+                        return True, f"Entry score degraded: {entry_score:.2f} -> {current_score:.2f}", {"degradation": True}
+                    
+                    # If opposite signal now qualifies
+                    opposite_action = "sell_to_open" if action == "buy_to_open" else "buy_to_open"
+                    if current_action == opposite_action and current_score >= cls.min_entry_score:
+                        return True, f"Reversal signal detected: {opposite_action} score {current_score:.2f}", {"reversal": True}
+            
+            # Fall back to MarketDataService exit logic
             # Convert action to exit action
             if action == "buy_to_open":
                 exit_action = "SELL_TO_CLOSE"
@@ -319,21 +385,88 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
 
             if action and signal_data:
                 entry_score = signal_data.get("entry_score", 0.0)
-                if entry_score >= cls.min_entry_score:
+                # Use dynamic threshold based on market conditions
+                dynamic_threshold = await cls._get_dynamic_entry_threshold()
+                if entry_score >= dynamic_threshold:
+                    # Check portfolio correlation before adding to candidates
+                    active_trades = await cls._get_active_trades()
+                    correlation_ok, correlation_reason = await cls._check_portfolio_correlation(
+                        ticker, action, active_trades
+                    )
+                    if not correlation_ok:
+                        stats["no_entry_signal"] += 1  # Reuse this stat
+                        logger.debug(f"Skipping {ticker}: {correlation_reason}")
+                        inactive_ticker_logs.append(
+                            {
+                                "ticker": ticker,
+                                "indicator": cls.indicator_name(),
+                                "reason_not_to_enter_long": correlation_reason if action == "buy_to_open" else None,
+                                "reason_not_to_enter_short": correlation_reason if action == "sell_to_open" else None,
+                                "technical_indicators": technical_analysis,
+                            }
+                        )
+                        continue
+                    
                     stats["passed"] += 1
                     ticker_candidates.append(
                         (ticker, entry_score, action, signal_data, reason)
                     )
                     logger.info(
                         f"{ticker} passed Deep Analyzer filters: {action} "
-                        f"(score: {entry_score:.2f}, {reason})"
+                        f"(score: {entry_score:.2f}, threshold: {dynamic_threshold:.2f}, {reason})"
                     )
                 else:
                     stats["low_entry_score"] += 1
                     logger.debug(
                         f"Skipping {ticker}: entry score {entry_score:.2f} < "
-                        f"minimum {cls.min_entry_score}"
+                        f"dynamic threshold {dynamic_threshold:.2f}"
                     )
+                    # Log reason based on action
+                    if action == "buy_to_open":
+                        reason_long = f"Entry score {entry_score:.2f} < dynamic threshold {dynamic_threshold:.2f}"
+                        reason_short = None
+                    else:  # sell_to_open
+                        reason_long = None
+                        reason_short = f"Entry score {entry_score:.2f} < dynamic threshold {dynamic_threshold:.2f}"
+
+                    inactive_ticker_logs.append(
+                        {
+                            "ticker": ticker,
+                            "indicator": cls.indicator_name(),
+                            "reason_not_to_enter_long": reason_long,
+                            "reason_not_to_enter_short": reason_short,
+                            "technical_indicators": technical_analysis,
+                        }
+                    )
+            else:
+                stats["no_entry_signal"] += 1
+                logger.debug(f"Skipping {ticker}: {reason}")
+
+                # Use detailed_results from evaluation to avoid double API calls
+                reason_long = None
+                reason_short = None
+
+                if detailed_results:
+                    long_result = detailed_results.get("long_result", {})
+                    short_result = detailed_results.get("short_result", {})
+
+                    long_enter = long_result.get("enter", False)
+                    short_enter = short_result.get("enter", False)
+
+                    if not long_enter:
+                        reason_long = long_result.get("message", "No entry signal")
+                    if not short_enter:
+                        reason_short = short_result.get("message", "No entry signal")
+
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": reason_long,
+                        "reason_not_to_enter_short": reason_short,
+                        "technical_indicators": technical_analysis,
+                    }
+                )
                     # Log reason based on action
                     if action == "buy_to_open":
                         reason_long = f"Entry score {entry_score:.2f} < minimum {cls.min_entry_score}"
@@ -770,11 +903,22 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 logger.warning(f"Invalid Deep Analyzer trade data: {trade}")
                 continue
 
-            # Evaluate for exit using MarketDataService
+            # Get entry score from trade record if available
+            entry_score = None
+            if "entry_score" in trade:
+                entry_score = trade.get("entry_score")
+            elif "technical_indicators_for_enter" in trade:
+                # Try to extract from technical indicators
+                tech_indicators = trade.get("technical_indicators_for_enter", {})
+                if isinstance(tech_indicators, dict):
+                    entry_score = tech_indicators.get("entry_score")
+            
+            # Evaluate for exit using enhanced exit logic
             should_exit, exit_reason, exit_data = await cls._evaluate_ticker_for_exit(
                 ticker=ticker,
                 enter_price=enter_price,
                 action=original_action,
+                entry_score=entry_score,
             )
 
             if should_exit:
