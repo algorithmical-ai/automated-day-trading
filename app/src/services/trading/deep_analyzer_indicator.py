@@ -15,6 +15,7 @@ from app.src.services.market_data.market_data_service import MarketDataService
 from app.src.services.mab.mab_service import MABService
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.trading.base_trading_indicator import BaseTradingIndicator
+from app.src.services.trading.realtime_quote_utils import RealtimeQuoteUtils
 
 
 class DeepAnalyzerIndicator(BaseTradingIndicator):
@@ -621,24 +622,30 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             action = "buy_to_open"
             signal_data, reason = long_signal_lookup.get(ticker, (None, ""))
 
-            # Get quote for ask price (buy price)
-            quote_response = await MCPClient.get_quote(ticker)
-            if not quote_response:
-                logger.warning(f"Failed to get quote for {ticker}, skipping")
-                long_entries_blocked["quote_failed"] += 1
-                continue
+            # Get current price hint for penny stock detection
+            market_data_response = market_data_dict.get(ticker)
+            current_price_hint = None
+            if market_data_response:
+                technical_analysis = market_data_response.get("technical_analysis", {})
+                current_price_hint = technical_analysis.get("close_price", 0.0)
 
-            quote_data = quote_response.get("quote", {})
-            quotes = quote_data.get("quotes", {})
-            ticker_quote = quotes.get(ticker, {})
-            enter_price = ticker_quote.get("ap", 0.0)
+            # Get entry price using real-time quotes for penny stocks
+            enter_price, quote_source = await RealtimeQuoteUtils.get_entry_price_quote(
+                ticker, action, current_price_hint, cls.max_stock_price_for_penny_treatment
+            )
 
-            if enter_price <= 0:
+            if enter_price is None or enter_price <= 0:
                 logger.warning(
-                    f"Failed to get valid quote price for {ticker}, skipping"
+                    f"Failed to get entry price for {ticker} from {quote_source}, skipping"
                 )
                 long_entries_blocked["quote_failed"] += 1
                 continue
+
+            # Log quote source for debugging
+            if quote_source == "realtime_alpaca":
+                logger.info(
+                    f"🚀 Using real-time Alpaca quote for {ticker} entry (penny stock fast entry)"
+                )
 
             # Use the is_golden from daily limit check, or check signal_data if not already set
             if not is_golden:
@@ -738,24 +745,30 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             action = "sell_to_open"
             signal_data, reason = short_signal_lookup.get(ticker, (None, ""))
 
-            # Get quote for bid price (sell price)
-            quote_response = await MCPClient.get_quote(ticker)
-            if not quote_response:
-                logger.warning(f"Failed to get quote for {ticker}, skipping")
-                short_entries_blocked["quote_failed"] += 1
-                continue
+            # Get current price hint for penny stock detection
+            market_data_response = market_data_dict.get(ticker)
+            current_price_hint = None
+            if market_data_response:
+                technical_analysis = market_data_response.get("technical_analysis", {})
+                current_price_hint = technical_analysis.get("close_price", 0.0)
 
-            quote_data = quote_response.get("quote", {})
-            quotes = quote_data.get("quotes", {})
-            ticker_quote = quotes.get(ticker, {})
-            enter_price = ticker_quote.get("bp", 0.0)
+            # Get entry price using real-time quotes for penny stocks
+            enter_price, quote_source = await RealtimeQuoteUtils.get_entry_price_quote(
+                ticker, action, current_price_hint, cls.max_stock_price_for_penny_treatment
+            )
 
-            if enter_price <= 0:
+            if enter_price is None or enter_price <= 0:
                 logger.warning(
-                    f"Failed to get valid quote price for {ticker}, skipping"
+                    f"Failed to get entry price for {ticker} from {quote_source}, skipping"
                 )
                 short_entries_blocked["quote_failed"] += 1
                 continue
+
+            # Log quote source for debugging
+            if quote_source == "realtime_alpaca":
+                logger.info(
+                    f"🚀 Using real-time Alpaca quote for {ticker} short entry (penny stock fast entry)"
+                )
 
             # Use the is_golden from daily limit check, or check signal_data if not already set
             if not is_golden:
@@ -889,67 +902,50 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             exit_data = None
             
             if is_penny_stock:
-                # Get current price for penny stock trailing stop check
-                quote_response = await MCPClient.get_quote(ticker)
-                if quote_response:
-                    quote_data = quote_response.get("quote", {})
-                    quotes = quote_data.get("quotes", {})
-                    ticker_quote = quotes.get(ticker, {})
+                # Get current price for penny stock trailing stop check using real-time quotes
+                current_price, quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
+                    ticker, original_action, enter_price, cls.max_stock_price_for_penny_treatment
+                )
+                
+                if current_price and current_price > 0:
+                    # Calculate current profit
+                    profit_percent = cls._calculate_profit_percent(
+                        enter_price, current_price, original_action
+                    )
                     
-                    # Use correct price: bid for longs (selling), ask for shorts (buying to cover)
-                    is_short = original_action == "sell_to_open"
-                    if is_short:
-                        current_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
-                    else:
-                        current_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                    # Get peak profit from trade record or use current as initial peak
+                    peak_profit_percent = float(trade.get("peak_profit_percent", profit_percent))
+                    if profit_percent > peak_profit_percent:
+                        peak_profit_percent = profit_percent
                     
-                    if current_price > 0:
-                        # Calculate current profit
-                        profit_percent = cls._calculate_profit_percent(
-                            enter_price, current_price, original_action
+                    # Check if trailing stop should activate (after +0.5% profit)
+                    if peak_profit_percent >= cls.penny_stock_trailing_stop_activation_profit:
+                        # Get latest quote right before trailing stop trigger check using real-time quotes
+                        final_price, final_quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
+                            ticker, original_action, enter_price, cls.max_stock_price_for_penny_treatment
                         )
                         
-                        # Get peak profit from trade record or use current as initial peak
-                        peak_profit_percent = float(trade.get("peak_profit_percent", profit_percent))
-                        if profit_percent > peak_profit_percent:
-                            peak_profit_percent = profit_percent
+                        if final_price and final_price > 0:
+                            current_price = final_price  # Update to latest quote
+                            # Recalculate profit with latest price for trailing stop check
+                            profit_percent = cls._calculate_profit_percent(
+                                enter_price, current_price, original_action
+                            )
                         
-                        # Check if trailing stop should activate (after +0.5% profit)
-                        if peak_profit_percent >= cls.penny_stock_trailing_stop_activation_profit:
-                            # Get latest quote right before trailing stop trigger check to ensure we use the freshest price
-                            final_quote_response = await MCPClient.get_quote(ticker)
-                            if final_quote_response:
-                                final_quote_data = final_quote_response.get("quote", {})
-                                final_quotes = final_quote_data.get("quotes", {})
-                                final_ticker_quote = final_quotes.get(ticker, {})
-                                
-                                # Update current price with latest quote for final trailing stop check
-                                is_short = original_action == "sell_to_open"
-                                if is_short:
-                                    final_price = final_ticker_quote.get("ap", current_price)  # Ask price for short
-                                else:
-                                    final_price = final_ticker_quote.get("bp", current_price)  # Bid price for long
-                                
-                                if final_price > 0:
-                                    current_price = final_price  # Update to latest quote
-                                    # Recalculate profit with latest price for trailing stop check
-                                    profit_percent = cls._calculate_profit_percent(
-                                        enter_price, current_price, original_action
-                                    )
-                            
-                            # Check if profit dropped by 1% from peak
-                            drop_from_peak = peak_profit_percent - profit_percent
-                            if drop_from_peak >= cls.penny_stock_trailing_stop_percent:
-                                should_exit = True
-                                exit_reason = (
-                                    f"Penny stock trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
-                                    f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
-                                    f"trailing stop: {cls.penny_stock_trailing_stop_percent:.2f}%)"
-                                )
-                                exit_data = {"current_price": current_price}
-                                logger.info(
-                                    f"Penny stock {ticker} (${enter_price:.2f}): {exit_reason}"
-                                )
+                        # Check if profit dropped by 1% from peak
+                        drop_from_peak = peak_profit_percent - profit_percent
+                        if drop_from_peak >= cls.penny_stock_trailing_stop_percent:
+                            should_exit = True
+                            exit_reason = (
+                                f"Penny stock trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
+                                f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
+                                f"trailing stop: {cls.penny_stock_trailing_stop_percent:.2f}%)"
+                            )
+                            exit_data = {"current_price": current_price}
+                            logger.info(
+                                f"Penny stock {ticker} (${enter_price:.2f}): {exit_reason} "
+                                f"(using {final_quote_source or quote_source} quote)"
+                            )
             
             # If penny stock trailing stop didn't trigger, evaluate with MarketDataService
             if not should_exit:
@@ -965,15 +961,12 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 exit_price = exit_data.get("current_price", 0.0) if exit_data else 0.0
 
                 if exit_price <= 0:
-                    # Fallback: get current price from quote
-                    quote_response = await MCPClient.get_quote(ticker)
-                    if quote_response:
-                        quote_data = quote_response.get("quote", {})
-                        quotes = quote_data.get("quotes", {})
-                        ticker_quote = quotes.get(ticker, {})
-                        exit_price = ticker_quote.get("bp", 0.0)  # Bid price for exit (selling)
+                    # Fallback: get current price using real-time quotes for penny stocks
+                    exit_price, exit_quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
+                        ticker, original_action, enter_price, cls.max_stock_price_for_penny_treatment
+                    )
 
-                if exit_price <= 0:
+                if exit_price is None or exit_price <= 0:
                     logger.warning(f"Failed to get valid exit price for {ticker}")
                     continue
 
@@ -1009,25 +1002,28 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                                 if k != "datetime_price"
                             }
 
-                # Get latest second quote right before exit to ensure we use the freshest price
-                latest_quote_response = await MCPClient.get_quote(ticker)
-                if latest_quote_response:
-                    latest_quote_data = latest_quote_response.get("quote", {})
-                    latest_quotes = latest_quote_data.get("quotes", {})
-                    latest_ticker_quote = latest_quotes.get(ticker, {})
-                    
-                    # Use correct price for exit: bid for longs (selling), ask for shorts (buying to cover)
-                    is_short = original_action == "sell_to_open"
-                    if is_short:
-                        latest_exit_price = latest_ticker_quote.get("ap", exit_price)  # Ask price for short exit
+                # Get latest quote right before exit using real-time quotes for penny stocks
+                latest_exit_price, latest_exit_quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
+                    ticker, original_action, enter_price, cls.max_stock_price_for_penny_treatment
+                )
+
+                if latest_exit_price and latest_exit_price > 0:
+                    exit_price = latest_exit_price  # Update to latest quote
+                    is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
+                    if latest_exit_quote_source == "realtime_alpaca" and is_penny_stock:
+                        logger.info(
+                            f"🚀 Using real-time Alpaca quote for {ticker} exit: ${exit_price:.4f} "
+                            f"(penny stock fast exit)"
+                        )
                     else:
-                        latest_exit_price = latest_ticker_quote.get("bp", exit_price)  # Bid price for long exit
-                    
-                    if latest_exit_price > 0:
-                        exit_price = latest_exit_price  # Update to latest quote
-                        logger.debug(f"Using latest quote for {ticker} exit: ${exit_price:.4f}")
+                        logger.debug(
+                            f"Using {latest_exit_quote_source} quote for {ticker} exit: ${exit_price:.4f}"
+                        )
                 else:
-                    logger.warning(f"Failed to get latest quote for {ticker}, using previously fetched price")
+                    logger.warning(
+                        f"Failed to get latest exit quote for {ticker} from {latest_exit_quote_source}, "
+                        f"using previously fetched price ${exit_price:.4f}"
+                    )
 
                 await cls._exit_trade(
                     ticker=ticker,

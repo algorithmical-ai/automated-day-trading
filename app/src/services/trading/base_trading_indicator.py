@@ -31,10 +31,14 @@ class BaseTradingIndicator(ABC):
     # Daily tracking
     daily_trades_count: int = 0
     daily_trades_date: Optional[str] = None
-    ticker_exit_timestamps: ClassVar[Optional[Dict[str, datetime]]] = None  # Per-subclass dict, initialized on first use
+    ticker_exit_timestamps: ClassVar[Optional[Dict[str, datetime]]] = (
+        None  # Per-subclass dict, initialized on first use
+    )
     mab_reset_date: Optional[str] = None
     mab_reset_timestamp: Optional[datetime] = None  # Track when reset happened (EST)
-    _daily_count_lock: ClassVar[Optional[asyncio.Lock]] = None  # Lock for thread-safe daily count updates
+    _daily_count_lock: ClassVar[Optional[asyncio.Lock]] = (
+        None  # Lock for thread-safe daily count updates
+    )
 
     @classmethod
     @abstractmethod
@@ -66,7 +70,10 @@ class BaseTradingIndicator(ABC):
     @classmethod
     def _get_ticker_exit_timestamps(cls) -> Dict[str, datetime]:
         """Get or initialize ticker_exit_timestamps dict for this class"""
-        if not hasattr(cls, 'ticker_exit_timestamps') or cls.ticker_exit_timestamps is None:
+        if (
+            not hasattr(cls, "ticker_exit_timestamps")
+            or cls.ticker_exit_timestamps is None
+        ):
             cls.ticker_exit_timestamps = {}
         return cls.ticker_exit_timestamps
 
@@ -105,13 +112,13 @@ class BaseTradingIndicator(ABC):
     async def _increment_daily_trade_count(cls):
         """Increment daily trade counter (thread-safe)"""
         async with cls._daily_count_lock:
-        today = date.today().isoformat()
+            today = date.today().isoformat()
 
-        if cls.daily_trades_date != today:
-            cls.daily_trades_count = 0
-            cls.daily_trades_date = today
+            if cls.daily_trades_date != today:
+                cls.daily_trades_count = 0
+                cls.daily_trades_date = today
 
-        cls.daily_trades_count += 1
+            cls.daily_trades_count += 1
 
     @classmethod
     async def _check_market_open(cls) -> bool:
@@ -126,12 +133,12 @@ class BaseTradingIndicator(ABC):
     @classmethod
     async def _reset_daily_stats_if_needed(cls):
         """Reset daily stats only once per day at 9:30 AM EST (market open)
-        
+
         Uses EST only for market-hour logic, stores timestamps in UTC internally.
         """
         # Use UTC internally
         current_time_utc = datetime.now(timezone.utc)
-        
+
         # Convert to EST only for market-hour logic
         est_tz = pytz.timezone("America/New_York")
         current_time_est = current_time_utc.astimezone(est_tz)

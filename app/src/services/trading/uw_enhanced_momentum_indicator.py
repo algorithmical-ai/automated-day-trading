@@ -26,6 +26,7 @@ from app.src.services.mab.mab_service import MABService
 from app.src.services.trading.base_trading_indicator import BaseTradingIndicator
 from app.src.services.market_data.market_data_service import MarketDataService
 from app.src.services.trading.volatility_utils import VolatilityUtils
+from app.src.services.trading.realtime_quote_utils import RealtimeQuoteUtils
 from app.src.services.trading.trading_config import (
     ATR_STOP_LOSS_MULTIPLIER,
     ATR_TRAILING_STOP_MULTIPLIER,
@@ -56,8 +57,12 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     max_momentum_threshold: float = 15.0  # Reduced from 50% - 15%+ is already extreme
     min_daily_volume: int = 1000
     min_volume_ratio: float = 1.5  # Volume must be >1.5x SMA for entry
-    stop_loss_threshold: float = -4.0  # Loosened from -2.5% to -4% as recommended by judge
-    trailing_stop_percent: float = 2.5  # Base trailing stop, will be adjusted for shorts
+    stop_loss_threshold: float = (
+        -4.0
+    )  # Loosened from -2.5% to -4% as recommended by judge
+    trailing_stop_percent: float = (
+        2.5  # Base trailing stop, will be adjusted for shorts
+    )
     trailing_stop_short_multiplier: float = 1.5  # Wider trailing stop for shorts (3-4%)
     min_adx_threshold: float = 20.0
     rsi_min_for_long: float = 45.0  # Not oversold (avoiding catching falling knives)
@@ -70,7 +75,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     )
     profit_target_strong_momentum: float = 5.0
     profit_target_multiplier: float = 2.0  # Profit target = 2x stop distance
-    trailing_stop_activation_profit: float = 1.0  # Activate trailing stop after +1% profit
+    trailing_stop_activation_profit: float = (
+        1.0  # Activate trailing stop after +1% profit
+    )
     min_holding_period_seconds: int = 60
     max_entry_hour_et: int = 15  # No entries after 3:00 PM ET (15:00)
 
@@ -96,7 +103,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     _alpaca_api_key = os.environ.get("REAL_TRADE_API_KEY", "")
     _alpaca_api_secret = os.environ.get("REAL_TRADE_SECRET_KEY", "")
     _alpaca_base_url = "https://data.alpaca.markets/v2/stocks/bars"
-    _alpaca_session: Optional[aiohttp.ClientSession] = None  # Shared session for API calls
+    _alpaca_session: Optional[aiohttp.ClientSession] = (
+        None  # Shared session for API calls (bars only, quotes use common utility)
+    )
 
     @classmethod
     def indicator_name(cls) -> str:
@@ -129,19 +138,19 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         cls,
         base_position_dollars: float,
         volatility_multiplier: float,
-        penny_stock_risk_score: float
+        penny_stock_risk_score: float,
     ) -> float:
         """Adjust position size based on all risk factors"""
-        
+
         # Start with volatility adjustment
         position = base_position_dollars * volatility_multiplier
-        
+
         # Further reduce for penny stock risk
         if penny_stock_risk_score > 0:
             # Risk score 0-100: 50 = no adjustment, 75 = 50% reduction, 100 = 75% reduction
             risk_reduction = max(0, (penny_stock_risk_score - 50) / 100)
-            position *= (1 - risk_reduction)
-        
+            position *= 1 - risk_reduction
+
         # Minimum position size floor
         return max(500, position)  # Never less than $500
 
@@ -155,6 +164,31 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         current_time_est = datetime.now(est_tz)
         current_hour = current_time_est.hour
         return current_hour >= cls.max_entry_hour_et
+
+    @classmethod
+    async def _get_entry_price_quote(
+        cls, ticker: str, action: str, current_price_hint: Optional[float] = None
+    ) -> Tuple[Optional[float], str]:
+        """
+        Get entry price quote using real-time Alpaca API for penny stocks,
+        falling back to MCPClient for others or if real-time fails.
+
+        Uses the common RealtimeQuoteUtils for penny stock handling.
+
+        Args:
+            ticker: Stock ticker symbol
+            action: "buy_to_open" (use ask) or "sell_to_open" (use bid)
+            current_price_hint: Optional current price hint to determine if penny stock
+
+        Returns:
+            Tuple of (enter_price: Optional[float], quote_source: str)
+        """
+        return await RealtimeQuoteUtils.get_entry_price_quote(
+            ticker=ticker,
+            action=action,
+            current_price_hint=current_price_hint,
+            penny_stock_threshold=cls.max_stock_price_for_penny_treatment,
+        )
 
     @classmethod
     async def _check_bid_ask_spread(
@@ -216,14 +250,20 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 # Use standardized ATR multiplier for stop loss
                 atr_percent = (atr / enter_price) * 100
                 dynamic_stop_loss = -(atr_percent * ATR_STOP_LOSS_MULTIPLIER)
-                
+
                 # Cap at reasonable levels using standardized bounds
                 is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
                 if is_low_price:
-                    dynamic_stop_loss = max(PENNY_STOCK_STOP_LOSS_MIN, min(PENNY_STOCK_STOP_LOSS_MAX, dynamic_stop_loss))
+                    dynamic_stop_loss = max(
+                        PENNY_STOCK_STOP_LOSS_MIN,
+                        min(PENNY_STOCK_STOP_LOSS_MAX, dynamic_stop_loss),
+                    )
                 else:
-                    dynamic_stop_loss = max(STANDARD_STOCK_STOP_LOSS_MIN, min(STANDARD_STOCK_STOP_LOSS_MAX, dynamic_stop_loss))
-                
+                    dynamic_stop_loss = max(
+                        STANDARD_STOCK_STOP_LOSS_MIN,
+                        min(STANDARD_STOCK_STOP_LOSS_MAX, dynamic_stop_loss),
+                    )
+
                 logger.info(
                     f"ATR-based stop loss (2x ATR) for {ticker}: {dynamic_stop_loss:.2f}% "
                     f"(ATR: {atr_percent:.2f}%, enter_price: ${enter_price:.2f}, "
@@ -264,45 +304,45 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             # Use shared session for efficiency
             if cls._alpaca_session is None or cls._alpaca_session.closed:
                 cls._alpaca_session = aiohttp.ClientSession()
-            
+
             async with cls._alpaca_session.get(
                 url,
                 params={k: str(v) for k, v in params.items()},
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as response:
-                    if response.status != 200:
-                        return default_stop_loss
+                if response.status != 200:
+                    return default_stop_loss
 
-                    data = await response.json()
-                    bars_dict = data.get("bars", {})
-                    bars = bars_dict.get(ticker, [])
+                data = await response.json()
+                bars_dict = data.get("bars", {})
+                bars = bars_dict.get(ticker, [])
 
-                    if not bars or len(bars) < 5:
-                        return default_stop_loss
+                if not bars or len(bars) < 5:
+                    return default_stop_loss
 
-                    high_low_ranges = []
-                    for bar in bars:
-                        if isinstance(bar, dict):
-                            high = bar.get("h")
-                            low = bar.get("l")
-                            if high is not None and low is not None:
-                                high, low = float(high), float(low)
-                                if high > 0 and low > 0:
-                                    high_low_ranges.append((high - low) / low * 100)
+                high_low_ranges = []
+                for bar in bars:
+                    if isinstance(bar, dict):
+                        high = bar.get("h")
+                        low = bar.get("l")
+                        if high is not None and low is not None:
+                            high, low = float(high), float(low)
+                            if high > 0 and low > 0:
+                                high_low_ranges.append((high - low) / low * 100)
 
-                    if not high_low_ranges:
-                        return default_stop_loss
+                if not high_low_ranges:
+                    return default_stop_loss
 
-                    avg_volatility = sum(high_low_ranges) / len(high_low_ranges)
-                    dynamic_stop_loss = -2.5 - (avg_volatility * 0.5)
-                    dynamic_stop_loss = max(-7.0, min(-3.5, dynamic_stop_loss))
+                avg_volatility = sum(high_low_ranges) / len(high_low_ranges)
+                dynamic_stop_loss = -2.5 - (avg_volatility * 0.5)
+                dynamic_stop_loss = max(-7.0, min(-3.5, dynamic_stop_loss))
 
-                    logger.info(
-                        f"Dynamic stop loss for {ticker}: {dynamic_stop_loss:.2f}% "
-                        f"(volatility: {avg_volatility:.2f}%, price: ${enter_price:.2f})"
-                    )
-                    return dynamic_stop_loss
+                logger.info(
+                    f"Dynamic stop loss for {ticker}: {dynamic_stop_loss:.2f}% "
+                    f"(volatility: {avg_volatility:.2f}%, price: ${enter_price:.2f})"
+                )
+                return dynamic_stop_loss
 
         except Exception as e:
             logger.warning(f"Error calculating dynamic stop loss for {ticker}: {e}")
@@ -342,7 +382,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         try:
             # Use cached flow sentiment
             sentiment, flow_details = await UWFlowCache.get_flow_sentiment(ticker)
-            
+
             details = {
                 "flow_sentiment": sentiment.value,
                 "flow_details": flow_details,
@@ -370,24 +410,40 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             # Weighted scoring: check alignment but don't reject on slight opposition
             sentiment_score = flow_details.get("sentiment_score", 0)
             confidence = flow_details.get("confidence", "low")
-            
+
             if intended_direction == "long":
-                if sentiment == FlowSentiment.BEARISH and confidence == "high" and sentiment_score < -0.5:
+                if (
+                    sentiment == FlowSentiment.BEARISH
+                    and confidence == "high"
+                    and sentiment_score < -0.5
+                ):
                     if cls.uw_reject_on_strong_opposing_flow:
                         logger.info(
                             f"UW validation rejected {ticker} {intended_direction}: "
                             f"strong bearish flow (score={sentiment_score:.2f})"
                         )
-                        return False, f"Strong bearish flow: sentiment_score={sentiment_score:.2f}", details
+                        return (
+                            False,
+                            f"Strong bearish flow: sentiment_score={sentiment_score:.2f}",
+                            details,
+                        )
                 reason = f"Flow sentiment: {sentiment.value} (score={sentiment_score:.2f}, confidence={confidence})"
             else:  # short
-                if sentiment == FlowSentiment.BULLISH and confidence == "high" and sentiment_score > 0.5:
+                if (
+                    sentiment == FlowSentiment.BULLISH
+                    and confidence == "high"
+                    and sentiment_score > 0.5
+                ):
                     if cls.uw_reject_on_strong_opposing_flow:
                         logger.info(
                             f"UW validation rejected {ticker} {intended_direction}: "
                             f"strong bullish flow (score={sentiment_score:.2f})"
                         )
-                        return False, f"Strong bullish flow: sentiment_score={sentiment_score:.2f}", details
+                        return (
+                            False,
+                            f"Strong bullish flow: sentiment_score={sentiment_score:.2f}",
+                            details,
+                        )
                 reason = f"Flow sentiment: {sentiment.value} (score={sentiment_score:.2f}, confidence={confidence})"
 
             return True, reason, details
@@ -537,7 +593,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
     @classmethod
     def _calculate_momentum(cls, datetime_price: List[Any]) -> Tuple[float, str]:
-        """Calculate price momentum score from datetime_price array"""
+        """Calculate price momentum score from datetime_price array or Alpaca quotes"""
         if not datetime_price or len(datetime_price) < 3:
             return 0.0, "Insufficient price data"
 
@@ -548,6 +604,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     if len(entry) >= 2:
                         prices.append(float(entry[1]))
                 elif isinstance(entry, dict):
+                    # Support both MCP datetime_price format and Alpaca quotes format
                     price = (
                         entry.get("price")
                         or entry.get("close")
@@ -689,25 +746,31 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         if initial_exit_price <= 0:
             return False
 
-        # Get latest second quote right before exit to ensure we use the freshest price
-        latest_quote_response = await MCPClient.get_quote(ticker_to_exit)
-        exit_price = initial_exit_price  # Default to previously fetched price
-        if latest_quote_response:
-            latest_quote_data = latest_quote_response.get("quote", {})
-            latest_quotes = latest_quote_data.get("quotes", {})
-            latest_ticker_quote = latest_quotes.get(ticker_to_exit, {})
-            
-            # Use correct price for exit: bid for longs (selling), ask for shorts (buying to cover)
-            is_short = original_action == "sell_to_open"
-            if is_short:
-                exit_price = latest_ticker_quote.get("ap", initial_exit_price)  # Ask price for short exit
-            else:
-                exit_price = latest_ticker_quote.get("bp", initial_exit_price)  # Bid price for long exit
-            
-            if exit_price > 0:
-                logger.debug(f"Using latest quote for {ticker_to_exit} preempt exit: ${exit_price:.4f}")
+        # Get latest quote right before exit using real-time quotes for penny stocks
+        exit_price, exit_quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
+            ticker_to_exit,
+            original_action,
+            enter_price,
+            cls.max_stock_price_for_penny_treatment,
+        )
+
+        if exit_price is None or exit_price <= 0:
+            # Fallback to initial_exit_price if real-time quote fails
+            exit_price = initial_exit_price
+            logger.warning(
+                f"Failed to get latest exit quote for {ticker_to_exit} from {exit_quote_source}, "
+                f"using previously fetched price ${initial_exit_price:.4f}"
+            )
         else:
-            logger.warning(f"Failed to get latest quote for {ticker_to_exit}, using previously fetched price")
+            is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
+            if exit_quote_source == "realtime_alpaca" and is_penny_stock:
+                logger.debug(
+                    f"🚀 Using real-time Alpaca quote for {ticker_to_exit} preempt exit: ${exit_price:.4f}"
+                )
+            else:
+                logger.debug(
+                    f"Using {exit_quote_source} quote for {ticker_to_exit} preempt exit: ${exit_price:.4f}"
+                )
 
         reason = f"Preempted for exceptional trade: {lowest_profit:.2f}% profit"
 
@@ -803,7 +866,8 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         ticker_momentum_scores = []
         stats = {
             "no_market_data": 0,
-            "no_datetime_price": 0,
+            "no_datetime_price": 0,  # Fallback counter
+            "alpaca_quotes_used": 0,
             "low_momentum": 0,
             "failed_quality_filters": 0,
             "failed_volatility_filters": 0,
@@ -823,15 +887,59 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 continue
 
             technical_analysis = market_data_response.get("technical_analysis", {})
-            datetime_price = technical_analysis.get("datetime_price", [])
             current_price = technical_analysis.get("close_price", 0.0)
             atr = technical_analysis.get("atr", 0)
 
-            if not datetime_price:
-                stats["no_datetime_price"] += 1
-                continue
+            # Always use Alpaca quotes for momentum calculation (discard datetime_price from MCP)
+            # Get 200 real-time quotes from Alpaca for accurate momentum calculation
+            alpaca_quotes = await RealtimeQuoteUtils.get_realtime_quotes_for_momentum(
+                ticker, limit=200
+            )
 
-            momentum_score, reason = cls._calculate_momentum(datetime_price)
+            datetime_price_for_momentum = None
+            if alpaca_quotes:
+                # Convert Alpaca quotes to datetime_price format for momentum calculation
+                # Filter out any quotes with missing or invalid prices
+                datetime_price_for_momentum = [
+                    {"price": quote.get("price")}
+                    for quote in alpaca_quotes
+                    if quote.get("price") is not None and quote.get("price") > 0
+                ]
+
+                # Ensure we have at least 3 valid quotes for momentum calculation
+                if (
+                    not datetime_price_for_momentum
+                    or len(datetime_price_for_momentum) < 3
+                ):
+                    datetime_price_for_momentum = None
+
+            # Fallback to MCP datetime_price only if Alpaca quotes unavailable
+            if not datetime_price_for_momentum:
+                datetime_price_for_momentum = technical_analysis.get(
+                    "datetime_price", []
+                )
+                if datetime_price_for_momentum:
+                    logger.debug(
+                        f"Using MCP datetime_price (fallback) for {ticker} momentum"
+                    )
+                else:
+                    stats["no_datetime_price"] += 1
+                    continue
+            else:
+                stats["alpaca_quotes_used"] += 1
+                logger.debug(
+                    f"✅ Using Alpaca real-time quotes ({len(alpaca_quotes)} quotes) for {ticker} momentum"
+                )
+
+            # Discard datetime_price from technical_analysis (always use Alpaca quotes)
+            if "datetime_price" in technical_analysis:
+                technical_analysis = {
+                    k: v for k, v in technical_analysis.items() if k != "datetime_price"
+                }
+
+            momentum_score, reason = cls._calculate_momentum(
+                datetime_price_for_momentum
+            )
             abs_momentum = abs(momentum_score)
 
             if abs_momentum < cls.min_momentum_threshold:
@@ -935,7 +1043,8 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         logger.info(
             f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers "
             f"(filtered: {stats['no_market_data']} no data, "
-            f"{stats['no_datetime_price']} no datetime_price, "
+            f"{stats['alpaca_quotes_used']} used Alpaca quotes, "
+            f"{stats['no_datetime_price']} no datetime_price (fallback), "
             f"{stats['low_momentum']} low momentum, "
             f"{stats['failed_quality_filters']} failed quality, "
             f"{stats['failed_volatility_filters']} failed volatility, "
@@ -997,16 +1106,20 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     continue
 
             action = "buy_to_open"
-            quote_response = await MCPClient.get_quote(ticker)
-            if not quote_response:
-                continue
 
-            quote_data = quote_response.get("quote", {})
-            quotes = quote_data.get("quotes", {})
-            ticker_quote = quotes.get(ticker, {})
-            enter_price = ticker_quote.get("ap", 0.0)
+            # Get current price hint for penny stock detection
+            technical_analysis = market_data_response.get("technical_analysis", {})
+            current_price_hint = technical_analysis.get("close_price", 0.0)
 
-            if enter_price <= 0:
+            # Get entry price using real-time quotes for penny stocks
+            enter_price, quote_source = await cls._get_entry_price_quote(
+                ticker, action, current_price_hint
+            )
+
+            if enter_price is None or enter_price <= 0:
+                logger.warning(
+                    f"Failed to get entry price for {ticker} from {quote_source}"
+                )
                 continue
 
             technical_analysis = market_data_response.get("technical_analysis", {})
@@ -1030,20 +1143,22 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if enter_price < VolatilityUtils.PENNY_STOCK_THRESHOLD:
                 uw_client = get_unusual_whales_client()
                 if uw_client.is_configured:
-                    penny_stock_risk_score, _ = await uw_client.get_penny_stock_risk_score(
-                        ticker, enter_price
+                    penny_stock_risk_score, _ = (
+                        await uw_client.get_penny_stock_risk_score(ticker, enter_price)
                     )
-            
-            base_position_multiplier = VolatilityUtils.calculate_position_size_multiplier(
-                enter_price, atr
+
+            base_position_multiplier = (
+                VolatilityUtils.calculate_position_size_multiplier(enter_price, atr)
             )
             adjusted_position_dollars = cls._calculate_risk_adjusted_position_size(
                 cls.position_size_dollars,
                 base_position_multiplier,
-                penny_stock_risk_score
+                penny_stock_risk_score,
             )
-            position_multiplier = adjusted_position_dollars / cls.position_size_dollars  # Convert back to multiplier
-            
+            position_multiplier = (
+                adjusted_position_dollars / cls.position_size_dollars
+            )  # Convert back to multiplier
+
             volatility_trailing_stop = (
                 VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
                     enter_price, enter_price, atr, cls.trailing_stop_percent
@@ -1135,20 +1250,29 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     continue
 
             action = "sell_to_open"
-            quote_response = await MCPClient.get_quote(ticker)
-            if not quote_response:
-                continue
 
-            quote_data = quote_response.get("quote", {})
-            quotes = quote_data.get("quotes", {})
-            ticker_quote = quotes.get(ticker, {})
-            enter_price = ticker_quote.get("bp", 0.0)
-
-            if enter_price <= 0:
-                continue
-
+            # Get current price hint for penny stock detection
             technical_analysis = market_data_response.get("technical_analysis", {})
+            current_price_hint = technical_analysis.get("close_price", 0.0)
+
+            # Get entry price using real-time quotes for penny stocks
+            enter_price, quote_source = await cls._get_entry_price_quote(
+                ticker, action, current_price_hint
+            )
+
+            if enter_price is None or enter_price <= 0:
+                logger.warning(
+                    f"Failed to get entry price for {ticker} from {quote_source}"
+                )
+                continue
+
             atr = technical_analysis.get("atr", 0)
+
+            # Log quote source for debugging
+            if quote_source == "realtime_alpaca":
+                logger.info(
+                    f"🚀 Using real-time Alpaca quote for {ticker} short entry (penny stock fast entry)"
+                )
 
             # Calculate dynamic stop loss using 2x ATR
             dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
@@ -1160,20 +1284,22 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if enter_price < VolatilityUtils.PENNY_STOCK_THRESHOLD:
                 uw_client = get_unusual_whales_client()
                 if uw_client.is_configured:
-                    penny_stock_risk_score, _ = await uw_client.get_penny_stock_risk_score(
-                        ticker, enter_price
+                    penny_stock_risk_score, _ = (
+                        await uw_client.get_penny_stock_risk_score(ticker, enter_price)
                     )
-            
-            base_position_multiplier = VolatilityUtils.calculate_position_size_multiplier(
-                enter_price, atr
+
+            base_position_multiplier = (
+                VolatilityUtils.calculate_position_size_multiplier(enter_price, atr)
             )
             adjusted_position_dollars = cls._calculate_risk_adjusted_position_size(
                 cls.position_size_dollars,
                 base_position_multiplier,
-                penny_stock_risk_score
+                penny_stock_risk_score,
             )
-            position_multiplier = adjusted_position_dollars / cls.position_size_dollars  # Convert back to multiplier
-            
+            position_multiplier = (
+                adjusted_position_dollars / cls.position_size_dollars
+            )  # Convert back to multiplier
+
             volatility_trailing_stop = (
                 VolatilityUtils.calculate_volatility_adjusted_trailing_stop(
                     enter_price, enter_price, atr, cls.trailing_stop_percent
@@ -1263,28 +1389,26 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if not ticker or enter_price is None or enter_price <= 0:
                 continue
 
-            # Get latest quote FIRST for accurate exit decisions (get_quote() is more up-to-date than get_market_data())
-            quote_response = await MCPClient.get_quote(ticker)
-            if not quote_response:
+            # Get latest quote FIRST for accurate exit decisions using real-time quotes for penny stocks
+            current_price, quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
+                ticker,
+                original_action,
+                enter_price,
+                cls.max_stock_price_for_penny_treatment,
+            )
+
+            if current_price is None or current_price <= 0:
                 logger.warning(
-                    f"Failed to get quote for {ticker} for exit check - will retry in next cycle"
+                    f"Failed to get quote for {ticker} for exit check from {quote_source} - will retry in next cycle"
                 )
                 continue
 
-            quote_data = quote_response.get("quote", {})
-            quotes = quote_data.get("quotes", {})
-            ticker_quote = quotes.get(ticker, {})
-            
-            # Use correct price for exit: bid for longs (selling), ask for shorts (buying to cover)
-            is_short = original_action == "sell_to_open"
-            if is_short:
-                current_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit (buying to cover)
-            else:
-                current_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit (selling)
-
-            if current_price <= 0:
-                logger.warning(f"Failed to get valid current price for {ticker}")
-                continue
+            # Log quote source for debugging
+            is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
+            if quote_source == "realtime_alpaca" and is_penny_stock:
+                logger.debug(
+                    f"🚀 Using real-time Alpaca quote for {ticker} exit check (penny stock fast exit)"
+                )
 
             # Get market data for technical indicators (may be delayed, but don't block exit decisions)
             # Exit decisions are based on get_quote() which is more up-to-date
@@ -1320,7 +1444,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     if is_penny_stock
                     else cls.trailing_stop_activation_profit
                 )
-                
+
                 if peak_profit_percent >= activation_threshold:
                     should_apply_trailing, cooling_reason = (
                         VolatilityUtils.should_apply_trailing_stop(
@@ -1328,35 +1452,38 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         )
                     )
                     if should_apply_trailing:
-                        # Get latest quote right before trailing stop evaluation to ensure we use the freshest price
-                        latest_quote_response = await MCPClient.get_quote(ticker)
-                        if latest_quote_response:
-                            latest_quote_data = latest_quote_response.get("quote", {})
-                            latest_quotes = latest_quote_data.get("quotes", {})
-                            latest_ticker_quote = latest_quotes.get(ticker, {})
-                            
-                            # Update current price with latest quote for accurate trailing stop calculation
-                            is_short = original_action == "sell_to_open"
-                            if is_short:
-                                latest_price = latest_ticker_quote.get("ap", current_price)  # Ask price for short
-                            else:
-                                latest_price = latest_ticker_quote.get("bp", current_price)  # Bid price for long
-                            
-                            if latest_price > 0:
-                                current_price = latest_price  # Update to latest quote
-                                # Recalculate profit with latest price
-                                profit_percent = cls._calculate_profit_percent(
-                                    enter_price, current_price, original_action
-                                )
-                                logger.debug(f"Refreshed quote for {ticker} trailing stop check: ${current_price:.4f}")
-                        
+                        # Get latest quote right before trailing stop evaluation using real-time quotes for penny stocks
+                        latest_price, latest_quote_source = (
+                            await RealtimeQuoteUtils.get_exit_price_quote(
+                                ticker,
+                                original_action,
+                                enter_price,
+                                cls.max_stock_price_for_penny_treatment,
+                            )
+                        )
+
+                        if latest_price and latest_price > 0:
+                            current_price = latest_price  # Update to latest quote
+                            # Recalculate profit with latest price
+                            profit_percent = cls._calculate_profit_percent(
+                                enter_price, current_price, original_action
+                            )
+                            logger.debug(
+                                f"Refreshed quote for {ticker} trailing stop check: ${current_price:.4f} "
+                                f"({latest_quote_source})"
+                            )
+
                         # Check if this is a penny stock (< $5) - use tight trailing stop
-                        is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
-                        
+                        is_penny_stock = (
+                            enter_price < cls.max_stock_price_for_penny_treatment
+                        )
+
                         if is_penny_stock:
                             # For penny stocks: use tight trailing stop (1% drop from peak)
                             # Exit quickly to lock in profits on volatile penny stocks
-                            volatility_trailing_stop = cls.penny_stock_trailing_stop_percent
+                            volatility_trailing_stop = (
+                                cls.penny_stock_trailing_stop_percent
+                            )
                             logger.debug(
                                 f"Penny stock {ticker} (${enter_price:.2f}): "
                                 f"Using tight trailing stop of {volatility_trailing_stop:.2f}% "
@@ -1366,49 +1493,56 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                             # For non-penny stocks: use ATR-based trailing stop
                             # Calculate ATR-based trailing stop: max(2%, 1.5*ATR)
                             is_short = original_action == "sell_to_open"
-                            
+
                             if atr is not None and atr > 0:
-                                atr_percent = cls._calculate_atr_percent(atr, current_price)
+                                atr_percent = cls._calculate_atr_percent(
+                                    atr, current_price
+                                )
                                 # Use standardized ATR multiplier for trailing stop
-                                atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
-                                volatility_trailing_stop = max(BASE_TRAILING_STOP_PERCENT, atr_based_trailing)
-                                
+                                atr_based_trailing = (
+                                    ATR_TRAILING_STOP_MULTIPLIER * atr_percent
+                                )
+                                volatility_trailing_stop = max(
+                                    BASE_TRAILING_STOP_PERCENT, atr_based_trailing
+                                )
+
                                 # Widen trailing stop for shorts
                                 if is_short:
                                     volatility_trailing_stop = (
-                                        volatility_trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
+                                        volatility_trailing_stop
+                                        * TRAILING_STOP_SHORT_MULTIPLIER
                                     )
                                     # Cap at maximum for shorts
-                                    volatility_trailing_stop = min(MAX_TRAILING_STOP_SHORT, volatility_trailing_stop)
+                                    volatility_trailing_stop = min(
+                                        MAX_TRAILING_STOP_SHORT,
+                                        volatility_trailing_stop,
+                                    )
                             else:
                                 # Fallback to base trailing stop
                                 volatility_trailing_stop = cls.trailing_stop_percent
                                 if is_short:
                                     volatility_trailing_stop = (
-                                        volatility_trailing_stop * cls.trailing_stop_short_multiplier
+                                        volatility_trailing_stop
+                                        * cls.trailing_stop_short_multiplier
                                     )
-                        
-                        # Get latest quote right before trailing stop trigger check to ensure we use the freshest price
-                        final_quote_response = await MCPClient.get_quote(ticker)
-                        if final_quote_response:
-                            final_quote_data = final_quote_response.get("quote", {})
-                            final_quotes = final_quote_data.get("quotes", {})
-                            final_ticker_quote = final_quotes.get(ticker, {})
-                            
-                            # Update current price with latest quote for final trailing stop check
-                            is_short = original_action == "sell_to_open"
-                            if is_short:
-                                final_price = final_ticker_quote.get("ap", current_price)  # Ask price for short
-                            else:
-                                final_price = final_ticker_quote.get("bp", current_price)  # Bid price for long
-                            
-                            if final_price > 0:
-                                current_price = final_price  # Update to latest quote
-                                # Recalculate profit with latest price for trailing stop check
-                                profit_percent = cls._calculate_profit_percent(
-                                    enter_price, current_price, original_action
-                                )
-                        
+
+                        # Get latest quote right before trailing stop trigger check using real-time quotes for penny stocks
+                        final_price, final_quote_source = (
+                            await RealtimeQuoteUtils.get_exit_price_quote(
+                                ticker,
+                                original_action,
+                                enter_price,
+                                cls.max_stock_price_for_penny_treatment,
+                            )
+                        )
+
+                        if final_price and final_price > 0:
+                            current_price = final_price  # Update to latest quote
+                            # Recalculate profit with latest price for trailing stop check
+                            profit_percent = cls._calculate_profit_percent(
+                                enter_price, current_price, original_action
+                            )
+
                         drop_from_peak = peak_profit_percent - profit_percent
                         if drop_from_peak >= volatility_trailing_stop:
                             should_exit = True
@@ -1431,10 +1565,10 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 # Calculate dynamic profit target: 2x stop distance
                 stop_distance = abs(stop_loss_threshold)
                 profit_target_to_exit = stop_distance * cls.profit_target_multiplier
-                
+
                 # Cap profit target at reasonable level (e.g., 10%)
                 profit_target_to_exit = min(10.0, profit_target_to_exit)
-                
+
                 if profit_percent >= profit_target_to_exit:
                     should_exit = True
                     exit_reason = (
@@ -1447,8 +1581,10 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 if profit_percent > peak_profit_percent:
                     peak_profit_percent = profit_percent
                     # Check if this is a penny stock (< $5) - use tight trailing stop
-                    is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
-                    
+                    is_penny_stock = (
+                        enter_price < cls.max_stock_price_for_penny_treatment
+                    )
+
                     if is_penny_stock:
                         # For penny stocks: use tight trailing stop (1% drop from peak)
                         trailing_stop = cls.penny_stock_trailing_stop_percent
@@ -1456,21 +1592,31 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         # For non-penny stocks: use ATR-based trailing stop
                         # Calculate dynamic trailing stop: max(2%, 1.5*ATR)
                         is_short = original_action == "sell_to_open"
-                        
+
                         if atr is not None and atr > 0:
                             atr_percent = cls._calculate_atr_percent(atr, current_price)
-                            atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
-                            trailing_stop = max(BASE_TRAILING_STOP_PERCENT, atr_based_trailing)
-                            
+                            atr_based_trailing = (
+                                ATR_TRAILING_STOP_MULTIPLIER * atr_percent
+                            )
+                            trailing_stop = max(
+                                BASE_TRAILING_STOP_PERCENT, atr_based_trailing
+                            )
+
                             # Widen trailing stop for shorts
                             if is_short:
-                                trailing_stop = trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
-                                trailing_stop = min(MAX_TRAILING_STOP_SHORT, trailing_stop)
+                                trailing_stop = (
+                                    trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
+                                )
+                                trailing_stop = min(
+                                    MAX_TRAILING_STOP_SHORT, trailing_stop
+                                )
                         else:
                             # Fallback to base trailing stop
                             trailing_stop = cls.trailing_stop_percent
                             if is_short:
-                                trailing_stop = trailing_stop * cls.trailing_stop_short_multiplier
+                                trailing_stop = (
+                                    trailing_stop * cls.trailing_stop_short_multiplier
+                                )
 
                 skipped_reason = (
                     f"Profit: {profit_percent:.2f}%, "
@@ -1514,25 +1660,36 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     technical_indicators_for_exit,
                 )
 
-                # Get latest second quote right before exit to ensure we use the freshest price
-                latest_quote_response = await MCPClient.get_quote(ticker)
-                exit_price = current_price  # Default to previously fetched price
-                if latest_quote_response:
-                    latest_quote_data = latest_quote_response.get("quote", {})
-                    latest_quotes = latest_quote_data.get("quotes", {})
-                    latest_ticker_quote = latest_quotes.get(ticker, {})
-                    
-                    # Use correct price for exit: bid for longs (selling), ask for shorts (buying to cover)
-                    is_short = original_action == "sell_to_open"
-                    if is_short:
-                        exit_price = latest_ticker_quote.get("ap", current_price)  # Ask price for short exit
-                    else:
-                        exit_price = latest_ticker_quote.get("bp", current_price)  # Bid price for long exit
-                    
-                    if exit_price > 0:
-                        logger.debug(f"Using latest quote for {ticker} exit: ${exit_price:.4f}")
+                # Get latest quote right before exit using real-time quotes for penny stocks
+                exit_price, exit_quote_source = (
+                    await RealtimeQuoteUtils.get_exit_price_quote(
+                        ticker,
+                        original_action,
+                        enter_price,
+                        cls.max_stock_price_for_penny_treatment,
+                    )
+                )
+
+                if exit_price is None or exit_price <= 0:
+                    # Fallback to current_price if real-time quote fails
+                    exit_price = current_price
+                    logger.warning(
+                        f"Failed to get latest exit quote for {ticker} from {exit_quote_source}, "
+                        f"using previously fetched price ${current_price:.4f}"
+                    )
                 else:
-                    logger.warning(f"Failed to get latest quote for {ticker}, using previously fetched price")
+                    is_penny_stock = (
+                        enter_price < cls.max_stock_price_for_penny_treatment
+                    )
+                    if exit_quote_source == "realtime_alpaca" and is_penny_stock:
+                        logger.info(
+                            f"🚀 Using real-time Alpaca quote for {ticker} exit: ${exit_price:.4f} "
+                            f"(penny stock fast exit)"
+                        )
+                    else:
+                        logger.debug(
+                            f"Using {exit_quote_source} quote for {ticker} exit: ${exit_price:.4f}"
+                        )
 
                 await cls._exit_trade(
                     ticker=ticker,
