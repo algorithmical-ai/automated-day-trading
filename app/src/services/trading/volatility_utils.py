@@ -24,7 +24,9 @@ class VolatilityUtils:
 
     # ATR-based trailing stop multipliers
     # Note: Imported from trading_config for consistency, but keeping as class attribute for backward compatibility
-    ATR_TRAILING_STOP_MULTIPLIER = ATR_TRAILING_STOP_MULTIPLIER_LEGACY  # Use 2.5x ATR for trailing stop
+    ATR_TRAILING_STOP_MULTIPLIER = (
+        ATR_TRAILING_STOP_MULTIPLIER_LEGACY  # Use 2.5x ATR for trailing stop
+    )
 
     # Minimum holding periods (seconds) before trailing stop activates
     PENNY_STOCK_MIN_HOLD_SECONDS = 180  # 3 minutes for penny stocks
@@ -39,7 +41,7 @@ class VolatilityUtils:
     @classmethod
     def calculate_atr_percent(cls, atr: float, price: float) -> float:
         """Calculate ATR as a percentage of price"""
-        if price <= 0 or atr <= 0:
+        if price <= 0 or atr is None or atr <= 0:
             return 0.0
         return (atr / price) * 100
 
@@ -67,7 +69,7 @@ class VolatilityUtils:
         Returns:
             Trailing stop percentage adjusted for volatility
         """
-        if current_price <= 0 or atr <= 0:
+        if current_price <= 0 or atr is None or atr <= 0:
             return default_trailing_stop
 
         # Calculate ATR as percentage of current price
@@ -111,7 +113,7 @@ class VolatilityUtils:
         Returns:
             Stop loss percentage (negative value)
         """
-        if enter_price <= 0 or atr <= 0:
+        if enter_price <= 0 or atr is None or atr <= 0:
             return default_stop_loss
 
         atr_percent = cls.calculate_atr_percent(atr, enter_price)
@@ -159,7 +161,7 @@ class VolatilityUtils:
         if enter_price <= 0:
             return False, "Invalid entry price"
 
-        if atr <= 0:
+        if atr is None or atr <= 0:
             return True, "No ATR data available"
 
         atr_percent = cls.calculate_atr_percent(atr, enter_price)
@@ -255,7 +257,7 @@ class VolatilityUtils:
         if enter_price <= 0:
             return 1.0
 
-        if atr <= 0:
+        if atr is None or atr <= 0:
             # No ATR data - use price-based defaults
             if enter_price < cls.PENNY_STOCK_THRESHOLD:
                 return 0.5  # Half size for penny stocks without ATR data
