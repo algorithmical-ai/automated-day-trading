@@ -111,7 +111,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     @classmethod
     def _calculate_atr_percent(cls, atr: float, current_price: float) -> float:
         """Calculate ATR as percentage of current price"""
-        if current_price <= 0 or atr <= 0:
+        if current_price <= 0 or atr is None or atr <= 0:
             return 0.0
         return (atr / current_price) * 100
 
@@ -203,7 +203,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         # Use ATR if available (preferred method via VolatilityUtils)
         if technical_analysis:
             atr = technical_analysis.get("atr", 0.0)
-            if atr > 0 and enter_price > 0:
+            if atr is not None and atr > 0 and enter_price > 0:
                 # Use standardized ATR multiplier for stop loss
                 atr_percent = (atr / enter_price) * 100
                 dynamic_stop_loss = -(atr_percent * ATR_STOP_LOSS_MULTIPLIER)
@@ -985,7 +985,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
             # Calculate volatility-adjusted stop loss using 2x ATR
             # Use ATR-based calculation if available, otherwise fall back to dynamic calculation
-            if atr > 0:
+            if atr is not None and atr > 0:
                 dynamic_stop_loss = (
                     VolatilityUtils.calculate_volatility_adjusted_stop_loss(
                         enter_price, atr, cls.stop_loss_threshold
@@ -1292,7 +1292,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         # Calculate ATR-based trailing stop: max(2%, 1.5*ATR)
                         is_short = original_action == "sell_to_open"
                         
-                        if atr > 0:
+                        if atr is not None and atr > 0:
                             atr_percent = cls._calculate_atr_percent(atr, current_price)
                             # Use standardized ATR multiplier for trailing stop
                             atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
@@ -1353,7 +1353,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     # Calculate dynamic trailing stop: max(2%, 1.5*ATR)
                     is_short = original_action == "sell_to_open"
                     
-                    if atr > 0:
+                    if atr is not None and atr > 0:
                         atr_percent = cls._calculate_atr_percent(atr, current_price)
                         atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
                         trailing_stop = max(BASE_TRAILING_STOP_PERCENT, atr_based_trailing)

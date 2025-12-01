@@ -164,7 +164,7 @@ class MomentumIndicator(BaseTradingIndicator):
     @classmethod
     def _calculate_atr_percent(cls, atr: float, current_price: float) -> float:
         """Calculate ATR as percentage of current price"""
-        if current_price <= 0 or atr <= 0:
+        if current_price <= 0 or atr is None or atr <= 0:
             return 0.0
         return (atr / current_price) * 100
 
@@ -196,7 +196,7 @@ class MomentumIndicator(BaseTradingIndicator):
         For penny stocks, use 2-3x ATR as trailing stop distance.
         This gives volatile stocks more room to breathe.
         """
-        if enter_price <= 0 or atr <= 0 or current_price <= 0:
+        if enter_price <= 0 or atr is None or atr <= 0 or current_price <= 0:
             return cls.trailing_stop_percent
 
         # Calculate ATR as percentage of price
@@ -319,7 +319,7 @@ class MomentumIndicator(BaseTradingIndicator):
         # Use ATR if available (preferred method) - use 2x ATR as recommended
         if technical_analysis:
             atr = technical_analysis.get("atr", 0.0)
-            if atr > 0 and enter_price > 0:
+            if atr is not None and atr > 0 and enter_price > 0:
                 atr_percent = cls._calculate_atr_percent(atr, enter_price)
 
                 # Use standardized ATR multiplier for stop loss
@@ -1692,7 +1692,7 @@ class MomentumIndicator(BaseTradingIndicator):
                 atr = technical_analysis.get("atr", 0.0)
                 atr_percent = (
                     cls._calculate_atr_percent(atr, current_price)
-                    if atr > 0 and current_price > 0
+                    if atr is not None and atr > 0 and current_price > 0
                     else 0.0
                 )
                 is_volatile = atr_percent > 3.0
@@ -1791,7 +1791,7 @@ class MomentumIndicator(BaseTradingIndicator):
                         atr = technical_analysis.get("atr", 0.0)
                         is_short = original_action == "sell_to_open"
 
-                        if atr > 0:
+                        if atr is not None and atr > 0:
                             atr_percent = cls._calculate_atr_percent(atr, current_price)
                             # Use standardized ATR multiplier for trailing stop
                             atr_based_trailing = (
@@ -1880,7 +1880,7 @@ class MomentumIndicator(BaseTradingIndicator):
                     atr = technical_analysis.get("atr", 0.0)
                     is_short = original_action == "sell_to_open"
 
-                    if atr > 0:
+                    if atr is not None and atr > 0:
                         # Use standardized ATR multiplier for trailing stop
                         atr_percent = cls._calculate_atr_percent(atr, current_price)
                         atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
