@@ -490,8 +490,15 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
         if is_short:
             stoch = technical_analysis.get("stoch", {})
-            stoch_k = stoch.get("k", 50.0) if isinstance(stoch, dict) else 50.0
-            stoch_d = stoch.get("d", 50.0) if isinstance(stoch, dict) else 50.0
+            if isinstance(stoch, dict):
+                # Handle None values explicitly - .get() with default only works if key missing
+                stoch_k_raw = stoch.get("k")
+                stoch_d_raw = stoch.get("d")
+                stoch_k = stoch_k_raw if stoch_k_raw is not None else 50.0
+                stoch_d = stoch_d_raw if stoch_d_raw is not None else 50.0
+            else:
+                stoch_k = 50.0
+                stoch_d = 50.0
 
             # Don't short if stochastic is still bullish (K > D and K > 60)
             # OR if both K and D are extremely high (> 80), indicating strong upward momentum
