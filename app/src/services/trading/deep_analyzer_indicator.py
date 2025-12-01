@@ -28,6 +28,17 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
     exceptional_entry_score: float = (
         0.75  # Exceptional entry score for golden tickers (lowered from 0.90)
     )
+    
+    # Penny stock trailing stop configuration
+    max_stock_price_for_penny_treatment: float = (
+        5.0  # Stocks under $5 get special handling (tight trailing stops)
+    )
+    penny_stock_trailing_stop_percent: float = (
+        1.0  # Exit penny stocks when profit drops 1.0% from peak (take profit quickly)
+    )
+    penny_stock_trailing_stop_activation_profit: float = (
+        0.5  # Activate trailing stop after +0.5% profit for penny stocks
+    )
 
     @classmethod
     def indicator_name(cls) -> str:
@@ -871,13 +882,83 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 if isinstance(tech_indicators, dict):
                     entry_score = tech_indicators.get("entry_score")
             
-            # Evaluate for exit using enhanced exit logic
-            should_exit, exit_reason, exit_data = await cls._evaluate_ticker_for_exit(
-                ticker=ticker,
-                enter_price=enter_price,
-                action=original_action,
-                entry_score=entry_score,
-            )
+            # Check penny stock trailing stop before MarketDataService evaluation
+            is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
+            should_exit = False
+            exit_reason = None
+            exit_data = None
+            
+            if is_penny_stock:
+                # Get current price for penny stock trailing stop check
+                quote_response = await MCPClient.get_quote(ticker)
+                if quote_response:
+                    quote_data = quote_response.get("quote", {})
+                    quotes = quote_data.get("quotes", {})
+                    ticker_quote = quotes.get(ticker, {})
+                    
+                    # Use correct price: bid for longs (selling), ask for shorts (buying to cover)
+                    is_short = original_action == "sell_to_open"
+                    if is_short:
+                        current_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+                    else:
+                        current_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                    
+                    if current_price > 0:
+                        # Calculate current profit
+                        profit_percent = cls._calculate_profit_percent(
+                            enter_price, current_price, original_action
+                        )
+                        
+                        # Get peak profit from trade record or use current as initial peak
+                        peak_profit_percent = float(trade.get("peak_profit_percent", profit_percent))
+                        if profit_percent > peak_profit_percent:
+                            peak_profit_percent = profit_percent
+                        
+                        # Check if trailing stop should activate (after +0.5% profit)
+                        if peak_profit_percent >= cls.penny_stock_trailing_stop_activation_profit:
+                            # Get latest quote right before trailing stop trigger check to ensure we use the freshest price
+                            final_quote_response = await MCPClient.get_quote(ticker)
+                            if final_quote_response:
+                                final_quote_data = final_quote_response.get("quote", {})
+                                final_quotes = final_quote_data.get("quotes", {})
+                                final_ticker_quote = final_quotes.get(ticker, {})
+                                
+                                # Update current price with latest quote for final trailing stop check
+                                is_short = original_action == "sell_to_open"
+                                if is_short:
+                                    final_price = final_ticker_quote.get("ap", current_price)  # Ask price for short
+                                else:
+                                    final_price = final_ticker_quote.get("bp", current_price)  # Bid price for long
+                                
+                                if final_price > 0:
+                                    current_price = final_price  # Update to latest quote
+                                    # Recalculate profit with latest price for trailing stop check
+                                    profit_percent = cls._calculate_profit_percent(
+                                        enter_price, current_price, original_action
+                                    )
+                            
+                            # Check if profit dropped by 1% from peak
+                            drop_from_peak = peak_profit_percent - profit_percent
+                            if drop_from_peak >= cls.penny_stock_trailing_stop_percent:
+                                should_exit = True
+                                exit_reason = (
+                                    f"Penny stock trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
+                                    f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
+                                    f"trailing stop: {cls.penny_stock_trailing_stop_percent:.2f}%)"
+                                )
+                                exit_data = {"current_price": current_price}
+                                logger.info(
+                                    f"Penny stock {ticker} (${enter_price:.2f}): {exit_reason}"
+                                )
+            
+            # If penny stock trailing stop didn't trigger, evaluate with MarketDataService
+            if not should_exit:
+                should_exit, exit_reason, exit_data = await cls._evaluate_ticker_for_exit(
+                    ticker=ticker,
+                    enter_price=enter_price,
+                    action=original_action,
+                    entry_score=entry_score,
+                )
 
             if should_exit:
                 # Get current price from exit_data
@@ -927,6 +1008,26 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                                 for k, v in technical_indicators_for_exit.items()
                                 if k != "datetime_price"
                             }
+
+                # Get latest second quote right before exit to ensure we use the freshest price
+                latest_quote_response = await MCPClient.get_quote(ticker)
+                if latest_quote_response:
+                    latest_quote_data = latest_quote_response.get("quote", {})
+                    latest_quotes = latest_quote_data.get("quotes", {})
+                    latest_ticker_quote = latest_quotes.get(ticker, {})
+                    
+                    # Use correct price for exit: bid for longs (selling), ask for shorts (buying to cover)
+                    is_short = original_action == "sell_to_open"
+                    if is_short:
+                        latest_exit_price = latest_ticker_quote.get("ap", exit_price)  # Ask price for short exit
+                    else:
+                        latest_exit_price = latest_ticker_quote.get("bp", exit_price)  # Bid price for long exit
+                    
+                    if latest_exit_price > 0:
+                        exit_price = latest_exit_price  # Update to latest quote
+                        logger.debug(f"Using latest quote for {ticker} exit: ${exit_price:.4f}")
+                else:
+                    logger.warning(f"Failed to get latest quote for {ticker}, using previously fetched price")
 
                 await cls._exit_trade(
                     ticker=ticker,

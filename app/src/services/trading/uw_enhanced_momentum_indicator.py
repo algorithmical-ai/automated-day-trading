@@ -80,8 +80,17 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
     # Volatility and low-priced stock filters
     min_stock_price: float = 0.10
-    max_stock_price_for_penny_treatment: float = 3.0
+    max_stock_price_for_penny_treatment: float = (
+        5.0  # Stocks under $5 get special handling (tight trailing stops)
+    )
     max_bid_ask_spread_percent: float = 2.0
+    # Tight trailing stop for penny stocks: exit when profit drops 1% from peak
+    penny_stock_trailing_stop_percent: float = (
+        1.0  # Exit penny stocks when profit drops 1.0% from peak (take profit quickly)
+    )
+    penny_stock_trailing_stop_activation_profit: float = (
+        0.5  # Activate trailing stop after +0.5% profit for penny stocks
+    )
 
     # Dynamic stop loss configuration
     _alpaca_api_key = os.environ.get("REAL_TRADE_API_KEY", "")
@@ -675,10 +684,30 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             return False
 
         technical_analysis = market_data_response.get("technical_analysis", {})
-        exit_price = technical_analysis.get("close_price", 0.0)
+        initial_exit_price = technical_analysis.get("close_price", 0.0)
 
-        if exit_price <= 0:
+        if initial_exit_price <= 0:
             return False
+
+        # Get latest second quote right before exit to ensure we use the freshest price
+        latest_quote_response = await MCPClient.get_quote(ticker_to_exit)
+        exit_price = initial_exit_price  # Default to previously fetched price
+        if latest_quote_response:
+            latest_quote_data = latest_quote_response.get("quote", {})
+            latest_quotes = latest_quote_data.get("quotes", {})
+            latest_ticker_quote = latest_quotes.get(ticker_to_exit, {})
+            
+            # Use correct price for exit: bid for longs (selling), ask for shorts (buying to cover)
+            is_short = original_action == "sell_to_open"
+            if is_short:
+                exit_price = latest_ticker_quote.get("ap", initial_exit_price)  # Ask price for short exit
+            else:
+                exit_price = latest_ticker_quote.get("bp", initial_exit_price)  # Bid price for long exit
+            
+            if exit_price > 0:
+                logger.debug(f"Using latest quote for {ticker_to_exit} preempt exit: ${exit_price:.4f}")
+        else:
+            logger.warning(f"Failed to get latest quote for {ticker_to_exit}, using previously fetched price")
 
         reason = f"Preempted for exceptional trade: {lowest_profit:.2f}% profit"
 
@@ -1234,10 +1263,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if not ticker or enter_price is None or enter_price <= 0:
                 continue
 
-            market_data_response = await MCPClient.get_market_data(ticker)
-            if not market_data_response:
-                continue
-
+            # Get latest quote FIRST for accurate exit decisions (get_quote() is more up-to-date than get_market_data())
             quote_response = await MCPClient.get_quote(ticker)
             if not quote_response:
                 logger.warning(
@@ -1260,8 +1286,14 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 logger.warning(f"Failed to get valid current price for {ticker}")
                 continue
 
-            technical_analysis = market_data_response.get("technical_analysis", {})
-            atr = technical_analysis.get("atr", 0)
+            # Get market data for technical indicators (may be delayed, but don't block exit decisions)
+            # Exit decisions are based on get_quote() which is more up-to-date
+            market_data_response = await MCPClient.get_market_data(ticker)
+            technical_analysis = {}
+            atr = 0
+            if market_data_response:
+                technical_analysis = market_data_response.get("technical_analysis", {})
+                atr = technical_analysis.get("atr", 0)
 
             profit_percent = cls._calculate_profit_percent(
                 enter_price, current_price, original_action
@@ -1278,39 +1310,103 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     f"(threshold: {stop_loss_threshold:.2f}%)"
                 )
 
-            # Check if trailing stop should apply (only after +1% profit as recommended)
+            # Check if trailing stop should apply
             # Trailing stop protects against drops from peak (can trigger even if currently at loss)
             elif not should_exit and peak_profit_percent > 0:
-                # Only activate trailing stop after +1% profit as recommended by judge
-                if peak_profit_percent >= cls.trailing_stop_activation_profit:
+                # For penny stocks, use tighter activation threshold (0.5% vs 1%)
+                is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
+                activation_threshold = (
+                    cls.penny_stock_trailing_stop_activation_profit
+                    if is_penny_stock
+                    else cls.trailing_stop_activation_profit
+                )
+                
+                if peak_profit_percent >= activation_threshold:
                     should_apply_trailing, cooling_reason = (
                         VolatilityUtils.should_apply_trailing_stop(
                             enter_price, created_at, profit_percent
                         )
                     )
                     if should_apply_trailing:
-                        # Calculate ATR-based trailing stop: max(2%, 1.5*ATR)
-                        is_short = original_action == "sell_to_open"
-                        
-                        if atr is not None and atr > 0:
-                            atr_percent = cls._calculate_atr_percent(atr, current_price)
-                            # Use standardized ATR multiplier for trailing stop
-                            atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
-                            volatility_trailing_stop = max(BASE_TRAILING_STOP_PERCENT, atr_based_trailing)
+                        # Get latest quote right before trailing stop evaluation to ensure we use the freshest price
+                        latest_quote_response = await MCPClient.get_quote(ticker)
+                        if latest_quote_response:
+                            latest_quote_data = latest_quote_response.get("quote", {})
+                            latest_quotes = latest_quote_data.get("quotes", {})
+                            latest_ticker_quote = latest_quotes.get(ticker, {})
                             
-                            # Widen trailing stop for shorts
+                            # Update current price with latest quote for accurate trailing stop calculation
+                            is_short = original_action == "sell_to_open"
                             if is_short:
-                                volatility_trailing_stop = (
-                                    volatility_trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
+                                latest_price = latest_ticker_quote.get("ap", current_price)  # Ask price for short
+                            else:
+                                latest_price = latest_ticker_quote.get("bp", current_price)  # Bid price for long
+                            
+                            if latest_price > 0:
+                                current_price = latest_price  # Update to latest quote
+                                # Recalculate profit with latest price
+                                profit_percent = cls._calculate_profit_percent(
+                                    enter_price, current_price, original_action
                                 )
-                                # Cap at maximum for shorts
-                                volatility_trailing_stop = min(MAX_TRAILING_STOP_SHORT, volatility_trailing_stop)
+                                logger.debug(f"Refreshed quote for {ticker} trailing stop check: ${current_price:.4f}")
+                        
+                        # Check if this is a penny stock (< $5) - use tight trailing stop
+                        is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
+                        
+                        if is_penny_stock:
+                            # For penny stocks: use tight trailing stop (1% drop from peak)
+                            # Exit quickly to lock in profits on volatile penny stocks
+                            volatility_trailing_stop = cls.penny_stock_trailing_stop_percent
+                            logger.debug(
+                                f"Penny stock {ticker} (${enter_price:.2f}): "
+                                f"Using tight trailing stop of {volatility_trailing_stop:.2f}% "
+                                f"(exit when profit drops {volatility_trailing_stop:.2f}% from peak)"
+                            )
                         else:
-                            # Fallback to base trailing stop
-                            volatility_trailing_stop = cls.trailing_stop_percent
+                            # For non-penny stocks: use ATR-based trailing stop
+                            # Calculate ATR-based trailing stop: max(2%, 1.5*ATR)
+                            is_short = original_action == "sell_to_open"
+                            
+                            if atr is not None and atr > 0:
+                                atr_percent = cls._calculate_atr_percent(atr, current_price)
+                                # Use standardized ATR multiplier for trailing stop
+                                atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
+                                volatility_trailing_stop = max(BASE_TRAILING_STOP_PERCENT, atr_based_trailing)
+                                
+                                # Widen trailing stop for shorts
+                                if is_short:
+                                    volatility_trailing_stop = (
+                                        volatility_trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
+                                    )
+                                    # Cap at maximum for shorts
+                                    volatility_trailing_stop = min(MAX_TRAILING_STOP_SHORT, volatility_trailing_stop)
+                            else:
+                                # Fallback to base trailing stop
+                                volatility_trailing_stop = cls.trailing_stop_percent
+                                if is_short:
+                                    volatility_trailing_stop = (
+                                        volatility_trailing_stop * cls.trailing_stop_short_multiplier
+                                    )
+                        
+                        # Get latest quote right before trailing stop trigger check to ensure we use the freshest price
+                        final_quote_response = await MCPClient.get_quote(ticker)
+                        if final_quote_response:
+                            final_quote_data = final_quote_response.get("quote", {})
+                            final_quotes = final_quote_data.get("quotes", {})
+                            final_ticker_quote = final_quotes.get(ticker, {})
+                            
+                            # Update current price with latest quote for final trailing stop check
+                            is_short = original_action == "sell_to_open"
                             if is_short:
-                                volatility_trailing_stop = (
-                                    volatility_trailing_stop * cls.trailing_stop_short_multiplier
+                                final_price = final_ticker_quote.get("ap", current_price)  # Ask price for short
+                            else:
+                                final_price = final_ticker_quote.get("bp", current_price)  # Bid price for long
+                            
+                            if final_price > 0:
+                                current_price = final_price  # Update to latest quote
+                                # Recalculate profit with latest price for trailing stop check
+                                profit_percent = cls._calculate_profit_percent(
+                                    enter_price, current_price, original_action
                                 )
                         
                         drop_from_peak = peak_profit_percent - profit_percent
@@ -1327,7 +1423,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     logger.debug(
                         f"Trailing stop not active for {ticker}: "
                         f"peak profit {peak_profit_percent:.2f}% < activation threshold "
-                        f"{cls.trailing_stop_activation_profit:.2f}%"
+                        f"{activation_threshold:.2f}% {'(penny stock)' if is_penny_stock else ''}"
                     )
 
             # Profit target: 2x stop distance as recommended
@@ -1350,23 +1446,31 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if not should_exit:
                 if profit_percent > peak_profit_percent:
                     peak_profit_percent = profit_percent
-                    # Calculate dynamic trailing stop: max(2%, 1.5*ATR)
-                    is_short = original_action == "sell_to_open"
+                    # Check if this is a penny stock (< $5) - use tight trailing stop
+                    is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
                     
-                    if atr is not None and atr > 0:
-                        atr_percent = cls._calculate_atr_percent(atr, current_price)
-                        atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
-                        trailing_stop = max(BASE_TRAILING_STOP_PERCENT, atr_based_trailing)
-                        
-                        # Widen trailing stop for shorts
-                        if is_short:
-                            trailing_stop = trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
-                            trailing_stop = min(MAX_TRAILING_STOP_SHORT, trailing_stop)
+                    if is_penny_stock:
+                        # For penny stocks: use tight trailing stop (1% drop from peak)
+                        trailing_stop = cls.penny_stock_trailing_stop_percent
                     else:
-                        # Fallback to base trailing stop
-                        trailing_stop = cls.trailing_stop_percent
-                        if is_short:
-                            trailing_stop = trailing_stop * cls.trailing_stop_short_multiplier
+                        # For non-penny stocks: use ATR-based trailing stop
+                        # Calculate dynamic trailing stop: max(2%, 1.5*ATR)
+                        is_short = original_action == "sell_to_open"
+                        
+                        if atr is not None and atr > 0:
+                            atr_percent = cls._calculate_atr_percent(atr, current_price)
+                            atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
+                            trailing_stop = max(BASE_TRAILING_STOP_PERCENT, atr_based_trailing)
+                            
+                            # Widen trailing stop for shorts
+                            if is_short:
+                                trailing_stop = trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
+                                trailing_stop = min(MAX_TRAILING_STOP_SHORT, trailing_stop)
+                        else:
+                            # Fallback to base trailing stop
+                            trailing_stop = cls.trailing_stop_percent
+                            if is_short:
+                                trailing_stop = trailing_stop * cls.trailing_stop_short_multiplier
 
                 skipped_reason = (
                     f"Profit: {profit_percent:.2f}%, "
@@ -1410,11 +1514,31 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     technical_indicators_for_exit,
                 )
 
+                # Get latest second quote right before exit to ensure we use the freshest price
+                latest_quote_response = await MCPClient.get_quote(ticker)
+                exit_price = current_price  # Default to previously fetched price
+                if latest_quote_response:
+                    latest_quote_data = latest_quote_response.get("quote", {})
+                    latest_quotes = latest_quote_data.get("quotes", {})
+                    latest_ticker_quote = latest_quotes.get(ticker, {})
+                    
+                    # Use correct price for exit: bid for longs (selling), ask for shorts (buying to cover)
+                    is_short = original_action == "sell_to_open"
+                    if is_short:
+                        exit_price = latest_ticker_quote.get("ap", current_price)  # Ask price for short exit
+                    else:
+                        exit_price = latest_ticker_quote.get("bp", current_price)  # Bid price for long exit
+                    
+                    if exit_price > 0:
+                        logger.debug(f"Using latest quote for {ticker} exit: ${exit_price:.4f}")
+                else:
+                    logger.warning(f"Failed to get latest quote for {ticker}, using previously fetched price")
+
                 await cls._exit_trade(
                     ticker=ticker,
                     original_action=original_action,
                     enter_price=enter_price,
-                    exit_price=current_price,
+                    exit_price=exit_price,
                     exit_reason=exit_reason,
                     technical_indicators_enter=technical_indicators_for_enter,
                     technical_indicators_exit=technical_indicators_for_exit,
