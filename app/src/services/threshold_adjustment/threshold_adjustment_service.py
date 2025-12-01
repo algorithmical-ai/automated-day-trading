@@ -181,7 +181,7 @@ class ThresholdAdjustmentService:
             logger.info(
                 f"✅ Successfully stored day trader event for {indicator_name} on {current_date} "
                 f"in DayTraderEvents table"
-            )
+        )
 
         if threshold_changes or max_long != 5 or max_short != 5:
             logger.info(

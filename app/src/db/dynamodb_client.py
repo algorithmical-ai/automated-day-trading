@@ -106,6 +106,50 @@ class DynamoDBClient:
         return False
 
     @classmethod
+    def _convert_utc_to_est_isoformat(cls, timestamp_str: Optional[str] = None) -> str:
+        """
+        Convert UTC timestamp to EST timezone and return as ISO format string.
+        If timestamp_str is provided, convert it from UTC to EST.
+        If None, get current UTC time and convert to EST.
+        
+        Args:
+            timestamp_str: Optional ISO format timestamp string (assumed UTC if provided)
+            
+        Returns:
+            ISO format timestamp string in EST timezone
+        """
+        est_tz = pytz.timezone("America/New_York")
+        
+        if timestamp_str:
+            # Parse the timestamp string (assume UTC if no timezone info)
+            try:
+                if timestamp_str.endswith('Z'):
+                    # Remove Z and parse as UTC
+                    dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                elif '+' in timestamp_str or timestamp_str.count('-') > 2:
+                    # Has timezone info
+                    dt = datetime.fromisoformat(timestamp_str)
+                else:
+                    # No timezone info, assume UTC
+                    dt = datetime.fromisoformat(timestamp_str).replace(tzinfo=timezone.utc)
+                
+                # If naive datetime, assume UTC
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                
+                # Convert to EST
+                est_time = dt.astimezone(est_tz)
+            except Exception as e:
+                logger.warning(f"Error parsing timestamp {timestamp_str}, using current time: {e}")
+                est_time = datetime.now(est_tz)
+        else:
+            # Get current UTC time and convert to EST
+            utc_now = datetime.now(timezone.utc)
+            est_time = utc_now.astimezone(est_tz)
+        
+        return est_time.isoformat()
+
+    @classmethod
     def _convert_to_decimal(cls, obj):
         """Convert float-like values to Decimal for DynamoDB"""
         if isinstance(obj, bool):
@@ -182,7 +226,7 @@ class DynamoDBClient:
                 "enter_price": cls._convert_to_decimal(enter_price),
                 "enter_reason": enter_reason,
                 "enter_response": cls._convert_to_decimal(enter_response),
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": cls._convert_utc_to_est_isoformat(),  # Store in EST timezone
             }
             cls._table.put_item(Item=item)
             logger.info(f"Added trade to DynamoDB: {ticker} - {action}")
@@ -244,7 +288,7 @@ class DynamoDBClient:
                 "enter_reason": enter_reason,
                 "trailing_stop": cls._convert_to_decimal(0.5),  # Initialize to 0.5%
                 "peak_profit_percent": cls._convert_to_decimal(0.0),  # Initialize to 0%
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": cls._convert_utc_to_est_isoformat(),  # Store in EST timezone
             }
 
             # Add dynamic stop loss if provided
@@ -670,14 +714,18 @@ class DynamoDBClient:
         """
         try:
             # Prepare the completed trade entry
+            # Convert timestamps from UTC to EST before storing
+            enter_timestamp_est = cls._convert_utc_to_est_isoformat(enter_timestamp)
+            exit_timestamp_est = cls._convert_utc_to_est_isoformat(exit_timestamp)
+            
             completed_trade = {
                 "ticker": ticker,
                 "action": action.upper(),  # Ensure uppercase (BUY_TO_OPEN, SELL_TO_OPEN)
                 "enter_price": cls._convert_to_decimal(enter_price),
                 "enter_reason": enter_reason,
-                "enter_timestamp": enter_timestamp,
+                "enter_timestamp": enter_timestamp_est,  # Store in EST timezone
                 "exit_price": cls._convert_to_decimal(exit_price),
-                "exit_timestamp": exit_timestamp,
+                "exit_timestamp": exit_timestamp_est,  # Store in EST timezone
                 "exit_reason": exit_reason,
                 "profit_or_loss": cls._convert_to_decimal(profit_or_loss),
                 "technical_indicators_for_enter": cls._convert_to_decimal(

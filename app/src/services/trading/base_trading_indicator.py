@@ -105,13 +105,13 @@ class BaseTradingIndicator(ABC):
     async def _increment_daily_trade_count(cls):
         """Increment daily trade counter (thread-safe)"""
         async with cls._daily_count_lock:
-            today = date.today().isoformat()
+        today = date.today().isoformat()
 
-            if cls.daily_trades_date != today:
-                cls.daily_trades_count = 0
-                cls.daily_trades_date = today
+        if cls.daily_trades_date != today:
+            cls.daily_trades_count = 0
+            cls.daily_trades_date = today
 
-            cls.daily_trades_count += 1
+        cls.daily_trades_count += 1
 
     @classmethod
     async def _check_market_open(cls) -> bool:
