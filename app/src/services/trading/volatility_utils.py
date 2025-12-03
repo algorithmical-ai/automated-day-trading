@@ -318,10 +318,11 @@ class VolatilityUtils:
         # Calculate position within Bollinger Bands (0 = lower, 1 = upper)
         position_in_band = (current_price - bollinger_lower) / band_width
 
-        # For LONG entries, reject if price is already at upper band (>90%)
-        if momentum_score > 0 and position_in_band > 0.90:
+        # For LONG entries, reject if price is already near the upper band (>85%)
+        # This is stricter to avoid chasing moves at exhaustion.
+        if momentum_score > 0 and position_in_band > 0.85:
             return True, (
-                f"Price at upper Bollinger ({position_in_band:.0%}), "
+                f"Price near/at upper Bollinger ({position_in_band:.0%}), "
                 "likely to mean-revert down"
             )
 

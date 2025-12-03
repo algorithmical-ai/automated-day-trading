@@ -1780,37 +1780,45 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"Force exit for {ticker} before market close: {exit_reason}"
                 )
 
-            # Time-based exit for volatile/low-priced stocks (check after getting market data)
+            # Time-based exit for volatile (non-penny) stocks only.
+            # For penny stocks (< $5), we rely on trailing stops and other rules, not a hard time limit.
             if holding_period_minutes > 0:
                 is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
-                atr = technical_analysis.get("atr", 0.0)
-                atr_percent = (
-                    cls._calculate_atr_percent(atr, current_price)
-                    if atr is not None and atr > 0 and current_price > 0
-                    else 0.0
-                )
-                is_volatile = atr_percent > 3.0
 
-                max_holding_minutes = None
                 if is_low_price:
-                    max_holding_minutes = cls.max_holding_time_penny_stocks_minutes
-                elif is_volatile:
-                    max_holding_minutes = cls.max_holding_time_volatile_stocks_minutes
+                    logger.debug(
+                        f"Skipping time-based exit for penny stock {ticker}: "
+                        f"holding {holding_period_minutes:.1f} min, profit {profit_percent:.2f}%"
+                    )
+                else:
+                    atr = technical_analysis.get("atr", 0.0)
+                    atr_percent = (
+                        cls._calculate_atr_percent(atr, current_price)
+                        if atr is not None and atr > 0 and current_price > 0
+                        else 0.0
+                    )
+                    is_volatile = atr_percent > 3.0
 
-                if (
-                    max_holding_minutes
-                    and holding_period_minutes >= max_holding_minutes
-                ):
-                    should_exit = True
-                    exit_reason = (
-                        f"Time-based exit: held for {holding_period_minutes:.1f} minutes "
-                        f"(max: {max_holding_minutes} min for {'penny' if is_low_price else 'volatile'} stock, "
-                        f"profit: {profit_percent:.2f}%)"
-                    )
-                    logger.info(
-                        f"Exit signal for {ticker} - time-based exit: "
-                        f"held {holding_period_minutes:.1f} min, profit: {profit_percent:.2f}%"
-                    )
+                    max_holding_minutes = None
+                    if is_volatile:
+                        max_holding_minutes = (
+                            cls.max_holding_time_volatile_stocks_minutes
+                        )
+
+                    if (
+                        max_holding_minutes
+                        and holding_period_minutes >= max_holding_minutes
+                    ):
+                        should_exit = True
+                        exit_reason = (
+                            f"Time-based exit: held for {holding_period_minutes:.1f} minutes "
+                            f"(max: {max_holding_minutes} min for volatile stock, "
+                            f"profit: {profit_percent:.2f}%)"
+                        )
+                        logger.info(
+                            f"Exit signal for {ticker} - time-based exit: "
+                            f"held {holding_period_minutes:.1f} min, profit: {profit_percent:.2f}%"
+                        )
 
             if profit_percent < stop_loss_threshold:
                 should_exit = True

@@ -91,6 +91,12 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         5.0  # Stocks under $5 get special handling (tight trailing stops)
     )
     max_bid_ask_spread_percent: float = 2.0
+    # Maximum allowed price drift between technical snapshot and actual fill (%)
+    # If real-time entry is much worse than the price used for indicators, skip the trade.
+    max_price_drift_percent_long: float = 3.0
+    max_price_drift_percent_short: float = 3.0
+    # Hard cap on dollar exposure for penny stocks to limit absolute risk
+    max_penny_stock_position_dollars: float = 2000.0
     # Tight trailing stop for penny stocks: exit when profit drops 1% from peak
     penny_stock_trailing_stop_percent: float = (
         1.0  # Exit penny stocks when profit drops 1.0% from peak (take profit quickly)
@@ -145,11 +151,15 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         # Start with volatility adjustment
         position = base_position_dollars * volatility_multiplier
 
-        # Further reduce for penny stock risk
+        # Further reduce for penny stock risk and cap absolute exposure
         if penny_stock_risk_score > 0:
             # Risk score 0-100: 50 = no adjustment, 75 = 50% reduction, 100 = 75% reduction
             risk_reduction = max(0, (penny_stock_risk_score - 50) / 100)
             position *= 1 - risk_reduction
+
+            # Use a conservative hard cap for penny stocks (e.g., ~$2,000 exposure)
+            max_penny_exposure = cls.max_penny_stock_position_dollars
+            position = min(position, max_penny_exposure)
 
         # Minimum position size floor
         return max(500, position)  # Never less than $500
@@ -212,15 +222,22 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
             spread = ask - bid
             spread_percent = (spread / enter_price) * 100 if enter_price > 0 else 0.0
+            spread_abs = spread
 
             max_spread = cls.max_bid_ask_spread_percent
-            if enter_price < cls.max_stock_price_for_penny_treatment:
-                max_spread = cls.max_bid_ask_spread_percent * 1.5
+
+            # For very low-priced stocks, also enforce an absolute spread cap
+            max_abs_spread: Optional[float] = None
+            if enter_price < 1.0:
+                max_abs_spread = 0.01
 
             is_acceptable = spread_percent <= max_spread
+            if is_acceptable and max_abs_spread is not None:
+                is_acceptable = spread_abs <= max_abs_spread
+
             reason = (
                 f"Spread: {spread_percent:.2f}% "
-                f"{'acceptable' if is_acceptable else f'(exceeds {max_spread:.2f}% limit)'}"
+                f"{'acceptable' if is_acceptable else '(exceeds spread limits)'}"
             )
 
             return is_acceptable, spread_percent, reason
@@ -485,6 +502,25 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         if is_reverting:
             return False, revert_reason
 
+        # Additional exhaustion guard for longs: price near upper band + overbought WillR
+        if momentum_score > 0 and isinstance(bollinger, dict):
+            willr = technical_analysis.get("willr")
+            if (
+                willr is not None
+                and upper > 0
+                and lower > 0
+                and current_price > 0
+                and willr > -10  # very overbought
+            ):
+                band_width = upper - lower
+                if band_width > 0:
+                    position_in_band = (current_price - lower) / band_width
+                    if position_in_band >= 0.9:
+                        return False, (
+                            "Mean reversion risk: price near upper Bollinger with "
+                            f"overbought WillR ({willr:.1f})"
+                        )
+
         return True, f"Passed volatility filters ({vol_reason})"
 
     @classmethod
@@ -545,6 +581,31 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 False,
                 f"RSI {rsi:.1f} outside acceptable range [{cls.rsi_min_for_long}-{cls.rsi_max_for_long}] for long entry",
             )
+
+        # Additional exhaustion filter for longs, especially penny/low-priced stocks:
+        # If RSI is high and other oscillators are screaming overbought, skip the trade.
+        if is_long:
+            mfi = technical_analysis.get("mfi")
+            stoch = technical_analysis.get("stoch", {})
+            stoch_k = stoch.get("k") if isinstance(stoch, dict) else None
+            willr = technical_analysis.get("willr")
+
+            is_penny_or_low = current_price < cls.max_stock_price_for_penny_treatment
+            if (
+                is_penny_or_low
+                and rsi is not None
+                and rsi > 60.0
+                and (
+                    (mfi is not None and mfi > 80.0)
+                    or (stoch_k is not None and stoch_k > 90.0)
+                    or (willr is not None and willr > -10.0)
+                )
+            ):
+                return (
+                    False,
+                    "Exhaustion cluster for long: high RSI with overbought MFI/Stoch/WillR "
+                    f"(RSI={rsi:.1f}, MFI={mfi}, StochK={stoch_k}, WillR={willr})",
+                )
 
         if is_short and rsi < cls.rsi_min_for_short:
             return (
@@ -1122,6 +1183,20 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 )
                 continue
 
+            # Slippage/drift guard: if real-time entry is far above the price used for
+            # technicals, skip to avoid chasing.
+            if current_price_hint and current_price_hint > 0:
+                drift_pct = (
+                    (enter_price - current_price_hint) / current_price_hint * 100
+                )
+                if drift_pct > cls.max_price_drift_percent_long:
+                    logger.info(
+                        f"Skipping {ticker} long entry due to price drift: "
+                        f"{drift_pct:.2f}% > {cls.max_price_drift_percent_long:.2f}% "
+                        f"(analysis price={current_price_hint:.4f}, enter={enter_price:.4f})"
+                    )
+                    continue
+
             technical_analysis = market_data_response.get("technical_analysis", {})
             atr = technical_analysis.get("atr", 0)
 
@@ -1265,6 +1340,20 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                     f"Failed to get entry price for {ticker} from {quote_source}"
                 )
                 continue
+
+            # Slippage/drift guard for shorts: avoid entering if fill is far below
+            # the price used for technicals (chasing downside).
+            if current_price_hint and current_price_hint > 0:
+                drift_pct = (
+                    (current_price_hint - enter_price) / current_price_hint * 100
+                )
+                if drift_pct > cls.max_price_drift_percent_short:
+                    logger.info(
+                        f"Skipping {ticker} short entry due to price drift: "
+                        f"{drift_pct:.2f}% > {cls.max_price_drift_percent_short:.2f}% "
+                        f"(analysis price={current_price_hint:.4f}, enter={enter_price:.4f})"
+                    )
+                    continue
 
             atr = technical_analysis.get("atr", 0)
 
