@@ -1769,16 +1769,23 @@ class MomentumIndicator(BaseTradingIndicator):
             should_exit = False
             exit_reason = None
 
-            # Force exit before market close
+            # Force exit before market close ONLY if trade is profitable
+            # Hold losing trades until next day (unless stop loss is hit)
             if is_near_close:
-                should_exit = True
-                exit_reason = (
-                    f"End-of-day closure: exiting {cls.minutes_before_close_to_exit} minutes before market close "
-                    f"(current profit: {profit_percent:.2f}%)"
-                )
-                logger.info(
-                    f"Force exit for {ticker} before market close: {exit_reason}"
-                )
+                if profit_percent > 0:
+                    should_exit = True
+                    exit_reason = (
+                        f"End-of-day closure: exiting {cls.minutes_before_close_to_exit} minutes before market close "
+                        f"(current profit: {profit_percent:.2f}%)"
+                    )
+                    logger.info(
+                        f"Force exit for {ticker} before market close: {exit_reason}"
+                    )
+                else:
+                    logger.info(
+                        f"Holding {ticker} at end of day (current loss: {profit_percent:.2f}%) - "
+                        f"will exit when profitable or stop loss triggered"
+                    )
 
             # Time-based exit for volatile (non-penny) stocks only.
             # For penny stocks (< $5), we rely on trailing stops and other rules, not a hard time limit.
