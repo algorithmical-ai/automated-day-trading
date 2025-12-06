@@ -167,7 +167,8 @@ class MomentumIndicator(BaseTradingIndicator):
         est_tz = pytz.timezone("America/New_York")
         current_time_est = datetime.now(est_tz)
         current_hour = current_time_est.hour
-        return current_hour >= cls.max_entry_hour_et
+        # Use > instead of >= to allow entries until 3:59 PM ET
+        return current_hour > cls.max_entry_hour_et
 
     @classmethod
     def _calculate_atr_percent(cls, atr: float, current_price: float) -> float:
@@ -1232,8 +1233,10 @@ class MomentumIndicator(BaseTradingIndicator):
                 continue
 
             # Check price action confirmation before other filters
-            technical_analysis = market_data_response.get("technical_analysis", {})
-            datetime_price = technical_analysis.get("datetime_price", [])
+            # Re-fetch technical_analysis from market_data_response to get original datetime_price
+            # (it was removed earlier for momentum calculation, but we need it for structure check)
+            technical_analysis_for_structure = market_data_response.get("technical_analysis", {})
+            datetime_price = technical_analysis_for_structure.get("datetime_price", [])
             if datetime_price:
                 prices = []
                 for entry in datetime_price:
@@ -1357,6 +1360,23 @@ class MomentumIndicator(BaseTradingIndicator):
             f"MAB selected {len(top_upward)} upward momentum tickers and "
             f"{len(top_downward)} downward momentum tickers (top_k={cls.top_k})"
         )
+        
+        # Diagnostic logging for zero trades
+        if len(top_upward) == 0 and len(top_downward) == 0:
+            logger.warning(
+                f"⚠️ MAB service returned zero tickers! "
+                f"Upward candidates: {len(upward_tickers)}, "
+                f"Downward candidates: {len(downward_tickers)}, "
+                f"Total passed filters: {len(ticker_momentum_scores)}"
+            )
+        elif len(upward_tickers) > 0 and len(top_upward) == 0:
+            logger.warning(
+                f"⚠️ MAB service returned zero upward tickers despite {len(upward_tickers)} candidates passing filters"
+            )
+        elif len(downward_tickers) > 0 and len(top_downward) == 0:
+            logger.warning(
+                f"⚠️ MAB service returned zero downward tickers despite {len(downward_tickers)} candidates passing filters"
+            )
 
         for rank, (ticker, momentum_score, reason) in enumerate(top_upward, start=1):
             if not cls.running:
@@ -1377,7 +1397,7 @@ class MomentumIndicator(BaseTradingIndicator):
                             f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
                             f"Skipping {ticker} (not golden/exceptional)."
                         )
-                        break
+                        continue  # Check next ticker instead of breaking
                     else:
                         logger.info(
                             f"Daily trade limit reached, but {ticker} is GOLDEN "
@@ -1388,7 +1408,7 @@ class MomentumIndicator(BaseTradingIndicator):
                         f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
                         f"Skipping {ticker} (no market data to verify golden status)."
                     )
-                    break
+                    continue  # Check next ticker instead of breaking
 
             active_trades = await cls._get_active_trades()
             active_count = len(active_trades)
@@ -1513,7 +1533,7 @@ class MomentumIndicator(BaseTradingIndicator):
                             f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
                             f"Skipping {ticker} (not golden/exceptional)."
                         )
-                        break
+                        continue  # Check next ticker instead of breaking
                     else:
                         logger.info(
                             f"Daily trade limit reached, but {ticker} is GOLDEN "
@@ -1524,7 +1544,7 @@ class MomentumIndicator(BaseTradingIndicator):
                         f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
                         f"Skipping {ticker} (no market data to verify golden status)."
                     )
-                    break
+                    continue  # Check next ticker instead of breaking
 
             active_trades = await cls._get_active_trades()
             active_count = len(active_trades)
