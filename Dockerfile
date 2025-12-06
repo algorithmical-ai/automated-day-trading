@@ -39,8 +39,9 @@ RUN conda info --envs && \
     conda run -n automated_trading_system_env python --version && \
     conda run -n automated_trading_system_env pip list
 
-# Expose the port
-EXPOSE $PORT
+# Expose port (Heroku will map this dynamically via PORT env var)
+# Using a common port, but Heroku will override via PORT env var at runtime
+EXPOSE 8000
 
 # Set environment variables for better logging in Docker
 ENV PYTHONUNBUFFERED=1

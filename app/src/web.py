@@ -36,7 +36,28 @@ async def main():
     import os
     
     port = os.environ.get("PORT", "8000")
-    logger.info(f"Starting web process with MCP server and trading application on PORT={port}...")
+    dyno = os.environ.get("DYNO")
+    is_heroku = bool(dyno)
+    
+    if is_heroku:
+        heroku_app_name = (
+            os.environ.get("HEROKU_APP_NAME") or
+            os.environ.get("APP_NAME") or
+            None
+        )
+        if heroku_app_name:
+            public_url = f"https://{heroku_app_name}.herokuapp.com"
+        else:
+            public_url = "https://YOUR-APP-NAME.herokuapp.com"
+        
+        logger.info("=" * 70)
+        logger.info("🚀 Starting web process on Heroku")
+        logger.info(f"📦 DYNO: {dyno}")
+        logger.info(f"🔌 Internal PORT: {port}")
+        logger.info(f"🌐 Public URL: {public_url}")
+        logger.info("=" * 70)
+    else:
+        logger.info(f"Starting web process with MCP server and trading application on PORT={port}...")
     
     try:
         # Start MCP server first (it's the web server, must start first)
@@ -53,7 +74,10 @@ async def main():
         logger.info("✅ Trading application task started")
         
         logger.info("✅ Both tasks created and running")
-        logger.info(f"📡 MCP server should be available at: http://0.0.0.0:{port}/mcp")
+        if is_heroku:
+            logger.info(f"📡 MCP server available at: {public_url}/mcp")
+        else:
+            logger.info(f"📡 MCP server should be available at: http://0.0.0.0:{port}/mcp")
         
         # Wait for both tasks (they run indefinitely)
         # If MCP server crashes, we want to know about it
