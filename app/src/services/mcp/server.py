@@ -274,28 +274,75 @@ def main_sync() -> None:
 
 async def _run_streamable_with_discovery() -> None:
     import uvicorn
-    
-    # Patch uvicorn Server to disable host header validation for Heroku compatibility
-    # Uvicorn validates Host header in the Server class before forwarding to ASGI app
+
+    # Patch uvicorn to disable host header validation for Heroku compatibility
+    # Uvicorn validates Host header and returns 421 if it doesn't match
+    # We need to patch the protocol handlers to bypass this validation
     try:
-        from uvicorn.server import Server
+        # Try patching the HTTP protocol implementations
+        # Uvicorn uses different protocols (httptools, h11, etc.)
+        patched = False
         
-        # Store original _should_check_host method if it exists
-        if hasattr(Server, '_should_check_host'):
-            original_should_check_host = Server._should_check_host
+        # Try httptools protocol
+        try:
+            from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
             
-            def patched_should_check_host(self, headers):
-                # Always return False to disable host checking
-                return False
+            if hasattr(HttpToolsProtocol, "should_check_host"):
+                original_should_check_host = HttpToolsProtocol.should_check_host
+                
+                @staticmethod
+                def patched_should_check_host(headers):
+                    return False
+                
+                HttpToolsProtocol.should_check_host = patched_should_check_host
+                patched = True
+                logger.info("✅ Patched HttpToolsProtocol.should_check_host")
+        except (ImportError, AttributeError):
+            pass
+        
+        # Try h11 protocol
+        try:
+            from uvicorn.protocols.http.h11_impl import H11Protocol
             
-            Server._should_check_host = patched_should_check_host
-            logger.info("✅ Patched uvicorn Server._should_check_host to bypass validation")
+            if hasattr(H11Protocol, "should_check_host"):
+                original_should_check_host = H11Protocol.should_check_host
+                
+                @staticmethod
+                def patched_should_check_host(headers):
+                    return False
+                
+                H11Protocol.should_check_host = patched_should_check_host
+                patched = True
+                logger.info("✅ Patched H11Protocol.should_check_host")
+        except (ImportError, AttributeError):
+            pass
+        
+        # Try patching Server class directly
+        try:
+            from uvicorn.server import Server
+            
+            # Patch the _check_host method if it exists
+            if hasattr(Server, "_check_host"):
+                original_check_host = Server._check_host
+                
+                def patched_check_host(self, headers):
+                    # Always allow - bypass host validation
+                    return True
+                
+                Server._check_host = patched_check_host
+                patched = True
+                logger.info("✅ Patched Server._check_host")
+        except (ImportError, AttributeError):
+            pass
+        
+        if not patched:
+            logger.warning("⚠️  Could not find uvicorn host validation methods to patch")
+            logger.warning("⚠️  Host header validation may still cause issues on Heroku")
         else:
-            # Try patching the protocol's host validation
-            # The host validation might be in the protocol implementation
-            logger.info("ℹ️  uvicorn Server._should_check_host not found, using ASGI wrapper approach")
-    except (ImportError, AttributeError) as e:
-        logger.warning(f"⚠️  Could not patch uvicorn host validation: {e}")
+            logger.info("✅ Successfully patched uvicorn host validation")
+            
+    except Exception as e:
+        logger.warning(f"⚠️  Error patching uvicorn host validation: {e}")
         logger.warning("⚠️  Host header validation may still cause issues on Heroku")
 
     # Get host and port from environment (Heroku compatibility)
