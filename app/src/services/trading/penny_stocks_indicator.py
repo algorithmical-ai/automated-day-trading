@@ -301,7 +301,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             1 for ticker in all_tickers if cls._is_special_security(ticker)
         )
         if special_securities_count > 0:
-            logger.info(
+            logger.debug(
                 f"Filtered out {special_securities_count} special securities (warrants/rights)"
             )
 
@@ -346,7 +346,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         candidates_to_fetch = penny_stock_candidates
 
-        logger.info(
+        logger.debug(
             f"Price filtering: {len(candidates_to_fetch)} penny stocks (< ${cls.max_stock_price:.2f}), "
             f"{price_filtered_count} filtered out (>= ${cls.max_stock_price:.2f} or no price data)"
         )

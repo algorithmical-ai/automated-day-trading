@@ -5,6 +5,7 @@ DynamoDB Client for managing active trades
 from typing_extensions import Set
 import boto3
 import json
+import math
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
@@ -106,6 +107,20 @@ class DynamoDBClient:
         return False
 
     @classmethod
+    def _is_invalid_number(cls, obj):
+        """Check if a number is Infinity or NaN (not supported by DynamoDB)"""
+        if isinstance(obj, (float, int)):
+            return math.isinf(obj) or math.isnan(obj)
+        try:
+            import numpy as np
+
+            if isinstance(obj, (np.floating, np.integer)):
+                return np.isinf(obj) or np.isnan(obj)
+        except (ImportError, TypeError):
+            pass
+        return False
+
+    @classmethod
     def _convert_utc_to_est_isoformat(cls, timestamp_str: Optional[str] = None) -> str:
         """
         Convert UTC timestamp to EST timezone and return as ISO format string.
@@ -178,19 +193,34 @@ class DynamoDBClient:
 
     @classmethod
     def _ensure_all_floats_converted(cls, obj):
-        """Recursively ensure all float values in a structure are converted to Decimal"""
+        """Recursively ensure all float values in a structure are converted to Decimal.
+        Infinity and NaN values are converted to None (not supported by DynamoDB).
+        """
         if isinstance(obj, dict):
             converted = {}
             for key, value in obj.items():
-                if cls._is_float_type(value):
+                if cls._is_invalid_number(value):
+                    # Convert Infinity/NaN to None (DynamoDB doesn't support these)
+                    converted[key] = None
+                elif cls._is_float_type(value):
                     converted[key] = Decimal(str(float(value)))
-                elif isinstance(value, (dict, list)):
-                    converted[key] = cls._ensure_all_floats_converted(value)
+                elif isinstance(value, (dict, list, tuple)):
+                    # Handle tuples by converting to list, processing, then back to tuple
+                    if isinstance(value, tuple):
+                        converted[key] = tuple(cls._ensure_all_floats_converted(list(value)))
+                    else:
+                        converted[key] = cls._ensure_all_floats_converted(value)
                 else:
                     converted[key] = value
             return converted
-        elif isinstance(obj, list):
+        elif isinstance(obj, (list, tuple)):
+            # Handle tuples by converting to list, processing, then back to tuple
+            if isinstance(obj, tuple):
+                return tuple([cls._ensure_all_floats_converted(item) for item in obj])
             return [cls._ensure_all_floats_converted(item) for item in obj]
+        elif cls._is_invalid_number(obj):
+            # Convert Infinity/NaN to None
+            return None
         elif cls._is_float_type(obj):
             return Decimal(str(float(obj)))
         return obj
