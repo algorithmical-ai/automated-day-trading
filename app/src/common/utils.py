@@ -2,6 +2,7 @@
 Common utility functions
 """
 
+import asyncio
 import functools
 import inspect
 import time
@@ -10,9 +11,10 @@ from typing import Any, Callable, Union
 from typing_extensions import Dict
 
 import pytz
-
+from app.src.common.alpaca import AlpacaClient
 from app.src.common.loguru_logger import logger
 from app.src.models.technical_indicators import TechnicalIndicators
+
 
 def adjust_date_backward(date_str: str) -> str:
     """
@@ -120,15 +122,18 @@ def measure_latency(func: Callable) -> Callable:
         try:
             result = await func(*args, **kwargs)
             elapsed_time = time.perf_counter() - start_time
-            logger.info(f"⏱️  {display_name} completed in {elapsed_time:.3f}s")
+            if await AlpacaClient.is_market_open():
+                logger.info(f"⏱️  {display_name} completed in {elapsed_time:.3f}s")
             return result
         except Exception as e:
             elapsed_time = time.perf_counter() - start_time
-            logger.warning(f"⏱️  {display_name} failed after {elapsed_time:.3f}s: {str(e)}")
+            logger.warning(
+                f"⏱️  {display_name} failed after {elapsed_time:.3f}s: {str(e)}"
+            )
             raise
 
     @functools.wraps(func)
-    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+    async def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
         start_time = time.perf_counter()
         func_name = func.__name__
         # Handle both classmethods (args[0] is a class) and instance methods (args[0] is an instance)
@@ -144,13 +149,17 @@ def measure_latency(func: Callable) -> Callable:
         display_name = f"{class_name}.{func_name}" if class_name else func_name
 
         try:
-            result = func(*args, **kwargs)
+            # Run sync function in thread pool to make it awaitable
+            result = await asyncio.to_thread(func, *args, **kwargs)
             elapsed_time = time.perf_counter() - start_time
-            logger.info(f"⏱️  {display_name} completed in {elapsed_time:.3f}s")
+            if await AlpacaClient.is_market_open():
+                logger.info(f"⏱️  {display_name} completed in {elapsed_time:.3f}s")
             return result
         except Exception as e:
             elapsed_time = time.perf_counter() - start_time
-            logger.warning(f"⏱️  {display_name} failed after {elapsed_time:.3f}s: {str(e)}")
+            logger.warning(
+                f"⏱️  {display_name} failed after {elapsed_time:.3f}s: {str(e)}"
+            )
             raise
 
     # Check if function is a coroutine function (async)
@@ -160,9 +169,7 @@ def measure_latency(func: Callable) -> Callable:
         return sync_wrapper
 
 
-def dict_to_technical_indicators(
-    indicators_dict: Dict
-) -> TechnicalIndicators | None:
+def dict_to_technical_indicators(indicators_dict: Dict) -> TechnicalIndicators | None:
     """
     Convert a dictionary to TechnicalIndicators object
 
