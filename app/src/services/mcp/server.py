@@ -272,14 +272,16 @@ async def _run_streamable_with_discovery() -> None:
     if settings.mcp_auth_bearer_token:
         logger.info(f"   Header: {settings.mcp_auth_header_name}")
         logger.info(f"   Token: {'*' * min(len(settings.mcp_auth_bearer_token), 8)}...")
-    logger.info(f"🔗 MCP endpoint will be available at: http://{host}:{port}/mcp")
+    logger.info(f"🔗 MCP SSE endpoint will be available at: http://{host}:{port}/mcp/sse")
+    logger.info(f"🔗 MCP messages endpoint will be available at: http://{host}:{port}/mcp/messages")
 
     # Get the Starlette app from FastMCP
     # FastMCP's streamable_http_app() requires a task group initialized via run()
     # Since we're using aiohttp directly, we'll use SSE app instead which works better
     # with custom ASGI servers and doesn't require task group initialization
+    # Mount at /mcp to match the expected endpoint
     logger.info("📡 Using SSE transport (compatible with aiohttp)")
-    starlette_app = app.sse_app()
+    starlette_app = app.sse_app(mount_path="/mcp")
 
     # Log registered routes for debugging
     logger.info(
@@ -460,9 +462,8 @@ async def _run_streamable_with_discovery() -> None:
         """Catch-all handler that forwards to ASGI app"""
         return await asgi_handler(request)
     
-    # Add routes for common paths first, then catch-all
-    aiohttp_app.router.add_route("*", "/mcp", catch_all_handler)
-    aiohttp_app.router.add_route("*", "/mcp/{path:.*}", catch_all_handler)
+    # Add routes - the SSE app handles /mcp/sse and /mcp/messages
+    # Also add catch-all for any other paths
     aiohttp_app.router.add_route("*", "/{path:.*}", catch_all_handler)
 
     # Add health check endpoint directly in aiohttp
@@ -494,7 +495,10 @@ async def _run_streamable_with_discovery() -> None:
     # Get Heroku app URL from environment
     heroku_app_name = os.environ.get("HEROKU_APP_NAME", "automated-day-trading")
     logger.info(
-        f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp"
+        f"📡 MCP server ready. SSE endpoint: https://{heroku_app_name}.herokuapp.com/mcp/sse"
+    )
+    logger.info(
+        f"📡 MCP messages endpoint: https://{heroku_app_name}.herokuapp.com/mcp/messages"
     )
     logger.info(
         "✅ Aiohttp server started successfully (no host header validation issues)"
