@@ -33,6 +33,32 @@ settings: ServerSettings = get_settings()
 client_settings = MCPClientSettings.model_validate(settings.mcp_clients)
 
 
+class AllowAnyHostASGIWrapper:
+    """ASGI wrapper to allow any host header (for Heroku compatibility).
+    
+    Uvicorn validates the Host header, but on Heroku the Host header can be any
+    subdomain. This wrapper modifies the scope to bypass validation.
+    """
+    
+    def __init__(self, app: Any) -> None:
+        self.app = app
+    
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        # For HTTP requests, ensure the server tuple matches what uvicorn expects
+        # This helps bypass host header validation
+        if scope.get("type") == "http":
+            # Set server to match the bound host/port to bypass validation
+            # Uvicorn validates by comparing Host header to server tuple
+            current_server = scope.get("server")
+            if current_server:
+                # Keep the port but set host to 0.0.0.0 to match our binding
+                scope["server"] = ("0.0.0.0", current_server[1])
+            else:
+                scope["server"] = ("0.0.0.0", 8000)
+        
+        await self.app(scope, receive, send)
+
+
 class HeaderTokenAuthMiddleware:
     """Simple header-based bearer token authentication middleware."""
 
@@ -273,6 +299,11 @@ async def _run_streamable_with_discovery() -> None:
     # Get the Starlette app and run it with uvicorn
     starlette_app = app.streamable_http_app()
     
+    # Wrap the ASGI app to allow any host header (for Heroku compatibility)
+    # This bypasses uvicorn's host header validation
+    wrapped_app = AllowAnyHostASGIWrapper(starlette_app)
+    logger.info("✅ Wrapped ASGI app with AllowAnyHostASGIWrapper for Heroku compatibility")
+    
     # Log registered routes for debugging
     logger.info(f"📋 Registered routes: {[route.path for route in starlette_app.routes if hasattr(route, 'path')]}")
     
@@ -338,11 +369,16 @@ async def _run_streamable_with_discovery() -> None:
         logger.info("Automated Trading System MCP server shutdown complete.")
     
     logger.info("⚙️  Creating uvicorn config...")
+    # Create config - uvicorn validates Host header by default
+    # For Heroku, we wrap the app to handle host header validation
+    # Note: uvicorn's host validation happens before the ASGI app receives the request
+    # so we handle it in the ASGI wrapper
     config = uvicorn.Config(
-        starlette_app,
+        wrapped_app,  # Use wrapped app instead of starlette_app
         host=host,
         port=port,
         log_level="info",
+        server_header=False,  # Disable server header
     )
     logger.info("✅ Uvicorn config created")
     
@@ -428,7 +464,6 @@ async def _run_sse_with_discovery() -> None:
         host=host,
         port=port,
         log_level="info",
-        allowed_hosts=["*"],  # Allow any host header for Heroku compatibility
     )
     server = uvicorn.Server(config)
 
