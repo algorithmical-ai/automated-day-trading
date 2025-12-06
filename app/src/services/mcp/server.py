@@ -275,7 +275,11 @@ async def _run_streamable_with_discovery() -> None:
     logger.info(f"🔗 MCP endpoint will be available at: http://{host}:{port}/mcp")
 
     # Get the Starlette app from FastMCP
-    starlette_app = app.streamable_http_app()
+    # FastMCP's streamable_http_app() requires a task group initialized via run()
+    # Since we're using aiohttp directly, we'll use SSE app instead which works better
+    # with custom ASGI servers and doesn't require task group initialization
+    logger.info("📡 Using SSE transport (compatible with aiohttp)")
+    starlette_app = app.sse_app()
 
     # Log registered routes for debugging
     logger.info(
@@ -360,33 +364,54 @@ async def _run_streamable_with_discovery() -> None:
     # Create aiohttp web application
     logger.info("⚙️  Creating aiohttp web application...")
     aiohttp_app = web.Application()
-    
+
     # Create ASGI adapter to run Starlette app with aiohttp
     # This allows us to use FastMCP's streamable_http_app() with aiohttp
     async def asgi_handler(request: web.Request) -> web.Response:
         """ASGI adapter to run Starlette app with aiohttp"""
         from aiohttp.web_response import Response
-        
+
         # Convert aiohttp request to ASGI scope
+        # Extract path without query string for ASGI
+        path = request.path
+        query_string = request.query_string
+        
+        # Convert client address to tuple format expected by ASGI
+        client_addr = None
+        if request.remote:
+            if isinstance(request.remote, str):
+                # Parse IP:port string
+                parts = request.remote.rsplit(":", 1)
+                if len(parts) == 2:
+                    try:
+                        client_addr = (parts[0], int(parts[1]))
+                    except ValueError:
+                        client_addr = (parts[0], 0)
+                else:
+                    client_addr = (request.remote, 0)
+            elif isinstance(request.remote, tuple):
+                client_addr = request.remote
+            else:
+                client_addr = (str(request.remote), 0)
+        
         scope = {
             "type": "http",
             "method": request.method,
-            "path": request.path_qs,
-            "raw_path": request.path_qs.encode(),
-            "query_string": request.query_string.encode() if request.query_string else b"",
-            "headers": [(k.encode(), v.encode()) for k, v in request.headers.items()],
-            "client": request.remote,
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": query_string.encode() if query_string else b"",
+            "headers": [(k.encode("latin1"), v.encode("latin1")) for k, v in request.headers.items()],
+            "client": client_addr,
             "server": (host, port),
-            "scheme": "https" if request.scheme == "https" else "http",
+            "scheme": request.scheme or "http",
             "root_path": "",
-            "app": starlette_app,
             "asgi": {"version": "3.0", "spec_version": "2.3"},
         }
-        
+
         # Create ASGI receive/send callables
         request_body = await request.read()
         request_body_index = [0]
-        
+
         async def receive():
             if request_body_index[0] == 0:
                 request_body_index[0] = 1
@@ -396,21 +421,21 @@ async def _run_streamable_with_discovery() -> None:
                     "more_body": False,
                 }
             return {"type": "http.request", "body": b"", "more_body": False}
-        
+
         response_status = [None]
         response_headers = [None]
         response_body = []
-        
+
         async def send(message):
             if message["type"] == "http.response.start":
                 response_status[0] = message["status"]
                 response_headers[0] = message["headers"]
             elif message["type"] == "http.response.body":
                 response_body.append(message.get("body", b""))
-        
+
         # Run the ASGI app
         await starlette_app(scope, receive, send)
-        
+
         # Build aiohttp response
         headers_dict: Dict[str, str] = {}
         headers_list: Optional[List[tuple]] = response_headers[0]
@@ -422,45 +447,59 @@ async def _run_streamable_with_discovery() -> None:
                     value = v.decode() if isinstance(v, bytes) else str(v)
                     headers_dict[key] = value
         body = b"".join(response_body)
-        
+
         return Response(
             status=response_status[0] or 200,
             headers=headers_dict,
             body=body,
         )
-    
+
     # Add route for all paths (ASGI app handles routing)
-    aiohttp_app.router.add_route("*", "/{path:.*}", asgi_handler)
+    # Use a catch-all route that preserves the path
+    async def catch_all_handler(request: web.Request) -> web.Response:
+        """Catch-all handler that forwards to ASGI app"""
+        return await asgi_handler(request)
     
+    # Add routes for common paths first, then catch-all
+    aiohttp_app.router.add_route("*", "/mcp", catch_all_handler)
+    aiohttp_app.router.add_route("*", "/mcp/{path:.*}", catch_all_handler)
+    aiohttp_app.router.add_route("*", "/{path:.*}", catch_all_handler)
+
     # Add health check endpoint directly in aiohttp
     async def health_handler(request: web.Request) -> web.Response:
         """Health check endpoint"""
-        return web.json_response({
-            "status": "healthy",
-            "service": "automated-trading-system-mcp",
-            "port": port,
-            "auth_configured": bool(settings.mcp_auth_bearer_token),
-        })
-    
+        return web.json_response(
+            {
+                "status": "healthy",
+                "service": "automated-trading-system-mcp",
+                "port": port,
+                "auth_configured": bool(settings.mcp_auth_bearer_token),
+            }
+        )
+
     aiohttp_app.router.add_get("/health", health_handler)
     aiohttp_app.router.add_get("/", health_handler)
-    
+
     logger.info("✅ Aiohttp application created")
-    
+
     # Create runner and site
     logger.info("⚙️  Creating aiohttp runner...")
     runner = AppRunner(aiohttp_app, access_log=None)
     await runner.setup()
-    
+
     site = TCPSite(runner, host, port)
     await site.start()
-    
+
     logger.info(f"🚀 Starting aiohttp server on {host}:{port}")
     # Get Heroku app URL from environment
     heroku_app_name = os.environ.get("HEROKU_APP_NAME", "automated-day-trading")
-    logger.info(f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp")
-    logger.info("✅ Aiohttp server started successfully (no host header validation issues)")
-    
+    logger.info(
+        f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp"
+    )
+    logger.info(
+        "✅ Aiohttp server started successfully (no host header validation issues)"
+    )
+
     try:
         # Keep running
         while True:
