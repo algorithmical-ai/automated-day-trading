@@ -1,2 +1,2 @@
-web: /usr/local/bin/heroku-start.sh
+web: python -u -m app.src.web
 
