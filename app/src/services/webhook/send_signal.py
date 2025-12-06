@@ -15,6 +15,7 @@ from app.src.config.constants import (
     WEBHOOK_URLS,
 )
 
+from app.src.common.alpaca import AlpacaClient
 from app.src.services.mcp.mcp_client import MCPClient
 
 
@@ -106,7 +107,7 @@ async def _send_signal_to_webhook_impl(  # noqa: C901
     if action in [BUY_TO_OPEN, SELL_TO_OPEN]:
         try:
             # Get quote for ask price (buy price)
-            quote_response = await MCPClient.get_quote(ticker)
+            quote_response = await AlpacaClient.quote(ticker)
             if not quote_response:
                 logger.warning(f"Failed to get quote for {ticker}")
 

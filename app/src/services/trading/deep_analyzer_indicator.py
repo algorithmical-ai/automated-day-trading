@@ -10,12 +10,12 @@ import pytz
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
+from app.src.common.alpaca import AlpacaClient
 from app.src.services.mcp.mcp_client import MCPClient
 from app.src.services.market_data.market_data_service import MarketDataService
 from app.src.services.mab.mab_service import MABService
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.trading.base_trading_indicator import BaseTradingIndicator
-from app.src.services.trading.realtime_quote_utils import RealtimeQuoteUtils
 
 
 class DeepAnalyzerIndicator(BaseTradingIndicator):
@@ -629,10 +629,21 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 technical_analysis = market_data_response.get("technical_analysis", {})
                 current_price_hint = technical_analysis.get("close_price", 0.0)
 
-            # Get entry price using real-time quotes for penny stocks
-            enter_price, quote_source = await RealtimeQuoteUtils.get_entry_price_quote(
-                ticker, action, current_price_hint, cls.max_stock_price_for_penny_treatment
-            )
+            # Get entry price using Alpaca API
+            quote_response = await AlpacaClient.quote(ticker)
+            enter_price = None
+            quote_source = "none"
+            
+            if quote_response:
+                quote_data = quote_response.get("quote", {})
+                quotes = quote_data.get("quotes", {})
+                ticker_quote = quotes.get(ticker, {})
+                is_long = action == "buy_to_open"
+                if is_long:
+                    enter_price = ticker_quote.get("ap", 0.0)  # Ask price for long entry
+                else:
+                    enter_price = ticker_quote.get("bp", 0.0)  # Bid price for short entry
+                quote_source = "alpaca"
 
             if enter_price is None or enter_price <= 0:
                 logger.warning(
@@ -641,11 +652,9 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 long_entries_blocked["quote_failed"] += 1
                 continue
 
-            # Log quote source for debugging
-            if quote_source == "realtime_alpaca":
-                logger.info(
-                    f"🚀 Using real-time Alpaca quote for {ticker} entry (penny stock fast entry)"
-                )
+            logger.debug(
+                f"Using Alpaca quote for {ticker} entry: ${enter_price:.4f}"
+            )
 
             # Use the is_golden from daily limit check, or check signal_data if not already set
             if not is_golden:
@@ -752,10 +761,21 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 technical_analysis = market_data_response.get("technical_analysis", {})
                 current_price_hint = technical_analysis.get("close_price", 0.0)
 
-            # Get entry price using real-time quotes for penny stocks
-            enter_price, quote_source = await RealtimeQuoteUtils.get_entry_price_quote(
-                ticker, action, current_price_hint, cls.max_stock_price_for_penny_treatment
-            )
+            # Get entry price using Alpaca API
+            quote_response = await AlpacaClient.quote(ticker)
+            enter_price = None
+            quote_source = "none"
+            
+            if quote_response:
+                quote_data = quote_response.get("quote", {})
+                quotes = quote_data.get("quotes", {})
+                ticker_quote = quotes.get(ticker, {})
+                is_long = action == "buy_to_open"
+                if is_long:
+                    enter_price = ticker_quote.get("ap", 0.0)  # Ask price for long entry
+                else:
+                    enter_price = ticker_quote.get("bp", 0.0)  # Bid price for short entry
+                quote_source = "alpaca"
 
             if enter_price is None or enter_price <= 0:
                 logger.warning(
@@ -764,11 +784,9 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 short_entries_blocked["quote_failed"] += 1
                 continue
 
-            # Log quote source for debugging
-            if quote_source == "realtime_alpaca":
-                logger.info(
-                    f"🚀 Using real-time Alpaca quote for {ticker} short entry (penny stock fast entry)"
-                )
+            logger.debug(
+                f"Using Alpaca quote for {ticker} short entry: ${enter_price:.4f}"
+            )
 
             # Use the is_golden from daily limit check, or check signal_data if not already set
             if not is_golden:
@@ -902,10 +920,21 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             exit_data = None
             
             if is_penny_stock:
-                # Get current price for penny stock trailing stop check using real-time quotes
-                current_price, quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
-                    ticker, original_action, enter_price, cls.max_stock_price_for_penny_treatment
-                )
+                # Get current price for penny stock trailing stop check using Alpaca API
+                quote_response = await AlpacaClient.quote(ticker)
+                current_price = None
+                quote_source = "none"
+                
+                if quote_response:
+                    quote_data = quote_response.get("quote", {})
+                    quotes = quote_data.get("quotes", {})
+                    ticker_quote = quotes.get(ticker, {})
+                    is_long = original_action == "buy_to_open"
+                    if is_long:
+                        current_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                    else:
+                        current_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+                    quote_source = "alpaca"
                 
                 if current_price and current_price > 0:
                     # Calculate current profit
@@ -920,10 +949,21 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                     
                     # Check if trailing stop should activate (after +0.5% profit)
                     if peak_profit_percent >= cls.penny_stock_trailing_stop_activation_profit:
-                        # Get latest quote right before trailing stop trigger check using real-time quotes
-                        final_price, final_quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
-                            ticker, original_action, enter_price, cls.max_stock_price_for_penny_treatment
-                        )
+                        # Get latest quote right before trailing stop trigger check using Alpaca API
+                        quote_response = await AlpacaClient.quote(ticker)
+                        final_price = None
+                        final_quote_source = "none"
+                        
+                        if quote_response:
+                            quote_data = quote_response.get("quote", {})
+                            quotes = quote_data.get("quotes", {})
+                            ticker_quote = quotes.get(ticker, {})
+                            is_long = original_action == "buy_to_open"
+                            if is_long:
+                                final_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                            else:
+                                final_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+                            final_quote_source = "alpaca"
                         
                         if final_price and final_price > 0:
                             current_price = final_price  # Update to latest quote
@@ -961,10 +1001,21 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 exit_price = exit_data.get("current_price", 0.0) if exit_data else 0.0
 
                 if exit_price <= 0:
-                    # Fallback: get current price using real-time quotes for penny stocks
-                    exit_price, exit_quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
-                        ticker, original_action, enter_price, cls.max_stock_price_for_penny_treatment
-                    )
+                    # Fallback: get current price using Alpaca API
+                    quote_response = await AlpacaClient.quote(ticker)
+                    exit_price = None
+                    exit_quote_source = "none"
+                    
+                    if quote_response:
+                        quote_data = quote_response.get("quote", {})
+                        quotes = quote_data.get("quotes", {})
+                        ticker_quote = quotes.get(ticker, {})
+                        is_long = original_action == "buy_to_open"
+                        if is_long:
+                            exit_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                        else:
+                            exit_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+                        exit_quote_source = "alpaca"
 
                 if exit_price is None or exit_price <= 0:
                     logger.warning(f"Failed to get valid exit price for {ticker}")
@@ -1002,23 +1053,27 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                                 if k != "datetime_price"
                             }
 
-                # Get latest quote right before exit using real-time quotes for penny stocks
-                latest_exit_price, latest_exit_quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
-                    ticker, original_action, enter_price, cls.max_stock_price_for_penny_treatment
-                )
+                # Get latest quote right before exit using Alpaca API
+                quote_response = await AlpacaClient.quote(ticker)
+                latest_exit_price = None
+                latest_exit_quote_source = "none"
+                
+                if quote_response:
+                    quote_data = quote_response.get("quote", {})
+                    quotes = quote_data.get("quotes", {})
+                    ticker_quote = quotes.get(ticker, {})
+                    is_long = original_action == "buy_to_open"
+                    if is_long:
+                        latest_exit_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                    else:
+                        latest_exit_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+                    latest_exit_quote_source = "alpaca"
 
                 if latest_exit_price and latest_exit_price > 0:
                     exit_price = latest_exit_price  # Update to latest quote
-                    is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
-                    if latest_exit_quote_source == "realtime_alpaca" and is_penny_stock:
-                        logger.info(
-                            f"🚀 Using real-time Alpaca quote for {ticker} exit: ${exit_price:.4f} "
-                            f"(penny stock fast exit)"
-                        )
-                    else:
-                        logger.debug(
-                            f"Using {latest_exit_quote_source} quote for {ticker} exit: ${exit_price:.4f}"
-                        )
+                    logger.debug(
+                        f"Using Alpaca quote for {ticker} exit: ${exit_price:.4f}"
+                    )
                 else:
                     logger.warning(
                         f"Failed to get latest exit quote for {ticker} from {latest_exit_quote_source}, "

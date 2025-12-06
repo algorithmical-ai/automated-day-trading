@@ -12,12 +12,12 @@ import aiohttp
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
+from app.src.common.alpaca import AlpacaClient
 from app.src.services.mcp.mcp_client import MCPClient
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
 from app.src.services.trading.base_trading_indicator import BaseTradingIndicator
-from app.src.services.trading.realtime_quote_utils import RealtimeQuoteUtils
 from app.src.services.trading.trading_config import (
     ATR_STOP_LOSS_MULTIPLIER,
     ATR_TRAILING_STOP_MULTIPLIER,
@@ -267,7 +267,7 @@ class MomentumIndicator(BaseTradingIndicator):
         Returns (is_acceptable, spread_percent, reason)
         """
         try:
-            quote_response = await MCPClient.get_quote(ticker)
+            quote_response = await AlpacaClient.quote(ticker)
             if not quote_response:
                 return True, 0.0, "No quote data available, proceeding"
 
@@ -959,31 +959,33 @@ class MomentumIndicator(BaseTradingIndicator):
             logger.warning(f"Invalid exit price for {ticker_to_exit}")
             return False
 
-        # Get latest quote right before exit using real-time quotes for penny stocks
-        exit_price, exit_quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
-            ticker_to_exit,
-            original_action,
-            enter_price,
-            cls.max_stock_price_for_penny_treatment,
-        )
+        # Get latest quote right before exit using Alpaca API
+        quote_response = await AlpacaClient.quote(ticker_to_exit)
+        exit_price = None
+        exit_quote_source = "none"
+
+        if quote_response:
+            quote_data = quote_response.get("quote", {})
+            quotes = quote_data.get("quotes", {})
+            ticker_quote = quotes.get(ticker_to_exit, {})
+            is_long = original_action == "buy_to_open"
+            if is_long:
+                exit_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+            else:
+                exit_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+            exit_quote_source = "alpaca"
 
         if exit_price is None or exit_price <= 0:
-            # Fallback to initial_exit_price if real-time quote fails
+            # Fallback to initial_exit_price if quote fails
             exit_price = initial_exit_price
             logger.warning(
                 f"Failed to get latest exit quote for {ticker_to_exit} from {exit_quote_source}, "
                 f"using previously fetched price ${initial_exit_price:.4f}"
             )
         else:
-            is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
-            if exit_quote_source == "realtime_alpaca" and is_penny_stock:
-                logger.debug(
-                    f"🚀 Using real-time Alpaca quote for {ticker_to_exit} preempt exit: ${exit_price:.4f}"
-                )
-            else:
-                logger.debug(
-                    f"Using {exit_quote_source} quote for {ticker_to_exit} preempt exit: ${exit_price:.4f}"
-                )
+            logger.debug(
+                f"Using Alpaca quote for {ticker_to_exit} preempt exit: ${exit_price:.4f}"
+            )
 
         reason = f"Preempted for exceptional trade: {lowest_profit:.2f}% profit"
 
@@ -1022,6 +1024,176 @@ class MomentumIndicator(BaseTradingIndicator):
                 await asyncio.sleep(10)
 
     @classmethod
+    def _extract_prices_from_datetime_price(
+        cls, datetime_price: List[Any]
+    ) -> List[float]:
+        """Extract price values from datetime_price array."""
+        prices = []
+        for entry in datetime_price:
+            try:
+                if isinstance(entry, list) and len(entry) >= 2:
+                    prices.append(float(entry[1]))
+                elif isinstance(entry, dict):
+                    price = (
+                        entry.get("price")
+                        or entry.get("close")
+                        or entry.get("close_price")
+                    )
+                    if price is not None:
+                        prices.append(float(price))
+            except (ValueError, TypeError, KeyError, IndexError):
+                continue
+        return prices
+
+    @classmethod
+    async def _process_ticker_entry(
+        cls,
+        ticker: str,
+        momentum_score: float,
+        reason: str,
+        rank: int,
+        action: str,
+        market_data_dict: Dict[str, Any],
+        daily_limit_reached: bool,
+        is_golden: bool,
+    ) -> bool:
+        """
+        Process entry for a single ticker (long or short).
+
+        Returns:
+            True if entry was successful, False otherwise
+        """
+        if not cls.running:
+            return False
+
+        market_data_response = market_data_dict.get(ticker)
+        if not market_data_response:
+            logger.warning(f"No market data for {ticker}, skipping entry")
+            return False
+
+        # Check daily limit (allow golden tickers to bypass)
+        if daily_limit_reached and not is_golden:
+            logger.info(
+                f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
+                f"Skipping {ticker} (not golden/exceptional)."
+            )
+            return False
+
+        # Check active trades capacity
+        active_trades = await cls._get_active_trades()
+        active_count = len(active_trades)
+
+        if active_count >= cls.max_active_trades:
+            if abs(momentum_score) >= cls.exceptional_momentum_threshold:
+                logger.info(
+                    f"At max capacity ({active_count}/{cls.max_active_trades}), "
+                    f"attempting to preempt for exceptional trade {ticker} "
+                    f"(momentum: {momentum_score:.2f})"
+                )
+                preempted = await cls._preempt_low_profit_trade(
+                    ticker, abs(momentum_score)
+                )
+                if not preempted:
+                    logger.info(f"Could not preempt for {ticker}, skipping entry")
+                    return False
+
+                # Re-check after preemption
+                active_trades = await cls._get_active_trades()
+                active_count = len(active_trades)
+                if active_count >= cls.max_active_trades:
+                    logger.warning(
+                        f"Still at max capacity ({active_count}/{cls.max_active_trades}) after preemption for {ticker}. "
+                        f"This may indicate a race condition or concurrent entry."
+                    )
+                    # Still proceed with entry attempt - _enter_trade will handle duplicates
+            else:
+                logger.info(
+                    f"At max capacity ({active_count}/{cls.max_active_trades}), "
+                    f"skipping {ticker} (momentum: {momentum_score:.2f} < "
+                    f"exceptional threshold: {cls.exceptional_momentum_threshold})"
+                )
+                return False
+
+        # For shorts, re-check quality filters at entry time
+        if action == "sell_to_open":
+            passes_filter, filter_reason = await cls._passes_stock_quality_filters(
+                ticker, market_data_response, momentum_score
+            )
+            if not passes_filter:
+                logger.info(
+                    f"Skipping {ticker} short entry: {filter_reason} "
+                    f"{'(was golden but failed filters at entry)' if is_golden else ''}"
+                )
+                return False
+
+        # Get entry price using Alpaca API
+        quote_response = await AlpacaClient.quote(ticker)
+        if not quote_response:
+            logger.warning(f"Failed to get quote for {ticker}, skipping")
+            return False
+
+        quote_data = quote_response.get("quote", {})
+        quotes = quote_data.get("quotes", {})
+        ticker_quote = quotes.get(ticker, {})
+
+        is_long = action == "buy_to_open"
+        enter_price = (
+            ticker_quote.get("ap", 0.0) if is_long else ticker_quote.get("bp", 0.0)
+        )
+
+        if enter_price <= 0:
+            logger.warning(f"Invalid entry price for {ticker}, skipping")
+            return False
+
+        logger.debug(f"Entry price for {ticker}: ${enter_price:.4f}")
+
+        # Check bid-ask spread
+        spread_acceptable, _, spread_reason = await cls._check_bid_ask_spread(
+            ticker, enter_price
+        )
+        if not spread_acceptable:
+            logger.info(f"Skipping {ticker}: {spread_reason}")
+            return False
+
+        # Prepare entry data
+        direction = "upward" if is_long else "downward"
+        golden_prefix = "🟡 GOLDEN: " if is_golden else ""
+        ranked_reason = f"{golden_prefix}{reason} (ranked #{rank} {direction} momentum)"
+
+        await send_signal_to_webhook(
+            ticker=ticker,
+            action=action,
+            indicator=cls.indicator_name(),
+            enter_reason=ranked_reason,
+        )
+
+        technical_indicators = market_data_response.get("technical_analysis", {})
+        technical_indicators_for_enter = {
+            k: v for k, v in technical_indicators.items() if k != "datetime_price"
+        }
+
+        # Calculate dynamic stop loss
+        dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
+            ticker, enter_price, technical_indicators_for_enter, action=action
+        )
+
+        # Enter trade
+        entry_success = await cls._enter_trade(
+            ticker=ticker,
+            action=action,
+            enter_price=enter_price,
+            enter_reason=ranked_reason,
+            technical_indicators=technical_indicators_for_enter,
+            dynamic_stop_loss=dynamic_stop_loss,
+        )
+
+        if not entry_success:
+            logger.error(f"Failed to enter trade for {ticker}")
+            return False
+
+        return True
+
+    @classmethod
     @measure_latency
     async def _run_entry_cycle(cls):
         """Execute a single momentum entry cycle."""
@@ -1048,7 +1220,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
         await cls._reset_daily_stats_if_needed()
 
-        # Check daily limit (will be bypassed for golden tickers later)
+        # Check daily limit once (will be bypassed for golden tickers later)
         daily_limit_reached = await cls._has_reached_daily_trade_limit()
         if daily_limit_reached:
             logger.info(
@@ -1089,8 +1261,7 @@ class MomentumIndicator(BaseTradingIndicator):
         ticker_momentum_scores = []
         stats = {
             "no_market_data": 0,
-            "no_datetime_price": 0,  # Fallback counter
-            "alpaca_quotes_used": 0,
+            "no_datetime_price": 0,
             "low_momentum": 0,
             "failed_quality_filters": 0,
             "passed": 0,
@@ -1119,62 +1290,23 @@ class MomentumIndicator(BaseTradingIndicator):
 
             technical_analysis = market_data_response.get("technical_analysis", {})
 
-            # Always use Alpaca quotes for momentum calculation (discard datetime_price from MCP)
-            # Get 200 real-time quotes from Alpaca for accurate momentum calculation
-            alpaca_quotes = await RealtimeQuoteUtils.get_realtime_quotes_for_momentum(
-                ticker, limit=200
-            )
-
-            datetime_price_for_momentum = None
-            if alpaca_quotes:
-                # Convert Alpaca quotes to datetime_price format for momentum calculation
-                # Filter out any quotes with missing or invalid prices
-                datetime_price_for_momentum = [
-                    {"price": quote.get("price")}
-                    for quote in alpaca_quotes
-                    if quote.get("price") is not None and quote.get("price") > 0
-                ]
-
-                # Ensure we have at least 3 valid quotes for momentum calculation
-                if (
-                    not datetime_price_for_momentum
-                    or len(datetime_price_for_momentum) < 3
-                ):
-                    datetime_price_for_momentum = None
-
-            # Fallback to MCP datetime_price only if Alpaca quotes unavailable
+            # Use MCP datetime_price for momentum calculation
+            datetime_price_for_momentum = technical_analysis.get("datetime_price", [])
             if not datetime_price_for_momentum:
-                datetime_price_for_momentum = technical_analysis.get(
-                    "datetime_price", []
+                stats["no_datetime_price"] += 1
+                logger.debug(f"No datetime_price data for {ticker}")
+                inactive_ticker_logs.append(
+                    {
+                        "ticker": ticker,
+                        "indicator": cls.indicator_name(),
+                        "reason_not_to_enter_long": "No datetime_price data",
+                        "reason_not_to_enter_short": "No datetime_price data",
+                        "technical_indicators": technical_analysis,
+                    }
                 )
-                if not datetime_price_for_momentum:
-                    stats["no_datetime_price"] += 1
-                    logger.debug(f"No datetime_price data for {ticker}")
-                    inactive_ticker_logs.append(
-                        {
-                            "ticker": ticker,
-                            "indicator": cls.indicator_name(),
-                            "reason_not_to_enter_long": "No datetime_price data",
-                            "reason_not_to_enter_short": "No datetime_price data",
-                            "technical_indicators": technical_analysis,
-                        }
-                    )
-                    continue
-                else:
-                    logger.debug(
-                        f"Using MCP datetime_price (fallback) for {ticker} momentum"
-                    )
+                continue
             else:
-                stats["alpaca_quotes_used"] += 1
-                logger.debug(
-                    f"✅ Using Alpaca real-time quotes ({len(alpaca_quotes)} quotes) for {ticker} momentum"
-                )
-
-            # Discard datetime_price from technical_analysis (always use Alpaca quotes)
-            if "datetime_price" in technical_analysis:
-                technical_analysis = {
-                    k: v for k, v in technical_analysis.items() if k != "datetime_price"
-                }
+                logger.debug(f"Using MCP datetime_price for {ticker} momentum")
 
             momentum_score, reason = cls._calculate_momentum(
                 datetime_price_for_momentum
@@ -1232,28 +1364,10 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 continue
 
-            # Check price action confirmation before other filters
-            # Re-fetch technical_analysis from market_data_response to get original datetime_price
-            # (it was removed earlier for momentum calculation, but we need it for structure check)
-            technical_analysis_for_structure = market_data_response.get("technical_analysis", {})
-            datetime_price = technical_analysis_for_structure.get("datetime_price", [])
+            # Check price action confirmation (trend structure)
+            datetime_price = technical_analysis.get("datetime_price", [])
             if datetime_price:
-                prices = []
-                for entry in datetime_price:
-                    try:
-                        if isinstance(entry, list) and len(entry) >= 2:
-                            prices.append(float(entry[1]))
-                        elif isinstance(entry, dict):
-                            price = (
-                                entry.get("price")
-                                or entry.get("close")
-                                or entry.get("close_price")
-                            )
-                            if price is not None:
-                                prices.append(float(price))
-                    except (ValueError, TypeError, KeyError, IndexError):
-                        continue
-
+                prices = cls._extract_prices_from_datetime_price(datetime_price)
                 if len(prices) >= 10:
                     is_long = momentum_score > 0
                     structure_confirmed, structure_reason = (
@@ -1326,8 +1440,7 @@ class MomentumIndicator(BaseTradingIndicator):
         logger.info(
             f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers "
             f"(filtered: {stats['no_market_data']} no data, "
-            f"{stats['alpaca_quotes_used']} used Alpaca quotes, "
-            f"{stats['no_datetime_price']} no datetime_price (fallback), "
+            f"{stats['no_datetime_price']} no datetime_price, "
             f"{stats['low_momentum']} low momentum, "
             f"{stats['failed_quality_filters']} failed quality filters)"
         )
@@ -1360,7 +1473,7 @@ class MomentumIndicator(BaseTradingIndicator):
             f"MAB selected {len(top_upward)} upward momentum tickers and "
             f"{len(top_downward)} downward momentum tickers (top_k={cls.top_k})"
         )
-        
+
         # Diagnostic logging for zero trades
         if len(top_upward) == 0 and len(top_downward) == 0:
             logger.warning(
@@ -1378,291 +1491,58 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"⚠️ MAB service returned zero downward tickers despite {len(downward_tickers)} candidates passing filters"
             )
 
+        # Process long entries
         for rank, (ticker, momentum_score, reason) in enumerate(top_upward, start=1):
             if not cls.running:
                 break
 
-            # Check if daily limit reached (allow golden tickers to bypass)
-            daily_limit_reached = await cls._has_reached_daily_trade_limit()
-            is_golden = False
-
-            if daily_limit_reached:
-                market_data_response = market_data_dict.get(ticker)
-                if market_data_response:
-                    is_golden = cls._is_golden_ticker(
-                        momentum_score, market_data_response
-                    )
-                    if not is_golden:
-                        logger.info(
-                            f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                            f"Skipping {ticker} (not golden/exceptional)."
-                        )
-                        continue  # Check next ticker instead of breaking
-                    else:
-                        logger.info(
-                            f"Daily trade limit reached, but {ticker} is GOLDEN "
-                            f"(momentum: {momentum_score:.2f}%) - allowing entry"
-                        )
-                else:
-                    logger.info(
-                        f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                        f"Skipping {ticker} (no market data to verify golden status)."
-                    )
-                    continue  # Check next ticker instead of breaking
-
-            active_trades = await cls._get_active_trades()
-            active_count = len(active_trades)
-
-            if active_count >= cls.max_active_trades:
-                if abs(momentum_score) >= cls.exceptional_momentum_threshold:
-                    logger.info(
-                        f"At max capacity ({active_count}/{cls.max_active_trades}), "
-                        f"attempting to preempt for exceptional trade {ticker} "
-                        f"(momentum: {momentum_score:.2f})"
-                    )
-                    # Note: There's a potential race condition between preemption and entry.
-                    # Another concurrent process could claim the slot between preempt and enter.
-                    # For production robustness, consider using DynamoDB conditional writes
-                    # or an asyncio.Lock to make preemption+entry atomic.
-                    preempted = await cls._preempt_low_profit_trade(
-                        ticker, momentum_score
-                    )
-                    if not preempted:
-                        logger.info(
-                            f"Could not preempt for {ticker}, skipping entry "
-                            f"(momentum: {momentum_score:.2f})"
-                        )
-                        continue
-                else:
-                    logger.info(
-                        f"At max capacity ({active_count}/{cls.max_active_trades}), "
-                        f"skipping {ticker} (momentum: {momentum_score:.2f} < "
-                        f"exceptional threshold: {cls.exceptional_momentum_threshold})"
-                    )
-                    continue
-
-            action = "buy_to_open"
-
-            # Get current price hint for penny stock detection
+            # Check if golden ticker (for daily limit bypass)
             market_data_response = market_data_dict.get(ticker)
-            current_price_hint = None
-            if market_data_response:
-                technical_analysis = market_data_response.get("technical_analysis", {})
-                current_price_hint = technical_analysis.get("close_price", 0.0)
+            is_golden = False
+            if daily_limit_reached and market_data_response:
+                is_golden = cls._is_golden_ticker(momentum_score, market_data_response)
+                if is_golden:
+                    logger.info(
+                        f"Daily trade limit reached, but {ticker} is GOLDEN "
+                        f"(momentum: {momentum_score:.2f}%) - allowing entry"
+                    )
 
-            # Get entry price using real-time quotes for penny stocks
-            enter_price, quote_source = await RealtimeQuoteUtils.get_entry_price_quote(
-                ticker,
-                action,
-                current_price_hint,
-                cls.max_stock_price_for_penny_treatment,
-            )
-
-            if enter_price is None or enter_price <= 0:
-                logger.warning(
-                    f"Failed to get entry price for {ticker} from {quote_source}, skipping"
-                )
-                continue
-
-            # Log quote source for debugging
-            if quote_source == "realtime_alpaca":
-                logger.info(
-                    f"🚀 Using real-time Alpaca quote for {ticker} entry (penny stock fast entry)"
-                )
-
-            # Check bid-ask spread before entry
-            spread_acceptable, spread_percent, spread_reason = (
-                await cls._check_bid_ask_spread(ticker, enter_price)
-            )
-            if not spread_acceptable:
-                logger.info(
-                    f"Skipping {ticker}: {spread_reason} (enter_price: ${enter_price:.2f})"
-                )
-                continue
-
-            golden_prefix = "🟡 GOLDEN: " if is_golden else ""
-            ranked_reason = f"{golden_prefix}{reason} (ranked #{rank} upward momentum)"
-            await send_signal_to_webhook(
+            await cls._process_ticker_entry(
                 ticker=ticker,
-                action=action,
-                indicator=cls.indicator_name(),
-                enter_reason=ranked_reason,
+                momentum_score=momentum_score,
+                reason=reason,
+                rank=rank,
+                action="buy_to_open",
+                market_data_dict=market_data_dict,
+                daily_limit_reached=daily_limit_reached,
+                is_golden=is_golden,
             )
 
-            technical_indicators = market_data_dict.get(ticker, {}).get(
-                "technical_analysis", {}
-            )
-            technical_indicators_for_enter = technical_indicators.copy()
-            if "datetime_price" in technical_indicators_for_enter:
-                technical_indicators_for_enter = {
-                    k: v
-                    for k, v in technical_indicators_for_enter.items()
-                    if k != "datetime_price"
-                }
-
-            # Calculate dynamic stop loss using 2x ATR
-            dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
-                ticker, enter_price, technical_indicators_for_enter, action=action
-            )
-
-            await cls._enter_trade(
-                ticker=ticker,
-                action=action,
-                enter_price=enter_price,
-                enter_reason=ranked_reason,
-                technical_indicators=technical_indicators_for_enter,
-                dynamic_stop_loss=dynamic_stop_loss,
-            )
-
+        # Process short entries
         for rank, (ticker, momentum_score, reason) in enumerate(top_downward, start=1):
             if not cls.running:
                 break
 
-            # Check if daily limit reached (allow golden tickers to bypass)
-            daily_limit_reached = await cls._has_reached_daily_trade_limit()
-            is_golden = False
-
-            if daily_limit_reached:
-                market_data_response = market_data_dict.get(ticker)
-                if market_data_response:
-                    is_golden = cls._is_golden_ticker(
-                        momentum_score, market_data_response
-                    )
-                    if not is_golden:
-                        logger.info(
-                            f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                            f"Skipping {ticker} (not golden/exceptional)."
-                        )
-                        continue  # Check next ticker instead of breaking
-                    else:
-                        logger.info(
-                            f"Daily trade limit reached, but {ticker} is GOLDEN "
-                            f"(momentum: {momentum_score:.2f}%) - allowing entry"
-                        )
-                else:
-                    logger.info(
-                        f"Daily trade limit reached ({cls.daily_trades_count}/{cls.max_daily_trades}). "
-                        f"Skipping {ticker} (no market data to verify golden status)."
-                    )
-                    continue  # Check next ticker instead of breaking
-
-            active_trades = await cls._get_active_trades()
-            active_count = len(active_trades)
-
-            if active_count >= cls.max_active_trades:
-                if abs(momentum_score) >= cls.exceptional_momentum_threshold:
-                    logger.info(
-                        f"At max capacity ({active_count}/{cls.max_active_trades}), "
-                        f"attempting to preempt for exceptional trade {ticker} "
-                        f"(momentum: {momentum_score:.2f})"
-                    )
-                    # Note: There's a potential race condition between preemption and entry.
-                    # Another concurrent process could claim the slot between preempt and enter.
-                    # For production robustness, consider using DynamoDB conditional writes
-                    # or an asyncio.Lock to make preemption+entry atomic.
-                    preempted = await cls._preempt_low_profit_trade(
-                        ticker, abs(momentum_score)
-                    )
-                    if not preempted:
-                        logger.info(
-                            f"Could not preempt for {ticker}, skipping entry "
-                            f"(momentum: {momentum_score:.2f})"
-                        )
-                        continue
-                else:
-                    logger.info(
-                        f"At max capacity ({active_count}/{cls.max_active_trades}), "
-                        f"skipping {ticker} (momentum: {momentum_score:.2f} < "
-                        f"exceptional threshold: {cls.exceptional_momentum_threshold})"
-                    )
-                    continue
-
-            action = "sell_to_open"
-
-            # Re-check stock quality filters before entry (even for golden tickers)
-            # This ensures RSI/stochastic filters are enforced at entry time
+            # Check if golden ticker (for daily limit bypass)
             market_data_response = market_data_dict.get(ticker)
-            if market_data_response:
-                passes_filter, filter_reason = await cls._passes_stock_quality_filters(
-                    ticker, market_data_response, momentum_score
-                )
-                if not passes_filter:
+            is_golden = False
+            if daily_limit_reached and market_data_response:
+                is_golden = cls._is_golden_ticker(momentum_score, market_data_response)
+                if is_golden:
                     logger.info(
-                        f"Skipping {ticker} short entry: {filter_reason} "
-                        f"{'(was golden but failed filters at entry)' if is_golden else ''}"
+                        f"Daily trade limit reached, but {ticker} is GOLDEN "
+                        f"(momentum: {momentum_score:.2f}%) - allowing entry"
                     )
-                    continue
 
-            # Get current price hint for penny stock detection
-            current_price_hint = None
-            if market_data_response:
-                technical_analysis = market_data_response.get("technical_analysis", {})
-                current_price_hint = technical_analysis.get("close_price", 0.0)
-
-            # Get entry price using real-time quotes for penny stocks
-            enter_price, quote_source = await RealtimeQuoteUtils.get_entry_price_quote(
-                ticker,
-                action,
-                current_price_hint,
-                cls.max_stock_price_for_penny_treatment,
-            )
-
-            if enter_price is None or enter_price <= 0:
-                logger.warning(
-                    f"Failed to get entry price for {ticker} from {quote_source}, skipping"
-                )
-                continue
-
-            # Log quote source for debugging
-            if quote_source == "realtime_alpaca":
-                logger.info(
-                    f"🚀 Using real-time Alpaca quote for {ticker} short entry (penny stock fast entry)"
-                )
-
-            # Check bid-ask spread before entry
-            spread_acceptable, spread_percent, spread_reason = (
-                await cls._check_bid_ask_spread(ticker, enter_price)
-            )
-            if not spread_acceptable:
-                logger.info(
-                    f"Skipping {ticker}: {spread_reason} (enter_price: ${enter_price:.2f})"
-                )
-                continue
-
-            golden_prefix = "🟡 GOLDEN: " if is_golden else ""
-            ranked_reason = (
-                f"{golden_prefix}{reason} (ranked #{rank} downward momentum)"
-            )
-            await send_signal_to_webhook(
+            await cls._process_ticker_entry(
                 ticker=ticker,
-                action=action,
-                indicator=cls.indicator_name(),
-                enter_reason=ranked_reason,
-            )
-
-            technical_indicators = market_data_dict.get(ticker, {}).get(
-                "technical_analysis", {}
-            )
-            technical_indicators_for_enter = technical_indicators.copy()
-            if "datetime_price" in technical_indicators_for_enter:
-                technical_indicators_for_enter = {
-                    k: v
-                    for k, v in technical_indicators_for_enter.items()
-                    if k != "datetime_price"
-                }
-
-            # Calculate dynamic stop loss using 2x ATR
-            dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
-                ticker, enter_price, technical_indicators_for_enter, action=action
-            )
-
-            await cls._enter_trade(
-                ticker=ticker,
-                action=action,
-                enter_price=enter_price,
-                enter_reason=ranked_reason,
-                technical_indicators=technical_indicators_for_enter,
-                dynamic_stop_loss=dynamic_stop_loss,
+                momentum_score=momentum_score,
+                reason=reason,
+                rank=rank,
+                action="sell_to_open",
+                market_data_dict=market_data_dict,
+                daily_limit_reached=daily_limit_reached,
+                is_golden=is_golden,
             )
 
         await asyncio.sleep(cls.entry_cycle_seconds)
@@ -1679,6 +1559,186 @@ class MomentumIndicator(BaseTradingIndicator):
                 await asyncio.sleep(5)
 
     @classmethod
+    async def _get_current_price(cls, ticker: str, action: str) -> Optional[float]:
+        """
+        Get current price for exit decision using Alpaca API.
+
+        Args:
+            ticker: Stock ticker symbol
+            action: "buy_to_open" (long) or "sell_to_open" (short)
+
+        Returns:
+            Current price (bid for long, ask for short) or None if unavailable
+        """
+        quote_response = await AlpacaClient.quote(ticker)
+        if not quote_response:
+            return None
+
+        quote_data = quote_response.get("quote", {})
+        quotes = quote_data.get("quotes", {})
+        ticker_quote = quotes.get(ticker, {})
+
+        is_long = action == "buy_to_open"
+        if is_long:
+            return ticker_quote.get("bp", 0.0)  # Bid price for long exit
+        else:
+            return ticker_quote.get("ap", 0.0)  # Ask price for short exit
+
+    @classmethod
+    def _check_holding_period(cls, created_at: Optional[str]) -> Tuple[bool, float]:
+        """
+        Check if trade has passed minimum holding period.
+
+        Args:
+            created_at: ISO timestamp string when trade was created
+
+        Returns:
+            Tuple of (passed_minimum: bool, holding_period_minutes: float)
+        """
+        if not created_at:
+            return True, 0.0  # No created_at means we can't check, allow processing
+
+        try:
+            enter_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if enter_time.tzinfo is None:
+                enter_time = enter_time.replace(tzinfo=timezone.utc)
+            current_time = datetime.now(timezone.utc)
+            holding_period_seconds = (current_time - enter_time).total_seconds()
+            holding_period_minutes = holding_period_seconds / 60.0
+
+            passed = holding_period_seconds >= cls.min_holding_period_seconds
+            return passed, holding_period_minutes
+        except Exception as e:
+            logger.warning(f"Error calculating holding period: {str(e)}")
+            return True, 0.0  # On error, allow processing
+
+    @classmethod
+    async def _check_trailing_stop(
+        cls,
+        ticker: str,
+        enter_price: float,
+        current_price: float,
+        original_action: str,
+        peak_profit_percent: float,
+        stop_loss_threshold: float,
+        technical_analysis: Dict[str, Any],
+        created_at: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        Check if trailing stop should trigger an exit.
+
+        Returns:
+            Dict with 'should_exit' (bool), 'exit_reason' (str), and 'profit_percent' (float)
+        """
+        # Get fresh price for trailing stop check
+        fresh_price = await cls._get_current_price(ticker, original_action)
+        if fresh_price and fresh_price > 0:
+            current_price = fresh_price
+
+        profit_percent = cls._calculate_profit_percent(
+            enter_price, current_price, original_action
+        )
+
+        is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
+        is_short = original_action == "sell_to_open"
+
+        # Check activation threshold
+        activation_threshold = (
+            cls.penny_stock_trailing_stop_activation_profit
+            if is_penny_stock
+            else cls.trailing_stop_activation_profit
+        )
+
+        if peak_profit_percent < activation_threshold:
+            return {
+                "should_exit": False,
+                "exit_reason": None,
+                "profit_percent": profit_percent,
+            }
+
+        # Check cooldown period
+        if created_at:
+            try:
+                enter_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                if enter_time.tzinfo is None:
+                    enter_time = enter_time.replace(tzinfo=timezone.utc)
+                elapsed_seconds = (
+                    datetime.now(timezone.utc) - enter_time
+                ).total_seconds()
+
+                required_cooldown = (
+                    cls.trailing_stop_cooldown_seconds
+                    if is_penny_stock
+                    else cls.min_trailing_stop_cooldown_seconds
+                )
+
+                if elapsed_seconds < required_cooldown:
+                    return {
+                        "should_exit": False,
+                        "exit_reason": None,
+                        "profit_percent": profit_percent,
+                    }
+            except Exception:
+                pass  # Continue if cooldown check fails
+
+        # Calculate trailing stop distance
+        if is_penny_stock:
+            dynamic_trailing_stop = cls.penny_stock_trailing_stop_percent
+        else:
+            # Calculate tiered trailing stop
+            trailing_stop_distance = cls._calculate_trailing_stop_activation(
+                peak_profit_percent, stop_loss_threshold
+            )
+            tiered_distance = (
+                trailing_stop_distance
+                if trailing_stop_distance is not None
+                else abs(stop_loss_threshold) * 0.8
+            )
+
+            # Calculate ATR-based trailing stop
+            atr = technical_analysis.get("atr", 0.0)
+            if atr and atr > 0:
+                atr_percent = cls._calculate_atr_percent(atr, current_price)
+                atr_trailing = max(
+                    BASE_TRAILING_STOP_PERCENT,
+                    ATR_TRAILING_STOP_MULTIPLIER * atr_percent,
+                )
+                if is_short:
+                    atr_trailing = min(
+                        MAX_TRAILING_STOP_SHORT,
+                        atr_trailing * TRAILING_STOP_SHORT_MULTIPLIER,
+                    )
+                dynamic_trailing_stop = min(tiered_distance, atr_trailing)
+            else:
+                dynamic_trailing_stop = tiered_distance
+                if is_short:
+                    dynamic_trailing_stop *= cls.trailing_stop_short_multiplier
+
+        # Check if trailing stop should trigger
+        drop_from_peak = peak_profit_percent - profit_percent
+        should_trigger = (
+            drop_from_peak >= dynamic_trailing_stop
+            and profit_percent > 0  # Require profit for all stocks
+        )
+
+        if should_trigger:
+            return {
+                "should_exit": True,
+                "exit_reason": (
+                    f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
+                    f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
+                    f"trailing stop: {dynamic_trailing_stop:.2f}%)"
+                ),
+                "profit_percent": profit_percent,
+            }
+
+        return {
+            "should_exit": False,
+            "exit_reason": None,
+            "profit_percent": profit_percent,
+        }
+
+    @classmethod
     @measure_latency
     async def _run_exit_cycle(cls):
         """Execute a single momentum exit monitoring cycle."""
@@ -1688,13 +1748,32 @@ class MomentumIndicator(BaseTradingIndicator):
             return
 
         active_trades = await cls._get_active_trades()
-
         if not active_trades:
             logger.debug("No active momentum trades to monitor")
             await asyncio.sleep(cls.exit_cycle_seconds)
             return
 
-        active_count = len(active_trades)
+        # Filter trades that haven't passed minimum holding period
+        trades_to_process = []
+        for trade in active_trades:
+            created_at = trade.get("created_at")
+            passed, holding_minutes = cls._check_holding_period(created_at)
+
+            if not passed:
+                ticker = trade.get("ticker")
+                logger.debug(
+                    f"Skipping {ticker}: holding period {holding_minutes:.1f} min < "
+                    f"minimum {cls.min_holding_period_seconds/60:.1f} min"
+                )
+                continue
+            trades_to_process.append(trade)
+
+        if not trades_to_process:
+            logger.debug("No trades passed minimum holding period")
+            await asyncio.sleep(cls.exit_cycle_seconds)
+            return
+
+        active_count = len(trades_to_process)
         logger.info(
             f"Monitoring {active_count}/{cls.max_active_trades} active momentum trades"
         )
@@ -1707,7 +1786,7 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"({cls.minutes_before_close_to_exit} minutes before close)"
             )
 
-        for trade in active_trades:
+        for trade in trades_to_process:
             if not cls.running:
                 break
 
@@ -1729,51 +1808,15 @@ class MomentumIndicator(BaseTradingIndicator):
                 logger.warning(f"Invalid momentum trade data: {trade}")
                 continue
 
-            # Check minimum holding period
-            holding_period_minutes = 0
-            if created_at:
-                try:
-                    enter_time = datetime.fromisoformat(
-                        created_at.replace("Z", "+00:00")
-                    )
-                    if enter_time.tzinfo is None:
-                        enter_time = enter_time.replace(tzinfo=timezone.utc)
-                    current_time = datetime.now(timezone.utc)
-                    holding_period_seconds = (current_time - enter_time).total_seconds()
-                    holding_period_minutes = holding_period_seconds / 60.0
-
-                    if holding_period_seconds < cls.min_holding_period_seconds:
-                        logger.debug(
-                            f"Skipping exit check for {ticker}: "
-                            f"holding period {holding_period_seconds:.1f}s < "
-                            f"minimum {cls.min_holding_period_seconds}s"
-                        )
-                        continue
-                except Exception as e:
-                    logger.warning(
-                        f"Error calculating holding period for {ticker}: {str(e)}"
-                    )
-
-            # Get latest quote FIRST for accurate exit decisions using real-time quotes for penny stocks
-            current_price, quote_source = await RealtimeQuoteUtils.get_exit_price_quote(
-                ticker,
-                original_action,
-                enter_price,
-                cls.max_stock_price_for_penny_treatment,
-            )
-
+            # Get current price for exit decision
+            current_price = await cls._get_current_price(ticker, original_action)
             if current_price is None or current_price <= 0:
                 logger.warning(
-                    f"Failed to get quote for {ticker} for exit check from {quote_source} - will retry in next cycle"
+                    f"Failed to get quote for {ticker} - will retry in next cycle"
                 )
                 continue
 
-            # Log quote source for debugging
-            is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
-            if quote_source == "realtime_alpaca" and is_penny_stock:
-                logger.debug(
-                    f"🚀 Using real-time Alpaca quote for {ticker} exit check (penny stock fast exit)"
-                )
+            logger.debug(f"Current price for {ticker}: ${current_price:.4f}")
 
             # Get market data for technical indicators (may be delayed, but don't block exit decisions)
             # Exit decisions are based on get_quote() which is more up-to-date
@@ -1789,9 +1832,21 @@ class MomentumIndicator(BaseTradingIndicator):
             should_exit = False
             exit_reason = None
 
+            # Check stop loss FIRST (most critical exit condition)
+            if profit_percent < stop_loss_threshold:
+                should_exit = True
+                exit_reason = (
+                    f"Stop loss triggered: {profit_percent:.2f}% "
+                    f"(below {stop_loss_threshold:.2f}% stop loss threshold"
+                    f"{' (dynamic)' if dynamic_stop_loss is not None else ''})"
+                )
+                logger.info(
+                    f"Exit signal for {ticker} - stop loss: {profit_percent:.2f}%"
+                )
+
             # Force exit before market close ONLY if trade is profitable
             # Hold losing trades until next day (unless stop loss is hit)
-            if is_near_close:
+            if not should_exit and is_near_close:
                 if profit_percent > 0:
                     should_exit = True
                     exit_reason = (
@@ -1807,241 +1862,24 @@ class MomentumIndicator(BaseTradingIndicator):
                         f"will exit when profitable or stop loss triggered"
                     )
 
-            # Time-based exit for volatile (non-penny) stocks only.
-            # For penny stocks (< $5), we rely on trailing stops and other rules, not a hard time limit.
-            if holding_period_minutes > 0:
-                is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
-
-                if is_low_price:
-                    logger.debug(
-                        f"Skipping time-based exit for penny stock {ticker}: "
-                        f"holding {holding_period_minutes:.1f} min, profit {profit_percent:.2f}%"
-                    )
-                else:
-                    atr = technical_analysis.get("atr", 0.0)
-                    atr_percent = (
-                        cls._calculate_atr_percent(atr, current_price)
-                        if atr is not None and atr > 0 and current_price > 0
-                        else 0.0
-                    )
-                    is_volatile = atr_percent > 3.0
-
-                    max_holding_minutes = None
-                    if is_volatile:
-                        max_holding_minutes = (
-                            cls.max_holding_time_volatile_stocks_minutes
-                        )
-
-                    if (
-                        max_holding_minutes
-                        and holding_period_minutes >= max_holding_minutes
-                    ):
-                        should_exit = True
-                        exit_reason = (
-                            f"Time-based exit: held for {holding_period_minutes:.1f} minutes "
-                            f"(max: {max_holding_minutes} min for volatile stock, "
-                            f"profit: {profit_percent:.2f}%)"
-                        )
-                        logger.info(
-                            f"Exit signal for {ticker} - time-based exit: "
-                            f"held {holding_period_minutes:.1f} min, profit: {profit_percent:.2f}%"
-                        )
-
-            if profit_percent < stop_loss_threshold:
-                should_exit = True
-                exit_reason = (
-                    f"Trailing stop loss triggered: {profit_percent:.2f}% "
-                    f"(below {stop_loss_threshold:.2f}% stop loss threshold"
-                    f"{' (dynamic)' if dynamic_stop_loss is not None else ''})"
-                )
-                logger.info(
-                    f"Exit signal for {ticker} - losing trade: {profit_percent:.2f}%"
+            # Check trailing stop if we have a peak profit
+            if not should_exit and peak_profit_percent > 0:
+                trailing_stop_result = await cls._check_trailing_stop(
+                    ticker=ticker,
+                    enter_price=enter_price,
+                    current_price=current_price,
+                    original_action=original_action,
+                    peak_profit_percent=peak_profit_percent,
+                    stop_loss_threshold=stop_loss_threshold,
+                    technical_analysis=technical_analysis,
+                    created_at=created_at,
                 )
 
-            elif peak_profit_percent > 0:
-                # Trailing stop protects against drops from peak profit
-                # Check if we should apply trailing stop even if currently at a loss
-                # Get latest quote right before trailing stop evaluation using real-time quotes for penny stocks
-                latest_price, latest_quote_source = (
-                    await RealtimeQuoteUtils.get_exit_price_quote(
-                        ticker,
-                        original_action,
-                        enter_price,
-                        cls.max_stock_price_for_penny_treatment,
-                    )
-                )
-
-                if latest_price and latest_price > 0:
-                    current_price = latest_price  # Update to latest quote
-                    # Recalculate profit with latest price
-                    profit_percent = cls._calculate_profit_percent(
-                        enter_price, current_price, original_action
-                    )
-                    logger.debug(
-                        f"Refreshed quote for {ticker} trailing stop check: ${current_price:.4f} "
-                        f"({latest_quote_source})"
-                    )
-
-                # Tiered trailing stop activation based on peak profit level
-                trailing_stop_distance = cls._calculate_trailing_stop_activation(
-                    peak_profit_percent, stop_loss_threshold
-                )
-                if trailing_stop_distance is None:
-                    # No trailing stop yet (peak profit < 0.5%)
-                    logger.debug(
-                        f"Trailing stop not active for {ticker}: "
-                        f"peak profit {peak_profit_percent:.2f}% < 0.5% activation threshold"
-                    )
-                else:
-                    # Check if trailing stop should be active
-                    # For penny stocks, use tighter activation threshold
-                    is_penny_stock = (
-                        enter_price < cls.max_stock_price_for_penny_treatment
-                    )
-                    activation_threshold = (
-                        cls.penny_stock_trailing_stop_activation_profit
-                        if is_penny_stock
-                        else cls.trailing_stop_activation_profit
-                    )
-
-                    if peak_profit_percent >= activation_threshold:
-                        trailing_stop_active = True
-                    else:
-                        trailing_stop_active = False
-                        logger.debug(
-                            f"Trailing stop not active for {ticker}: "
-                            f"peak profit {peak_profit_percent:.2f}% < activation threshold "
-                            f"{activation_threshold:.2f}% {'(penny stock)' if is_penny_stock else ''}"
-                        )
-
-                    if trailing_stop_active and created_at:
-                        try:
-                            enter_time = datetime.fromisoformat(
-                                created_at.replace("Z", "+00:00")
-                            )
-                            if enter_time.tzinfo is None:
-                                enter_time = enter_time.replace(tzinfo=timezone.utc)
-                            elapsed_seconds = (
-                                datetime.now(timezone.utc) - enter_time
-                            ).total_seconds()
-
-                            # Apply minimum cooldown for ALL stocks to prevent whipsaw exits
-                            # For penny stocks, use longer cooldown
-                            is_low_price = (
-                                enter_price < cls.max_stock_price_for_penny_treatment
-                            )
-                            required_cooldown = (
-                                cls.trailing_stop_cooldown_seconds
-                                if is_low_price
-                                else cls.min_trailing_stop_cooldown_seconds
-                            )
-                            if elapsed_seconds < required_cooldown:
-                                trailing_stop_active = False
-                                logger.debug(
-                                    f"Trailing stop not active for {ticker}: "
-                                    f"cooling period ({elapsed_seconds:.0f}s < {required_cooldown}s) "
-                                    f"{'(penny stock)' if is_low_price else '(standard)'}"
-                                )
-                        except Exception as e:
-                            logger.debug(
-                                f"Error checking trailing stop cooldown for {ticker}: {str(e)}"
-                            )
-
-                    if trailing_stop_active:
-                        # Check if this is a penny stock (< $5) - use tight trailing stop
-                        if is_penny_stock:
-                            # For penny stocks: use tight trailing stop (1% drop from peak)
-                            # Exit quickly to lock in profits on volatile penny stocks
-                            dynamic_trailing_stop = (
-                                cls.penny_stock_trailing_stop_percent
-                            )
-                            logger.debug(
-                                f"Penny stock {ticker} (${enter_price:.2f}): "
-                                f"Using tight trailing stop of {dynamic_trailing_stop:.2f}% "
-                                f"(exit when profit drops {dynamic_trailing_stop:.2f}% from peak)"
-                            )
-                        else:
-                            # For non-penny stocks: use tiered/ATR-based trailing stop
-                            # Use tiered trailing stop distance
-                            tiered_trailing_distance = trailing_stop_distance
-                            if tiered_trailing_distance is None:
-                                stop_distance = abs(stop_loss_threshold)
-                                tiered_trailing_distance = (
-                                    stop_distance * 0.8
-                                )  # Default wide trailing
-
-                            # Calculate ATR-based trailing stop: max(2%, 1.5*ATR) as recommended
-                            atr = technical_analysis.get("atr", 0.0)
-                            is_short = original_action == "sell_to_open"
-
-                            if atr is not None and atr > 0:
-                                atr_percent = cls._calculate_atr_percent(
-                                    atr, current_price
-                                )
-                                # Use standardized ATR multiplier for trailing stop
-                                atr_based_trailing = (
-                                    ATR_TRAILING_STOP_MULTIPLIER * atr_percent
-                                )
-                                atr_trailing = max(
-                                    BASE_TRAILING_STOP_PERCENT, atr_based_trailing
-                                )
-
-                                # Widen trailing stop for shorts as recommended
-                                if is_short:
-                                    atr_trailing = (
-                                        atr_trailing * TRAILING_STOP_SHORT_MULTIPLIER
-                                    )
-                                    # Cap at maximum for shorts
-                                    atr_trailing = min(
-                                        MAX_TRAILING_STOP_SHORT, atr_trailing
-                                    )
-
-                                # Use the tighter of tiered distance or ATR-based
-                                dynamic_trailing_stop = min(
-                                    tiered_trailing_distance, atr_trailing
-                                )
-                            else:
-                                # Fallback to tiered distance if no ATR
-                                dynamic_trailing_stop = tiered_trailing_distance
-
-                                # Apply multipliers for shorts
-                                if is_short:
-                                    dynamic_trailing_stop = (
-                                        dynamic_trailing_stop
-                                        * cls.trailing_stop_short_multiplier
-                                    )
-
-                        # Get latest quote right before trailing stop trigger check using real-time quotes for penny stocks
-                        final_price, final_quote_source = (
-                            await RealtimeQuoteUtils.get_exit_price_quote(
-                                ticker,
-                                original_action,
-                                enter_price,
-                                cls.max_stock_price_for_penny_treatment,
-                            )
-                        )
-
-                        if final_price and final_price > 0:
-                            current_price = final_price  # Update to latest quote
-                            # Recalculate profit with latest price for trailing stop check
-                            profit_percent = cls._calculate_profit_percent(
-                                enter_price, current_price, original_action
-                            )
-
-                        # Trailing stop protects against drops from peak (can trigger even if currently at loss)
-                        drop_from_peak = peak_profit_percent - profit_percent
-                        if drop_from_peak >= dynamic_trailing_stop:
-                            should_exit = True
-                            exit_reason = (
-                                f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
-                                f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
-                                f"trailing stop: {dynamic_trailing_stop:.2f}%)"
-                            )
-                            logger.info(
-                                f"Exit signal for {ticker} - trailing stop: "
-                                f"peak {peak_profit_percent:.2f}%, current {profit_percent:.2f}%, "
-                                f"trailing stop: {dynamic_trailing_stop:.2f}%"
-                            )
+                if trailing_stop_result["should_exit"]:
+                    should_exit = True
+                    exit_reason = trailing_stop_result["exit_reason"]
+                    profit_percent = trailing_stop_result["profit_percent"]
+                    logger.info(f"Exit signal for {ticker} - {exit_reason}")
 
             if not should_exit:
                 # Calculate dynamic profit target: 2x stop distance as recommended
@@ -2062,62 +1900,48 @@ class MomentumIndicator(BaseTradingIndicator):
                     )
 
             if not should_exit:
+                # Update peak profit if current profit is higher
                 if profit_percent > peak_profit_percent:
                     peak_profit_percent = profit_percent
-                    # Calculate dynamic trailing stop for updating (use ATR-based if available)
-                    atr = technical_analysis.get("atr", 0.0)
-                    is_short = original_action == "sell_to_open"
 
-                    if atr is not None and atr > 0:
-                        # Use standardized ATR multiplier for trailing stop
-                        atr_percent = cls._calculate_atr_percent(atr, current_price)
-                        atr_based_trailing = ATR_TRAILING_STOP_MULTIPLIER * atr_percent
-                        trailing_stop = max(
-                            BASE_TRAILING_STOP_PERCENT, atr_based_trailing
-                        )
+                # Calculate trailing stop for database update
+                atr = technical_analysis.get("atr", 0.0)
+                is_short = original_action == "sell_to_open"
+                is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
 
-                        # Widen trailing stop for shorts
-                        if is_short:
-                            trailing_stop = (
-                                trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER
-                            )
-                            trailing_stop = min(MAX_TRAILING_STOP_SHORT, trailing_stop)
-                    else:
-                        # Fallback to multiplier-based approach
-                        is_low_price = (
-                            enter_price < cls.max_stock_price_for_penny_treatment
-                        )
-                        base_trailing_stop = cls.trailing_stop_percent
-
-                        if is_short:
-                            # Wider trailing for shorts
-                            trailing_stop = (
-                                base_trailing_stop * cls.trailing_stop_short_multiplier
-                            )
-                        elif is_low_price:
-                            trailing_stop = (
-                                cls.trailing_stop_percent
-                                * cls.trailing_stop_penny_stock_multiplier
-                            )
-                        else:
-                            trailing_stop = cls.trailing_stop_percent
-
-                skipped_reason = None
-                if profit_percent < 0:
-                    skipped_reason = (
-                        f"Trade is losing: {profit_percent:.2f}% "
-                        f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
+                if atr and atr > 0:
+                    atr_percent = cls._calculate_atr_percent(atr, current_price)
+                    trailing_stop = max(
+                        BASE_TRAILING_STOP_PERCENT,
+                        ATR_TRAILING_STOP_MULTIPLIER * atr_percent,
                     )
-                elif profit_percent < cls.profit_threshold:
-                    skipped_reason = (
-                        f"Trade not yet profitable: {profit_percent:.2f}% "
-                        f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
-                    )
+                    if is_short:
+                        trailing_stop = min(
+                            MAX_TRAILING_STOP_SHORT,
+                            trailing_stop * TRAILING_STOP_SHORT_MULTIPLIER,
+                        )
                 else:
-                    skipped_reason = (
-                        f"Trade profitable: {profit_percent:.2f}% "
-                        f"(trailing stop: {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%)"
-                    )
+                    # Fallback to multiplier-based approach
+                    if is_short:
+                        trailing_stop = (
+                            cls.trailing_stop_percent
+                            * cls.trailing_stop_short_multiplier
+                        )
+                    elif is_low_price:
+                        trailing_stop = (
+                            cls.trailing_stop_percent
+                            * cls.trailing_stop_penny_stock_multiplier
+                        )
+                    else:
+                        trailing_stop = cls.trailing_stop_percent
+
+                # Generate skipped reason for logging
+                if profit_percent < 0:
+                    skipped_reason = f"Trade is losing: {profit_percent:.2f}%"
+                elif profit_percent < cls.profit_threshold:
+                    skipped_reason = f"Trade not yet profitable: {profit_percent:.2f}%"
+                else:
+                    skipped_reason = f"Trade profitable: {profit_percent:.2f}%"
 
                 await DynamoDBClient.update_momentum_trade_trailing_stop(
                     ticker=ticker,
@@ -2134,36 +1958,15 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"profit: {profit_percent:.2f}%)"
                 )
 
-                # Get latest quote right before exit using real-time quotes for penny stocks
-                exit_price, exit_quote_source = (
-                    await RealtimeQuoteUtils.get_exit_price_quote(
-                        ticker,
-                        original_action,
-                        enter_price,
-                        cls.max_stock_price_for_penny_treatment,
-                    )
-                )
-
+                # Get latest quote right before exit
+                exit_price = await cls._get_current_price(ticker, original_action)
                 if exit_price is None or exit_price <= 0:
-                    # Fallback to current_price if real-time quote fails
-                    exit_price = current_price
+                    exit_price = current_price  # Fallback to current price
                     logger.warning(
-                        f"Failed to get latest exit quote for {ticker} from {exit_quote_source}, "
-                        f"using previously fetched price ${current_price:.4f}"
+                        f"Failed to get exit quote for {ticker}, using current price ${current_price:.4f}"
                     )
                 else:
-                    is_penny_stock = (
-                        enter_price < cls.max_stock_price_for_penny_treatment
-                    )
-                    if exit_quote_source == "realtime_alpaca" and is_penny_stock:
-                        logger.info(
-                            f"🚀 Using real-time Alpaca quote for {ticker} exit: ${exit_price:.4f} "
-                            f"(penny stock fast exit)"
-                        )
-                    else:
-                        logger.debug(
-                            f"Using {exit_quote_source} quote for {ticker} exit: ${exit_price:.4f}"
-                        )
+                    logger.debug(f"Exit price for {ticker}: ${exit_price:.4f}")
 
                 technical_indicators_for_enter = trade.get(
                     "technical_indicators_for_enter"
