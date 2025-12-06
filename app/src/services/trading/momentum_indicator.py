@@ -485,7 +485,8 @@ class MomentumIndicator(BaseTradingIndicator):
         Golden tickers can bypass daily trade limits
         More stringent requirements for penny stocks to avoid false signals
         """
-        technical_analysis = market_data.get("technical_analysis", {})
+        # market_data IS the technical analysis dict (from calculate_all_indicators)
+        technical_analysis = market_data if isinstance(market_data, dict) else {}
         current_price = technical_analysis.get("close_price", 0.0)
         abs_momentum = abs(momentum_score)
 
@@ -593,7 +594,8 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"Excluded: {ticker} is a warrant/option (ends with W/R/RT/etc)",
             )
 
-        technical_analysis = market_data.get("technical_analysis", {})
+        # market_data IS the technical analysis dict (from calculate_all_indicators)
+        technical_analysis = market_data if isinstance(market_data, dict) else {}
         current_price = technical_analysis.get("close_price", 0.0)
 
         # Check minimum price filter
@@ -1078,7 +1080,8 @@ class MomentumIndicator(BaseTradingIndicator):
             enter_reason=ranked_reason,
         )
 
-        technical_indicators = market_data_response.get("technical_analysis", {})
+        # market_data_response IS the technical analysis dict (from calculate_all_indicators)
+        technical_indicators = market_data_response if isinstance(market_data_response, dict) else {}
         technical_indicators_for_enter = {
             k: v for k, v in technical_indicators.items() if k != "datetime_price"
         }
@@ -1192,9 +1195,10 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 continue
 
-            technical_analysis = market_data_response.get("technical_analysis", {})
+            # market_data_response IS the technical analysis dict (from calculate_all_indicators)
+            technical_analysis = market_data_response if isinstance(market_data_response, dict) else {}
 
-            # Use MCP datetime_price for momentum calculation
+            # Use datetime_price for momentum calculation
             datetime_price_for_momentum = technical_analysis.get("datetime_price", [])
             if not datetime_price_for_momentum:
                 stats["no_datetime_price"] += 1
@@ -1873,7 +1877,8 @@ class MomentumIndicator(BaseTradingIndicator):
                 technical_indicators_for_enter = trade.get(
                     "technical_indicators_for_enter"
                 )
-                technical_indicators_for_exit = technical_analysis.copy()
+                # technical_analysis IS the indicators dict (from calculate_all_indicators)
+                technical_indicators_for_exit = technical_analysis.copy() if isinstance(technical_analysis, dict) else {}
                 if "datetime_price" in technical_indicators_for_exit:
                     technical_indicators_for_exit = {
                         k: v
