@@ -330,6 +330,7 @@ async def _run_streamable_with_discovery() -> None:
         await market_tool_client.close()
         logger.info("Automated Trading System MCP server shutdown complete.")
     
+    logger.info("⚙️  Creating uvicorn config...")
     config = uvicorn.Config(
         starlette_app,
         host=host,
@@ -337,7 +338,11 @@ async def _run_streamable_with_discovery() -> None:
         log_level="info",
         allowed_hosts=["*"],  # Allow any host header for Heroku compatibility
     )
+    logger.info("✅ Uvicorn config created")
+    
+    logger.info("⚙️  Creating uvicorn server...")
     server = uvicorn.Server(config)
+    logger.info("✅ Uvicorn server object created")
 
     logger.info(f"🚀 Starting uvicorn server on {host}:{port}")
     # Get Heroku app URL from environment or construct from request
@@ -346,8 +351,9 @@ async def _run_streamable_with_discovery() -> None:
     logger.info(f"💡 Note: FastMCP streamable HTTP may mount at root '/' - check registered routes above")
     
     try:
-        logger.info("🔄 Server starting...")
+        logger.info("🔄 About to call server.serve()...")
         await server.serve()
+        logger.info("🔄 server.serve() completed (unexpected)")
     except KeyboardInterrupt:
         logger.info("🛑 Server stopped by user")
     except Exception as e:
