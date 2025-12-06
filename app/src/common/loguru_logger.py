@@ -21,28 +21,21 @@ logger.remove()
 
 LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {file}:{line} | {function} | {message}"
 
+# Determine if we should use colorized output (development mode only)
+is_development = (
+    os.getenv("ENVIRONMENT", "development").lower() == "development"
+    and not os.getenv("DYNO")
+)
+
 logger.add(
     sys.stdout,
     level=LOG_LEVEL,
     format=LOG_FORMAT,
-    colorize=False,
+    colorize=is_development,  # Colorize in development, plain in production
     enqueue=False,
     backtrace=False,
     diagnose=False,
 )
-
-if os.getenv("ENVIRONMENT", "development").lower() == "development" and not os.getenv(
-    "DYNO"
-):
-    logger.add(
-        sys.stderr,
-        level=LOG_LEVEL,
-        format=LOG_FORMAT,
-        colorize=True,
-        enqueue=False,
-        backtrace=False,
-        diagnose=False,
-    )
 
 # Suppress noisy third-party library logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
