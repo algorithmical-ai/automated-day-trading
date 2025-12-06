@@ -17,7 +17,16 @@ from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
-import talib  # pylint: disable=import-error
+
+# Try to import talib, but handle gracefully if not available
+try:
+    import talib  # pylint: disable=import-error
+    TALIB_AVAILABLE = True
+except ImportError:
+    TALIB_AVAILABLE = False
+    talib = None  # type: ignore
+    import warnings
+    warnings.warn("TA-Lib not available. Some technical indicators will not work.")
 
 from app.src.common.loguru_logger import logger
 from app.src.common.alpaca import AlpacaClient
@@ -304,6 +313,11 @@ class TechnicalAnalysisLib:
             close = close.astype(np.float64)
             volume = volume.astype(np.float64)
             open_ = open_.astype(np.float64)
+
+            # Check if TA-Lib is available before using it
+            if not TALIB_AVAILABLE or talib is None:
+                logger.warning(f"TA-Lib not available for {ticker}, using fallback indicators")
+                return await cls._create_default_indicators(ticker)
 
             # Calculate main indicators using TA-Lib
             rsi_array = talib.RSI(close, timeperiod=cls._default_periods["rsi"])
