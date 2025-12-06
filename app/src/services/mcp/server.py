@@ -336,7 +336,6 @@ async def _run_streamable_with_discovery() -> None:
         host=host,
         port=port,
         log_level="info",
-        allowed_hosts=["*"],  # Allow any host header for Heroku compatibility
     )
     logger.info("✅ Uvicorn config created")
     
