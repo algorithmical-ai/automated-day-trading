@@ -59,7 +59,10 @@ class MomentumIndicator(BaseTradingIndicator):
     )
     max_entry_hour_et: int = 15  # No entries after 3:00 PM ET (15:00)
     min_holding_period_seconds: int = (
-        60  # Minimum 60 seconds before allowing exit (prevent instant exits)
+        30  # Minimum 30 seconds before allowing exit (reduced for quick penny stock exits, was 60)
+    )
+    min_holding_period_penny_stocks_seconds: int = (
+        15  # Minimum 15 seconds for penny stocks - allow very quick exits to bank on volatility
     )
 
     # Volatility and low-priced stock filters
@@ -72,17 +75,20 @@ class MomentumIndicator(BaseTradingIndicator):
     max_atr_percent_for_entry: float = (
         5.0  # Maximum ATR% to allow entry (5% = very volatile)
     )
-    max_volatility_for_low_price: float = 4.0  # Max ATR% for stocks under $5
+    max_volatility_for_low_price: float = 50.0  # Allow high volatility for penny stocks - we bank on it! (was 4.0)
     max_bid_ask_spread_percent: float = 2.0  # Maximum bid-ask spread % for entry
     trailing_stop_penny_stock_multiplier: float = (
         1.5  # Wider trailing stop for penny stocks (legacy, now overridden)
     )
-    # Tight trailing stop for penny stocks: exit when profit drops 1% from peak
+    # Tight trailing stop for penny stocks: exit when profit drops 0.5% from peak (QUICK EXITS)
     penny_stock_trailing_stop_percent: float = (
-        1.0  # Exit penny stocks when profit drops 1.0% from peak (take profit quickly)
+        0.5  # Exit penny stocks when profit drops 0.5% from peak (take profit VERY quickly)
     )
     penny_stock_trailing_stop_activation_profit: float = (
-        0.5  # Activate trailing stop after +0.5% profit for penny stocks
+        0.25  # Activate trailing stop after +0.25% profit for penny stocks (very quick activation)
+    )
+    penny_stock_quick_profit_target: float = (
+        1.5  # Quick profit target for penny stocks - exit at 1.5% profit (bank on volatility)
     )
     trailing_stop_volatile_multiplier: float = (
         1.3  # Wider trailing stop for volatile stocks
@@ -94,10 +100,10 @@ class MomentumIndicator(BaseTradingIndicator):
         60  # Maximum holding time for volatile stocks
     )
     trailing_stop_cooldown_seconds: int = (
-        180  # 3 minutes - don't activate trailing stop until this time has passed (for penny stocks)
+        30  # 30 seconds - quick activation for penny stocks (was 180 seconds)
     )
     min_trailing_stop_cooldown_seconds: int = (
-        120  # 2 minutes minimum cooldown for ALL stocks to prevent whipsaw exits
+        30  # 30 seconds minimum cooldown for penny stocks to allow quick exits (was 120 seconds)
     )
     force_close_before_market_close: bool = (
         True  # Force close all positions before market close
@@ -612,12 +618,19 @@ class MomentumIndicator(BaseTradingIndicator):
         )
 
         if is_low_price:
-            # Stricter volatility filter for low-priced stocks
+            # For penny stocks, we WANT high volatility - it's our edge! No filter here.
+            # Only filter out extreme cases (>50% ATR) to avoid complete chaos
             if volatility_score > cls.max_volatility_for_low_price:
                 return (
                     False,
-                    f"Too volatile for low-priced stock: {volatility_reason} "
-                    f"(exceeds {cls.max_volatility_for_low_price:.2f}% limit for stocks < ${cls.max_stock_price_for_penny_treatment})",
+                    f"Extreme volatility for penny stock: {volatility_reason} "
+                    f"(exceeds {cls.max_volatility_for_low_price:.2f}% limit - too chaotic even for aggressive trading)",
+                )
+            # Log that we're allowing high volatility for penny stocks
+            if volatility_score > 4.0:  # Log when volatility is above old threshold
+                logger.info(
+                    f"💰 Allowing high volatility penny stock {ticker}: {volatility_reason} "
+                    f"(volatility: {volatility_score:.2f}% - banking on volatility for quick profits)"
                 )
         else:
             # Standard volatility filter for higher-priced stocks
@@ -1188,8 +1201,8 @@ class MomentumIndicator(BaseTradingIndicator):
                     {
                         "ticker": ticker,
                         "indicator": cls.indicator_name(),
-                        "reason_not_to_enter_long": "No market data response",
-                        "reason_not_to_enter_short": "No market data response",
+                        "reason_not_to_enter_long": "No market data response - cannot evaluate technical indicators or momentum for long entry",
+                        "reason_not_to_enter_short": "No market data response - cannot evaluate technical indicators or momentum for short entry",
                         "technical_indicators": None,
                     }
                 )
@@ -1207,8 +1220,8 @@ class MomentumIndicator(BaseTradingIndicator):
                     {
                         "ticker": ticker,
                         "indicator": cls.indicator_name(),
-                        "reason_not_to_enter_long": "No datetime_price data",
-                        "reason_not_to_enter_short": "No datetime_price data",
+                        "reason_not_to_enter_long": "No datetime_price data - cannot calculate momentum for long entry evaluation",
+                        "reason_not_to_enter_short": "No datetime_price data - cannot calculate momentum for short entry evaluation",
                         "technical_indicators": technical_analysis,
                     }
                 )
@@ -1227,13 +1240,18 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"Skipping {ticker}: momentum {momentum_score:.2f}% < "
                     f"minimum threshold {cls.min_momentum_threshold}%"
                 )
-                # Determine long/short based on momentum sign
+                # Momentum threshold applies to both directions
+                # If positive momentum is too low, can't go long; if negative is too low, can't go short
                 if momentum_score > 0:
-                    reason_long = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}%"
-                    reason_short = None
+                    reason_long = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}% (insufficient upward momentum for long entry)"
+                    reason_short = f"Not evaluated for short entry (momentum is positive {momentum_score:.2f}%, would evaluate momentum threshold on negative momentum for short entry)"
+                elif momentum_score < 0:
+                    reason_long = f"Not evaluated for long entry (momentum is negative {momentum_score:.2f}%, would evaluate momentum threshold on positive momentum for long entry)"
+                    reason_short = f"Momentum {abs(momentum_score):.2f}% < minimum threshold {cls.min_momentum_threshold}% (insufficient downward momentum for short entry)"
                 else:
-                    reason_long = None
-                    reason_short = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}%"
+                    # Zero momentum - applies to both
+                    reason_long = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}% (insufficient momentum for long entry)"
+                    reason_short = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}% (insufficient momentum for short entry)"
 
                 inactive_ticker_logs.append(
                     {
@@ -1253,13 +1271,17 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"Skipping {ticker}: momentum {momentum_score:.2f}% > "
                     f"maximum threshold {cls.max_momentum_threshold}% (likely at peak)"
                 )
-                # Determine long/short based on momentum sign
+                # Extreme momentum applies to both directions (entering at peak/trough)
                 if momentum_score > 0:
-                    reason_long = f"Momentum {momentum_score:.2f}% > maximum threshold {cls.max_momentum_threshold}% (likely at peak)"
-                    reason_short = None
+                    reason_long = f"Momentum {momentum_score:.2f}% > maximum threshold {cls.max_momentum_threshold}% (likely at peak, risk of reversal)"
+                    reason_short = f"Not evaluated for short entry (momentum is positive {momentum_score:.2f}%, would evaluate momentum threshold on negative momentum for short entry)"
+                elif momentum_score < 0:
+                    reason_long = f"Not evaluated for long entry (momentum is negative {momentum_score:.2f}%, would evaluate momentum threshold on positive momentum for long entry)"
+                    reason_short = f"Momentum {abs(momentum_score):.2f}% > maximum threshold {cls.max_momentum_threshold}% (likely at trough, risk of reversal)"
                 else:
-                    reason_long = None
-                    reason_short = f"Momentum {momentum_score:.2f}% > maximum threshold {cls.max_momentum_threshold}% (likely at peak)"
+                    # Zero momentum edge case
+                    reason_long = f"Momentum {momentum_score:.2f}% exceeds maximum threshold {cls.max_momentum_threshold}% (applies to both directions)"
+                    reason_short = f"Momentum {momentum_score:.2f}% exceeds maximum threshold {cls.max_momentum_threshold}% (applies to both directions)"
 
                 inactive_ticker_logs.append(
                     {
@@ -1284,16 +1306,20 @@ class MomentumIndicator(BaseTradingIndicator):
                     if not structure_confirmed:
                         stats["failed_quality_filters"] += 1
                         logger.debug(f"Skipping {ticker}: {structure_reason}")
+                        # Trend structure check is direction-specific
+                        if is_long:
+                            reason_long = f"Trend structure failed: {structure_reason}"
+                            reason_short = f"Not evaluated (momentum is positive {momentum_score:.2f}%, would evaluate trend structure on negative momentum for short entry)"
+                        else:
+                            reason_long = f"Not evaluated (momentum is negative {momentum_score:.2f}%, would evaluate trend structure on positive momentum for long entry)"
+                            reason_short = f"Trend structure failed: {structure_reason}"
+                        
                         inactive_ticker_logs.append(
                             {
                                 "ticker": ticker,
                                 "indicator": cls.indicator_name(),
-                                "reason_not_to_enter_long": (
-                                    structure_reason if is_long else None
-                                ),
-                                "reason_not_to_enter_short": (
-                                    structure_reason if not is_long else None
-                                ),
+                                "reason_not_to_enter_long": reason_long,
+                                "reason_not_to_enter_short": reason_short,
                                 "technical_indicators": technical_analysis,
                             }
                         )
@@ -1305,12 +1331,43 @@ class MomentumIndicator(BaseTradingIndicator):
             if not passes_filter:
                 stats["failed_quality_filters"] += 1
                 logger.debug(f"Skipping {ticker}: {filter_reason}")
-                # Determine long/short based on momentum sign
-                if momentum_score > 0:
-                    reason_long = filter_reason
-                    reason_short = None
+                # Log at INFO level for better visibility of why trades aren't happening
+                logger.info(
+                    f"❌ {ticker} failed quality filter: {filter_reason} "
+                    f"(momentum: {momentum_score:.2f}%)"
+                )
+                
+                # Determine which direction(s) this filter applies to
+                # Most filters apply to both directions, but some are direction-specific
+                is_long = momentum_score > 0
+                is_short = momentum_score < 0
+                
+                # Check if filter reason indicates direction-specific failure
+                reason_lower = filter_reason.lower()
+                is_direction_specific = (
+                    "rsi" in reason_lower and ("long" in reason_lower or "short" in reason_lower)
+                ) or (
+                    "stochastic" in reason_lower and "short" in reason_lower
+                ) or (
+                    "bollinger" in reason_lower and ("long" in reason_lower or "short" in reason_lower)
+                )
+                
+                if is_direction_specific:
+                    # Direction-specific filter (RSI, Stochastic, Bollinger)
+                    if is_long:
+                        reason_long = filter_reason
+                        reason_short = f"Not evaluated for short entry (momentum is positive {momentum_score:.2f}%, would evaluate quality filters on negative momentum for short entry)"
+                    elif is_short:
+                        reason_long = f"Not evaluated for long entry (momentum is negative {momentum_score:.2f}%, would evaluate quality filters on positive momentum for long entry)"
+                        reason_short = filter_reason
+                    else:
+                        # Zero momentum - set both with clear explanation
+                        reason_long = f"{filter_reason} (applies to both directions due to zero momentum)"
+                        reason_short = f"{filter_reason} (applies to both directions due to zero momentum)"
                 else:
-                    reason_long = None
+                    # Universal filter (applies to both directions)
+                    # Examples: price, volatility, volume, ADX, warrant/option
+                    reason_long = filter_reason
                     reason_short = filter_reason
 
                 inactive_ticker_logs.append(
@@ -1352,6 +1409,17 @@ class MomentumIndicator(BaseTradingIndicator):
             f"{stats['low_momentum']} low momentum, "
             f"{stats['failed_quality_filters']} failed quality filters)"
         )
+        
+        # Enhanced diagnostics: log if no tickers passed all filters
+        if len(ticker_momentum_scores) == 0:
+            logger.warning(
+                f"⚠️ ZERO tickers passed all filters! "
+                f"Total candidates: {len(candidates_to_fetch)}, "
+                f"No market data: {stats['no_market_data']}, "
+                f"No datetime_price: {stats['no_datetime_price']}, "
+                f"Low momentum: {stats['low_momentum']}, "
+                f"Failed quality filters: {stats['failed_quality_filters']}"
+            )
 
         upward_tickers = [
             (t, score, reason)
@@ -1381,8 +1449,18 @@ class MomentumIndicator(BaseTradingIndicator):
             f"MAB selected {len(top_upward)} upward momentum tickers and "
             f"{len(top_downward)} downward momentum tickers (top_k={cls.top_k})"
         )
+        
+        # Log selected tickers for visibility
+        if top_upward:
+            logger.info(
+                f"Selected upward tickers: {[(t, f'{s:.2f}%', r[:50]) for t, s, r in top_upward]}"
+            )
+        if top_downward:
+            logger.info(
+                f"Selected downward tickers: {[(t, f'{s:.2f}%', r[:50]) for t, s, r in top_downward]}"
+            )
 
-        # Diagnostic logging for zero trades
+        # Enhanced diagnostic logging for zero trades
         if len(top_upward) == 0 and len(top_downward) == 0:
             logger.warning(
                 f"⚠️ MAB service returned zero tickers! "
@@ -1390,13 +1468,26 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"Downward candidates: {len(downward_tickers)}, "
                 f"Total passed filters: {len(ticker_momentum_scores)}"
             )
+            # Log sample of candidates that passed filters but weren't selected
+            if upward_tickers:
+                logger.info(
+                    f"Sample upward candidates (top 5): "
+                    f"{[(t, f'{s:.2f}%') for t, s, _ in upward_tickers[:5]]}"
+                )
+            if downward_tickers:
+                logger.info(
+                    f"Sample downward candidates (top 5): "
+                    f"{[(t, f'{s:.2f}%') for t, s, _ in downward_tickers[:5]]}"
+                )
         elif len(upward_tickers) > 0 and len(top_upward) == 0:
             logger.warning(
-                f"⚠️ MAB service returned zero upward tickers despite {len(upward_tickers)} candidates passing filters"
+                f"⚠️ MAB service returned zero upward tickers despite {len(upward_tickers)} candidates passing filters. "
+                f"Top 3 candidates: {[(t, f'{s:.2f}%') for t, s, _ in upward_tickers[:3]]}"
             )
         elif len(downward_tickers) > 0 and len(top_downward) == 0:
             logger.warning(
-                f"⚠️ MAB service returned zero downward tickers despite {len(downward_tickers)} candidates passing filters"
+                f"⚠️ MAB service returned zero downward tickers despite {len(downward_tickers)} candidates passing filters. "
+                f"Top 3 candidates: {[(t, f'{s:.2f}%') for t, s, _ in downward_tickers[:3]]}"
             )
 
         # Process long entries
@@ -1453,6 +1544,24 @@ class MomentumIndicator(BaseTradingIndicator):
                 is_golden=is_golden,
             )
 
+        # Summary log for entry cycle
+        total_entries_attempted = len(top_upward) + len(top_downward)
+        if total_entries_attempted == 0:
+            logger.warning(
+                f"⚠️ Entry cycle completed with ZERO trade entries attempted. "
+                f"Summary: {len(candidates_to_fetch)} candidates fetched, "
+                f"{len(ticker_momentum_scores)} passed all filters, "
+                f"{len(upward_tickers)} upward candidates, {len(downward_tickers)} downward candidates, "
+                f"MAB selected {len(top_upward)} upward + {len(top_downward)} downward. "
+                f"Active trades: {active_count}/{cls.max_active_trades}, "
+                f"Daily trades: {cls.daily_trades_count}/{cls.max_daily_trades}"
+            )
+        else:
+            logger.info(
+                f"Entry cycle completed: {total_entries_attempted} trade entries attempted "
+                f"({len(top_upward)} long, {len(top_downward)} short)"
+            )
+
         await asyncio.sleep(cls.entry_cycle_seconds)
 
     @classmethod
@@ -1493,18 +1602,22 @@ class MomentumIndicator(BaseTradingIndicator):
             return ticker_quote.get("ap", 0.0)  # Ask price for short exit
 
     @classmethod
-    def _check_holding_period(cls, created_at: Optional[str]) -> Tuple[bool, float]:
+    def _check_holding_period(cls, created_at: Optional[str], min_holding_seconds: Optional[int] = None) -> Tuple[bool, float]:
         """
         Check if trade has passed minimum holding period.
 
         Args:
             created_at: ISO timestamp string when trade was created
+            min_holding_seconds: Optional minimum holding period in seconds (defaults to cls.min_holding_period_seconds)
 
         Returns:
             Tuple of (passed_minimum: bool, holding_period_minutes: float)
         """
         if not created_at:
             return True, 0.0  # No created_at means we can't check, allow processing
+
+        if min_holding_seconds is None:
+            min_holding_seconds = cls.min_holding_period_seconds
 
         try:
             enter_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
@@ -1514,7 +1627,7 @@ class MomentumIndicator(BaseTradingIndicator):
             holding_period_seconds = (current_time - enter_time).total_seconds()
             holding_period_minutes = holding_period_seconds / 60.0
 
-            passed = holding_period_seconds >= cls.min_holding_period_seconds
+            passed = holding_period_seconds >= min_holding_seconds
             return passed, holding_period_minutes
         except Exception as e:
             logger.warning(f"Error calculating holding period: {str(e)}")
@@ -1665,13 +1778,18 @@ class MomentumIndicator(BaseTradingIndicator):
         trades_to_process = []
         for trade in active_trades:
             created_at = trade.get("created_at")
-            passed, holding_minutes = cls._check_holding_period(created_at)
+            enter_price = trade.get("enter_price", 0.0)
+            is_penny_stock = enter_price > 0 and enter_price < cls.max_stock_price_for_penny_treatment
+            
+            # Use shorter holding period for penny stocks
+            min_holding = cls.min_holding_period_penny_stocks_seconds if is_penny_stock else cls.min_holding_period_seconds
+            passed, holding_minutes = cls._check_holding_period(created_at, min_holding_seconds=min_holding)
 
             if not passed:
                 ticker = trade.get("ticker")
                 logger.debug(
                     f"Skipping {ticker}: holding period {holding_minutes:.1f} min < "
-                    f"minimum {cls.min_holding_period_seconds/60:.1f} min"
+                    f"minimum {min_holding/60:.2f} min {'(penny stock)' if is_penny_stock else ''}"
                 )
                 continue
             trades_to_process.append(trade)
@@ -1788,22 +1906,33 @@ class MomentumIndicator(BaseTradingIndicator):
                     logger.info(f"Exit signal for {ticker} - {exit_reason}")
 
             if not should_exit:
-                # Calculate dynamic profit target: 2x stop distance as recommended
-                # If stop loss is -3%, profit target should be +6%
-                stop_distance = abs(stop_loss_threshold)
-                profit_target_to_exit = stop_distance * cls.profit_target_multiplier
-
-                # Cap profit target at reasonable level (e.g., 10%)
-                profit_target_to_exit = min(10.0, profit_target_to_exit)
-
-                is_profitable = profit_percent >= profit_target_to_exit
-                if is_profitable:
+                # For penny stocks: QUICK PROFIT EXIT - bank on volatility, get out fast!
+                is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
+                if is_penny_stock and profit_percent >= cls.penny_stock_quick_profit_target:
                     should_exit = True
                     exit_reason = (
-                        f"Profit target reached: {profit_percent:.2f}% profit "
-                        f"(target: {profit_target_to_exit:.2f}% = {cls.profit_target_multiplier}x "
-                        f"stop distance of {stop_distance:.2f}%)"
+                        f"Penny stock quick profit target reached: {profit_percent:.2f}% profit "
+                        f"(target: {cls.penny_stock_quick_profit_target:.2f}% - banking on volatility, quick exit)"
                     )
+                    logger.info(f"Quick profit exit for penny stock {ticker}: {exit_reason}")
+                
+                if not should_exit:
+                    # Calculate dynamic profit target: 2x stop distance as recommended
+                    # If stop loss is -3%, profit target should be +6%
+                    stop_distance = abs(stop_loss_threshold)
+                    profit_target_to_exit = stop_distance * cls.profit_target_multiplier
+
+                    # Cap profit target at reasonable level (e.g., 10%)
+                    profit_target_to_exit = min(10.0, profit_target_to_exit)
+
+                    is_profitable = profit_percent >= profit_target_to_exit
+                    if is_profitable:
+                        should_exit = True
+                        exit_reason = (
+                            f"Profit target reached: {profit_percent:.2f}% profit "
+                            f"(target: {profit_target_to_exit:.2f}% = {cls.profit_target_multiplier}x "
+                            f"stop distance of {stop_distance:.2f}%)"
+                        )
 
             if not should_exit:
                 # Update peak profit if current profit is higher

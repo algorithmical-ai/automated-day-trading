@@ -53,8 +53,8 @@ class AlpacaClient:
             "APCA-API-SECRET-KEY": cls.API_SECRET_KEY,
         }
 
-        max_retries = 3
-        timeout_seconds = 2
+        max_retries = 5
+        timeout_seconds = 3
 
         for attempt in range(max_retries):
             try:
@@ -105,7 +105,7 @@ class AlpacaClient:
 
             except asyncio.TimeoutError:
                 if attempt < max_retries - 1:
-                    logger.warning(
+                    logger.debug(
                         f"Timeout getting quote for {ticker} from Alpaca API "
                         f"(attempt {attempt + 1}/{max_retries}), retrying..."
                     )

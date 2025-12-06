@@ -207,6 +207,17 @@ class MABService:
         # Select top-k
         selected = scored_tickers[:top_k]
         
+        if len(selected) == 0 and len(ticker_candidates) > 0:
+            logger.warning(
+                f"⚠️ MAB service selected ZERO tickers from {len(ticker_candidates)} candidates! "
+                f"This should not happen. All scores: {[(t[0], f'{s:.4f}') for t, _, _, s in scored_tickers[:10]]}"
+            )
+        elif len(selected) < len(ticker_candidates) and len(selected) < top_k:
+            logger.debug(
+                f"MAB selected {len(selected)} tickers (requested top_k={top_k}) from {len(ticker_candidates)} candidates. "
+                f"All scores: {[(t[0], f'{s:.4f}') for t, _, _, s in scored_tickers[:10]]}"
+            )
+        
         logger.info(
             f"MAB selected {len(selected)} tickers from {len(ticker_candidates)} candidates. "
             f"Top scores: {[f'{t[0]}:{t[3]:.3f}' for t in selected[:5]]}"
