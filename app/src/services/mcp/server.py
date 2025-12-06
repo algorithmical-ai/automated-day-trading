@@ -33,32 +33,6 @@ settings: ServerSettings = get_settings()
 client_settings = MCPClientSettings.model_validate(settings.mcp_clients)
 
 
-class AllowAnyHostASGIWrapper:
-    """ASGI wrapper to allow any host header (for Heroku compatibility).
-
-    Uvicorn validates the Host header, but on Heroku the Host header can be any
-    subdomain. This wrapper modifies the scope to bypass validation.
-    """
-
-    def __init__(self, app: Any) -> None:
-        self.app = app
-
-    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        # For HTTP requests, ensure the server tuple matches what uvicorn expects
-        # This helps bypass host header validation
-        if scope.get("type") == "http":
-            # Set server to match the bound host/port to bypass validation
-            # Uvicorn validates by comparing Host header to server tuple
-            current_server = scope.get("server")
-            if current_server:
-                # Keep the port but set host to 0.0.0.0 to match our binding
-                scope["server"] = ("0.0.0.0", current_server[1])
-            else:
-                scope["server"] = ("0.0.0.0", 8000)
-
-        await self.app(scope, receive, send)
-
-
 class HeaderTokenAuthMiddleware:
     """Simple header-based bearer token authentication middleware."""
 
@@ -273,77 +247,8 @@ def main_sync() -> None:
 
 
 async def _run_streamable_with_discovery() -> None:
-    import uvicorn
-
-    # Patch uvicorn to disable host header validation for Heroku compatibility
-    # Uvicorn validates Host header and returns 421 if it doesn't match
-    # We need to patch the protocol handlers to bypass this validation
-    try:
-        # Try patching the HTTP protocol implementations
-        # Uvicorn uses different protocols (httptools, h11, etc.)
-        patched = False
-        
-        # Try httptools protocol
-        try:
-            from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
-            
-            if hasattr(HttpToolsProtocol, "should_check_host"):
-                original_should_check_host = HttpToolsProtocol.should_check_host
-                
-                @staticmethod
-                def patched_should_check_host(headers):
-                    return False
-                
-                HttpToolsProtocol.should_check_host = patched_should_check_host
-                patched = True
-                logger.info("✅ Patched HttpToolsProtocol.should_check_host")
-        except (ImportError, AttributeError):
-            pass
-        
-        # Try h11 protocol
-        try:
-            from uvicorn.protocols.http.h11_impl import H11Protocol
-            
-            if hasattr(H11Protocol, "should_check_host"):
-                original_should_check_host = H11Protocol.should_check_host
-                
-                @staticmethod
-                def patched_should_check_host(headers):
-                    return False
-                
-                H11Protocol.should_check_host = patched_should_check_host
-                patched = True
-                logger.info("✅ Patched H11Protocol.should_check_host")
-        except (ImportError, AttributeError):
-            pass
-        
-        # Try patching Server class directly
-        try:
-            from uvicorn.server import Server
-            
-            # Patch the _check_host method if it exists
-            if hasattr(Server, "_check_host"):
-                original_check_host = Server._check_host
-                
-                def patched_check_host(self, headers):
-                    # Always allow - bypass host validation
-                    return True
-                
-                Server._check_host = patched_check_host
-                patched = True
-                logger.info("✅ Patched Server._check_host")
-        except (ImportError, AttributeError):
-            pass
-        
-        if not patched:
-            logger.warning("⚠️  Could not find uvicorn host validation methods to patch")
-            logger.warning("⚠️  Host header validation may still cause issues on Heroku")
-        else:
-            logger.info("✅ Successfully patched uvicorn host validation")
-            
-    except Exception as e:
-        logger.warning(f"⚠️  Error patching uvicorn host validation: {e}")
-        logger.warning("⚠️  Host header validation may still cause issues on Heroku")
+    from aiohttp import web
+    from aiohttp.web_runner import AppRunner, TCPSite
 
     # Get host and port from environment (Heroku compatibility)
     host = os.environ.get("HOST", "0.0.0.0")
@@ -369,15 +274,8 @@ async def _run_streamable_with_discovery() -> None:
         logger.info(f"   Token: {'*' * min(len(settings.mcp_auth_bearer_token), 8)}...")
     logger.info(f"🔗 MCP endpoint will be available at: http://{host}:{port}/mcp")
 
-    # Get the Starlette app and run it with uvicorn
+    # Get the Starlette app from FastMCP
     starlette_app = app.streamable_http_app()
-
-    # Wrap the ASGI app to allow any host header (for Heroku compatibility)
-    # This bypasses uvicorn's host header validation
-    wrapped_app = AllowAnyHostASGIWrapper(starlette_app)
-    logger.info(
-        "✅ Wrapped ASGI app with AllowAnyHostASGIWrapper for Heroku compatibility"
-    )
 
     # Log registered routes for debugging
     logger.info(
@@ -459,43 +357,121 @@ async def _run_streamable_with_discovery() -> None:
         await market_tool_client.close()
         logger.info("Automated Trading System MCP server shutdown complete.")
 
-    logger.info("⚙️  Creating uvicorn config...")
-    # Create config - uvicorn validates Host header by default
-    # For Heroku, we wrap the app to handle host header validation
-    # Note: uvicorn's host validation happens before the ASGI app receives the request
-    # so we handle it in the ASGI wrapper
-    config = uvicorn.Config(
-        wrapped_app,  # Use wrapped app instead of starlette_app
-        host=host,
-        port=port,
-        log_level="info",
-        server_header=False,  # Disable server header
-    )
-    logger.info("✅ Uvicorn config created")
-
-    logger.info("⚙️  Creating uvicorn server...")
-    server = uvicorn.Server(config)
-    logger.info("✅ Uvicorn server object created")
-
-    logger.info(f"🚀 Starting uvicorn server on {host}:{port}")
-    # Get Heroku app URL from environment or construct from request
+    # Create aiohttp web application
+    logger.info("⚙️  Creating aiohttp web application...")
+    aiohttp_app = web.Application()
+    
+    # Create ASGI adapter to run Starlette app with aiohttp
+    # This allows us to use FastMCP's streamable_http_app() with aiohttp
+    async def asgi_handler(request: web.Request) -> web.Response:
+        """ASGI adapter to run Starlette app with aiohttp"""
+        from aiohttp.web_response import Response
+        
+        # Convert aiohttp request to ASGI scope
+        scope = {
+            "type": "http",
+            "method": request.method,
+            "path": request.path_qs,
+            "raw_path": request.path_qs.encode(),
+            "query_string": request.query_string.encode() if request.query_string else b"",
+            "headers": [(k.encode(), v.encode()) for k, v in request.headers.items()],
+            "client": request.remote,
+            "server": (host, port),
+            "scheme": "https" if request.scheme == "https" else "http",
+            "root_path": "",
+            "app": starlette_app,
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+        }
+        
+        # Create ASGI receive/send callables
+        request_body = await request.read()
+        request_body_index = [0]
+        
+        async def receive():
+            if request_body_index[0] == 0:
+                request_body_index[0] = 1
+                return {
+                    "type": "http.request",
+                    "body": request_body,
+                    "more_body": False,
+                }
+            return {"type": "http.request", "body": b"", "more_body": False}
+        
+        response_status = [None]
+        response_headers = [None]
+        response_body = []
+        
+        async def send(message):
+            if message["type"] == "http.response.start":
+                response_status[0] = message["status"]
+                response_headers[0] = message["headers"]
+            elif message["type"] == "http.response.body":
+                response_body.append(message.get("body", b""))
+        
+        # Run the ASGI app
+        await starlette_app(scope, receive, send)
+        
+        # Build aiohttp response
+        headers_dict: Dict[str, str] = {}
+        headers_list: Optional[List[tuple]] = response_headers[0]
+        if headers_list is not None:
+            for header_pair in headers_list:
+                if isinstance(header_pair, (list, tuple)) and len(header_pair) >= 2:
+                    k, v = header_pair[0], header_pair[1]
+                    key = k.decode() if isinstance(k, bytes) else str(k)
+                    value = v.decode() if isinstance(v, bytes) else str(v)
+                    headers_dict[key] = value
+        body = b"".join(response_body)
+        
+        return Response(
+            status=response_status[0] or 200,
+            headers=headers_dict,
+            body=body,
+        )
+    
+    # Add route for all paths (ASGI app handles routing)
+    aiohttp_app.router.add_route("*", "/{path:.*}", asgi_handler)
+    
+    # Add health check endpoint directly in aiohttp
+    async def health_handler(request: web.Request) -> web.Response:
+        """Health check endpoint"""
+        return web.json_response({
+            "status": "healthy",
+            "service": "automated-trading-system-mcp",
+            "port": port,
+            "auth_configured": bool(settings.mcp_auth_bearer_token),
+        })
+    
+    aiohttp_app.router.add_get("/health", health_handler)
+    aiohttp_app.router.add_get("/", health_handler)
+    
+    logger.info("✅ Aiohttp application created")
+    
+    # Create runner and site
+    logger.info("⚙️  Creating aiohttp runner...")
+    runner = AppRunner(aiohttp_app, access_log=None)
+    await runner.setup()
+    
+    site = TCPSite(runner, host, port)
+    await site.start()
+    
+    logger.info(f"🚀 Starting aiohttp server on {host}:{port}")
+    # Get Heroku app URL from environment
     heroku_app_name = os.environ.get("HEROKU_APP_NAME", "automated-day-trading")
-    logger.info(
-        f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp"
-    )
-    logger.info(
-        f"💡 Note: FastMCP streamable HTTP may mount at root '/' - check registered routes above"
-    )
-
+    logger.info(f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp")
+    logger.info("✅ Aiohttp server started successfully (no host header validation issues)")
+    
     try:
-        logger.info("🔄 About to call server.serve()...")
-        await server.serve()
-        logger.info("🔄 server.serve() completed (unexpected)")
+        # Keep running
+        while True:
+            await asyncio.sleep(1)
     except KeyboardInterrupt:
         logger.info("🛑 Server stopped by user")
     except Exception as e:
         logger.exception(f"❌ Fatal error running MCP server: {e}")
         raise
+    finally:
+        await runner.cleanup()
 
 
 async def _run_sse_with_discovery() -> None:
