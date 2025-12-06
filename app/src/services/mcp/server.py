@@ -35,14 +35,14 @@ client_settings = MCPClientSettings.model_validate(settings.mcp_clients)
 
 class AllowAnyHostASGIWrapper:
     """ASGI wrapper to allow any host header (for Heroku compatibility).
-    
+
     Uvicorn validates the Host header, but on Heroku the Host header can be any
     subdomain. This wrapper modifies the scope to bypass validation.
     """
-    
+
     def __init__(self, app: Any) -> None:
         self.app = app
-    
+
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         # For HTTP requests, ensure the server tuple matches what uvicorn expects
         # This helps bypass host header validation
@@ -55,7 +55,7 @@ class AllowAnyHostASGIWrapper:
                 scope["server"] = ("0.0.0.0", current_server[1])
             else:
                 scope["server"] = ("0.0.0.0", 8000)
-        
+
         await self.app(scope, receive, send)
 
 
@@ -191,8 +191,7 @@ async def _refresh_tool_registry() -> None:
         try:
             # Add timeout to prevent hanging
             tools_result = await asyncio.wait_for(
-                client.list_tools(),
-                timeout=10.0  # 10 second timeout per source
+                client.list_tools(), timeout=10.0  # 10 second timeout per source
             )
             serialized = [
                 (
@@ -275,6 +274,29 @@ def main_sync() -> None:
 
 async def _run_streamable_with_discovery() -> None:
     import uvicorn
+    
+    # Patch uvicorn Server to disable host header validation for Heroku compatibility
+    # Uvicorn validates Host header in the Server class before forwarding to ASGI app
+    try:
+        from uvicorn.server import Server
+        
+        # Store original _should_check_host method if it exists
+        if hasattr(Server, '_should_check_host'):
+            original_should_check_host = Server._should_check_host
+            
+            def patched_should_check_host(self, headers):
+                # Always return False to disable host checking
+                return False
+            
+            Server._should_check_host = patched_should_check_host
+            logger.info("✅ Patched uvicorn Server._should_check_host to bypass validation")
+        else:
+            # Try patching the protocol's host validation
+            # The host validation might be in the protocol implementation
+            logger.info("ℹ️  uvicorn Server._should_check_host not found, using ASGI wrapper approach")
+    except (ImportError, AttributeError) as e:
+        logger.warning(f"⚠️  Could not patch uvicorn host validation: {e}")
+        logger.warning("⚠️  Host header validation may still cause issues on Heroku")
 
     # Get host and port from environment (Heroku compatibility)
     host = os.environ.get("HOST", "0.0.0.0")
@@ -282,15 +304,19 @@ async def _run_streamable_with_discovery() -> None:
     try:
         port = int(port_str)
     except (ValueError, TypeError):
-        logger.warning(f"⚠️  Invalid PORT environment variable: '{port_str}', defaulting to 8000")
+        logger.warning(
+            f"⚠️  Invalid PORT environment variable: '{port_str}', defaulting to 8000"
+        )
         port = 8000
-    
+
     logger.info(f"🔧 Environment: HOST={host}, PORT={port} (from env: '{port_str}')")
 
     # Initialize database and start executor at server startup
     logger.info("Starting Automated Trading System MCP server.")
     logger.info(f"🌐 MCP Server will listen on {host}:{port}")
-    logger.info(f"🔐 Authentication: {'ENABLED' if settings.mcp_auth_bearer_token else 'DISABLED'}")
+    logger.info(
+        f"🔐 Authentication: {'ENABLED' if settings.mcp_auth_bearer_token else 'DISABLED'}"
+    )
     if settings.mcp_auth_bearer_token:
         logger.info(f"   Header: {settings.mcp_auth_header_name}")
         logger.info(f"   Token: {'*' * min(len(settings.mcp_auth_bearer_token), 8)}...")
@@ -298,32 +324,42 @@ async def _run_streamable_with_discovery() -> None:
 
     # Get the Starlette app and run it with uvicorn
     starlette_app = app.streamable_http_app()
-    
+
     # Wrap the ASGI app to allow any host header (for Heroku compatibility)
     # This bypasses uvicorn's host header validation
     wrapped_app = AllowAnyHostASGIWrapper(starlette_app)
-    logger.info("✅ Wrapped ASGI app with AllowAnyHostASGIWrapper for Heroku compatibility")
-    
+    logger.info(
+        "✅ Wrapped ASGI app with AllowAnyHostASGIWrapper for Heroku compatibility"
+    )
+
     # Log registered routes for debugging
-    logger.info(f"📋 Registered routes: {[route.path for route in starlette_app.routes if hasattr(route, 'path')]}")
-    
+    logger.info(
+        f"📋 Registered routes: {[route.path for route in starlette_app.routes if hasattr(route, 'path')]}"
+    )
+
     # Add a health check endpoint (before other routes to avoid conflicts)
     from starlette.routing import Route
-    
+
     async def health_check(request: Any) -> JSONResponse:
         """Health check endpoint for Heroku"""
-        return JSONResponse({
-            "status": "healthy",
-            "service": "automated-trading-system-mcp",
-            "port": port,
-            "auth_configured": bool(settings.mcp_auth_bearer_token)
-        })
-    
+        return JSONResponse(
+            {
+                "status": "healthy",
+                "service": "automated-trading-system-mcp",
+                "port": port,
+                "auth_configured": bool(settings.mcp_auth_bearer_token),
+            }
+        )
+
     # Add health check route - insert at beginning to ensure it's checked first
     try:
         health_route = Route("/health", health_check, methods=["GET"])
         # Check if health route already exists
-        existing_health = [r for r in starlette_app.routes if hasattr(r, 'path') and r.path == "/health"]
+        existing_health = [
+            r
+            for r in starlette_app.routes
+            if hasattr(r, "path") and r.path == "/health"
+        ]
         if not existing_health:
             starlette_app.routes.insert(0, health_route)  # Insert at beginning
             logger.info("✅ Health check endpoint added at /health")
@@ -331,29 +367,37 @@ async def _run_streamable_with_discovery() -> None:
             logger.info("ℹ️  Health check endpoint already exists")
     except Exception as e:
         logger.warning(f"⚠️  Could not add health check endpoint: {e}")
-    
+
     # Track background tasks - use a dict to avoid closure issues
     background_tasks: Dict[str, Optional[asyncio.Task]] = {
         "discovery": None,
-        "initialization": None
+        "initialization": None,
     }
-    
+
     # Add startup event to Starlette app
     @starlette_app.on_event("startup")
     async def startup_event():
         # Start background tasks after server is ready
         # Use create_task to ensure this doesn't block startup
-        logger.info("🚀 MCP Server startup event fired - scheduling background tasks...")
+        logger.info(
+            "🚀 MCP Server startup event fired - scheduling background tasks..."
+        )
         try:
-            background_tasks["discovery"] = asyncio.create_task(_periodic_tool_discovery())
-            background_tasks["initialization"] = asyncio.create_task(_initialization_worker())
+            background_tasks["discovery"] = asyncio.create_task(
+                _periodic_tool_discovery()
+            )
+            background_tasks["initialization"] = asyncio.create_task(
+                _initialization_worker()
+            )
             # Don't await - let them run in background
-            logger.info("✅ Background tasks scheduled: discovery={}, initialization={}", 
-                       background_tasks["discovery"] is not None,
-                       background_tasks["initialization"] is not None)
+            logger.info(
+                "✅ Background tasks scheduled: discovery={}, initialization={}",
+                background_tasks["discovery"] is not None,
+                background_tasks["initialization"] is not None,
+            )
         except Exception as e:
             logger.exception("❌ Error scheduling background tasks: {}", e)
-    
+
     @starlette_app.on_event("shutdown")
     async def shutdown_event():
         logger.info("Shutting down Automated Trading System MCP server.")
@@ -367,7 +411,7 @@ async def _run_streamable_with_discovery() -> None:
                     await task
         await market_tool_client.close()
         logger.info("Automated Trading System MCP server shutdown complete.")
-    
+
     logger.info("⚙️  Creating uvicorn config...")
     # Create config - uvicorn validates Host header by default
     # For Heroku, we wrap the app to handle host header validation
@@ -381,7 +425,7 @@ async def _run_streamable_with_discovery() -> None:
         server_header=False,  # Disable server header
     )
     logger.info("✅ Uvicorn config created")
-    
+
     logger.info("⚙️  Creating uvicorn server...")
     server = uvicorn.Server(config)
     logger.info("✅ Uvicorn server object created")
@@ -389,9 +433,13 @@ async def _run_streamable_with_discovery() -> None:
     logger.info(f"🚀 Starting uvicorn server on {host}:{port}")
     # Get Heroku app URL from environment or construct from request
     heroku_app_name = os.environ.get("HEROKU_APP_NAME", "automated-day-trading")
-    logger.info(f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp")
-    logger.info(f"💡 Note: FastMCP streamable HTTP may mount at root '/' - check registered routes above")
-    
+    logger.info(
+        f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp"
+    )
+    logger.info(
+        f"💡 Note: FastMCP streamable HTTP may mount at root '/' - check registered routes above"
+    )
+
     try:
         logger.info("🔄 About to call server.serve()...")
         await server.serve()
@@ -412,9 +460,11 @@ async def _run_sse_with_discovery() -> None:
     try:
         port = int(port_str)
     except (ValueError, TypeError):
-        logger.warning(f"⚠️  Invalid PORT environment variable: '{port_str}', defaulting to 8000")
+        logger.warning(
+            f"⚠️  Invalid PORT environment variable: '{port_str}', defaulting to 8000"
+        )
         port = 8000
-    
+
     logger.info(f"🔧 Environment: HOST={host}, PORT={port} (from env: '{port_str}')")
 
     # Initialize database and start executor at server startup
@@ -422,29 +472,37 @@ async def _run_sse_with_discovery() -> None:
 
     # Get the Starlette app and run it with uvicorn
     starlette_app = app.sse_app()
-    
+
     # Track background tasks - use a dict to avoid closure issues
     background_tasks: Dict[str, Optional[asyncio.Task]] = {
         "discovery": None,
-        "initialization": None
+        "initialization": None,
     }
-    
+
     # Add startup event to Starlette app
     @starlette_app.on_event("startup")
     async def startup_event():
         # Start background tasks after server is ready
         # Use create_task to ensure this doesn't block startup
-        logger.info("🚀 MCP Server startup event fired - scheduling background tasks...")
+        logger.info(
+            "🚀 MCP Server startup event fired - scheduling background tasks..."
+        )
         try:
-            background_tasks["discovery"] = asyncio.create_task(_periodic_tool_discovery())
-            background_tasks["initialization"] = asyncio.create_task(_initialization_worker())
+            background_tasks["discovery"] = asyncio.create_task(
+                _periodic_tool_discovery()
+            )
+            background_tasks["initialization"] = asyncio.create_task(
+                _initialization_worker()
+            )
             # Don't await - let them run in background
-            logger.info("✅ Background tasks scheduled: discovery={}, initialization={}", 
-                       background_tasks["discovery"] is not None,
-                       background_tasks["initialization"] is not None)
+            logger.info(
+                "✅ Background tasks scheduled: discovery={}, initialization={}",
+                background_tasks["discovery"] is not None,
+                background_tasks["initialization"] is not None,
+            )
         except Exception as e:
             logger.exception("❌ Error scheduling background tasks: {}", e)
-    
+
     @starlette_app.on_event("shutdown")
     async def shutdown_event():
         logger.info("Shutting down Automated Trading System MCP server.")
@@ -458,7 +516,7 @@ async def _run_sse_with_discovery() -> None:
                     await task
         await market_tool_client.close()
         logger.info("Automated Trading System MCP server shutdown complete.")
-    
+
     config = uvicorn.Config(
         starlette_app,
         host=host,
@@ -470,9 +528,13 @@ async def _run_sse_with_discovery() -> None:
     logger.info(f"🚀 Starting uvicorn server on {host}:{port}")
     # Get Heroku app URL from environment or construct from request
     heroku_app_name = os.environ.get("HEROKU_APP_NAME", "automated-day-trading")
-    logger.info(f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp")
-    logger.info(f"💡 Note: FastMCP streamable HTTP may mount at root '/' - check registered routes above")
-    
+    logger.info(
+        f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp"
+    )
+    logger.info(
+        f"💡 Note: FastMCP streamable HTTP may mount at root '/' - check registered routes above"
+    )
+
     try:
         logger.info("🔄 Server starting...")
         await server.serve()
