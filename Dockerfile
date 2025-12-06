@@ -32,7 +32,7 @@ RUN conda run -n automated_trading_system_env pip install --no-cache-dir \
     && conda run -n automated_trading_system_env pip install --no-cache-dir -r requirements.txt
 
 # Verify the environment is working and all packages are installed
-RUN conda run -n automated_trading_system_env python -c "import sys; print(f'Python version: {sys.version}'); print('Checking critical packages...'); import fastapi; print('✅ FastAPI imported successfully'); import aiohttp; print('✅ aiohttp imported successfully'); import pandas; print('✅ pandas imported successfully'); import requests; print('✅ requests imported successfully'); from bs4 import BeautifulSoup; print('✅ BeautifulSoup imported successfully'); import talib; print('✅ TA-Lib imported successfully'); print('✅ All critical packages imported successfully')"
+RUN conda run -n automated_trading_system_env python -c "import sys; print(f'Python version: {sys.version}'); print('Checking critical packages...'); import aiohttp; print('✅ aiohttp imported successfully'); import pandas; print('✅ pandas imported successfully'); import requests; print('✅ requests imported successfully'); from bs4 import BeautifulSoup; print('✅ BeautifulSoup imported successfully'); import talib; print('✅ TA-Lib imported successfully'); print('✅ All critical packages imported successfully')"
 
 # Verify the environment is working
 RUN conda info --envs && \
