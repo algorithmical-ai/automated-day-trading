@@ -252,7 +252,14 @@ async def _run_streamable_with_discovery() -> None:
 
     # Get host and port from environment (Heroku compatibility)
     host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", 8000))
+    port_str = os.environ.get("PORT", "8000")
+    try:
+        port = int(port_str)
+    except (ValueError, TypeError):
+        logger.warning(f"⚠️  Invalid PORT environment variable: '{port_str}', defaulting to 8000")
+        port = 8000
+    
+    logger.info(f"🔧 Environment: HOST={host}, PORT={port} (from env: '{port_str}')")
 
     # Initialize database and start executor at server startup
     logger.info("Starting Automated Trading System MCP server.")
@@ -365,7 +372,14 @@ async def _run_sse_with_discovery() -> None:
 
     # Get host and port from environment (Heroku compatibility)
     host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", 8000))
+    port_str = os.environ.get("PORT", "8000")
+    try:
+        port = int(port_str)
+    except (ValueError, TypeError):
+        logger.warning(f"⚠️  Invalid PORT environment variable: '{port_str}', defaulting to 8000")
+        port = 8000
+    
+    logger.info(f"🔧 Environment: HOST={host}, PORT={port} (from env: '{port_str}')")
 
     # Initialize database and start executor at server startup
     logger.info("Starting Automated Trading System MCP server.")
