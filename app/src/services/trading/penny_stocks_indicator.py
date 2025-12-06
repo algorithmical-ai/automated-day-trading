@@ -20,7 +20,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
     # Configuration
     max_stock_price: float = 5.0  # Only trade stocks < $5
-    min_stock_price: float = 0.10  # Minimum stock price
+    min_stock_price: float = .01  # Minimum stock price (avoid extreme penny stocks)
     trailing_stop_percent: float = 4.0  # 4% trailing stop loss
     profit_threshold: float = 1.0  # Minimum profit to exit
     top_k: int = 2  # Top K tickers to select
@@ -29,7 +29,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
     exceptional_momentum_threshold: float = (
         8.0  # Exceptional momentum to trigger preemption
     )
-    min_volume: int = 1000  # Minimum daily volume
+    min_volume: int = 500  # Minimum daily volume (increased for liquidity)
+    min_avg_volume: int = 1000  # Minimum average daily volume
+    max_price_discrepancy_percent: float = 10.0  # Max % difference between quote and close price
+    max_bid_ask_spread_percent: float = 2.0  # Max bid-ask spread as % of price
     entry_cycle_seconds: int = 5
     exit_cycle_seconds: int = 5
     max_active_trades: int = 5
@@ -143,6 +146,12 @@ class PennyStocksIndicator(BaseTradingIndicator):
         return results
 
     @classmethod
+    def _is_special_security(cls, ticker: str) -> bool:
+        """Check if ticker is a special security (warrants, rights, units, etc.)"""
+        special_suffixes = [".WS", ".RT", ".U", ".W", ".R", ".V"]
+        return any(ticker.upper().endswith(suffix) for suffix in special_suffixes)
+
+    @classmethod
     async def _passes_filters(
         cls, ticker: str, bars_data: Optional[Dict[str, Any]], momentum_score: float
     ) -> Tuple[bool, str, Optional[str]]:
@@ -153,25 +162,56 @@ class PennyStocksIndicator(BaseTradingIndicator):
         if not bars_data:
             return False, "No market data", None
 
+        # Filter out special securities (warrants, rights, etc.)
+        if cls._is_special_security(ticker):
+            return False, f"Special security (warrants/rights): {ticker}", None
+
         bars_dict = bars_data.get("bars", {})
         ticker_bars = bars_dict.get(ticker, [])
         if not ticker_bars or len(ticker_bars) < 10:
             return False, "Insufficient bars data", None
 
-        # Get current price
-        current_price = await cls._get_ticker_price(ticker)
-        if current_price is None or current_price <= 0:
-            return False, "Unable to get current price", None
+        # Get current price from quote
+        quote_response = await AlpacaClient.quote(ticker)
+        if not quote_response:
+            return False, "Unable to get quote", None
+
+        quote_data = quote_response.get("quote", {})
+        quotes = quote_data.get("quotes", {})
+        ticker_quote = quotes.get(ticker, {})
+        
+        bid = ticker_quote.get("bp", 0.0)
+        ask = ticker_quote.get("ap", 0.0)
+        
+        if bid <= 0 or ask <= 0:
+            return False, f"Invalid bid/ask: bid={bid}, ask={ask}", None
+
+        # Use mid price
+        current_price = (bid + ask) / 2.0
+        
+        # Check bid-ask spread
+        spread = ask - bid
+        spread_percent = (spread / current_price) * 100 if current_price > 0 else 100
+        if spread_percent > cls.max_bid_ask_spread_percent:
+            return False, f"Bid-ask spread too wide: {spread_percent:.2f}% > {cls.max_bid_ask_spread_percent}%", None
 
         # Check price range
         if current_price < cls.min_stock_price:
-            return False, f"Price too low: ${current_price:.2f}", None
+            return False, f"Price too low: ${current_price:.2f} < ${cls.min_stock_price:.2f}", None
         if current_price >= cls.max_stock_price:
             return (
                 False,
                 f"Price too high: ${current_price:.2f} >= ${cls.max_stock_price:.2f}",
                 None,
             )
+
+        # Validate quote price vs close price from bars
+        latest_bar = ticker_bars[-1]
+        close_price = latest_bar.get("c", 0.0)
+        if close_price > 0:
+            price_discrepancy = abs(current_price - close_price) / close_price * 100
+            if price_discrepancy > cls.max_price_discrepancy_percent:
+                return False, f"Price discrepancy too large: quote=${current_price:.4f} vs close=${close_price:.4f} ({price_discrepancy:.2f}%)", None
 
         # Check momentum
         abs_momentum = abs(momentum_score)
@@ -188,10 +228,16 @@ class PennyStocksIndicator(BaseTradingIndicator):
             else:
                 return False, reason, None
 
-        # Check volume
-        total_volume = sum(bar.get("v", 0) for bar in ticker_bars[-20:])  # Last 20 bars
+        # Check volume - use last 20 bars and calculate average
+        recent_volumes = [bar.get("v", 0) for bar in ticker_bars[-20:]]
+        total_volume = sum(recent_volumes)
+        avg_volume = total_volume / len(recent_volumes) if recent_volumes else 0
+        
         if total_volume < cls.min_volume:
             return False, f"Volume too low: {total_volume} < {cls.min_volume}", None
+        
+        if avg_volume < cls.min_avg_volume:
+            return False, f"Average volume too low: {avg_volume:.0f} < {cls.min_avg_volume}", None
 
         return True, "Passed all filters", None
 
@@ -242,13 +288,22 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         logger.info(f"Current active trades: {active_count}/{cls.max_active_trades}")
 
-        # Filter out active tickers and those in cooldown
+        # Filter out active tickers, those in cooldown, and special securities
         candidates_to_fetch = [
             ticker
             for ticker in all_tickers
             if ticker not in active_ticker_set
             and not cls._is_ticker_in_cooldown(ticker)
+            and not cls._is_special_security(ticker)
         ]
+        
+        special_securities_count = sum(
+            1 for ticker in all_tickers if cls._is_special_security(ticker)
+        )
+        if special_securities_count > 0:
+            logger.info(
+                f"Filtered out {special_securities_count} special securities (warrants/rights)"
+            )
 
         # Filter out stocks >= $5 USD using quote() before fetching market data
         logger.info(
@@ -711,23 +766,60 @@ class PennyStocksIndicator(BaseTradingIndicator):
         quotes = quote_data.get("quotes", {})
         ticker_quote = quotes.get(ticker, {})
 
+        bid = ticker_quote.get("bp", 0.0)
+        ask = ticker_quote.get("ap", 0.0)
+        
+        if bid <= 0 or ask <= 0:
+            logger.warning(f"Invalid bid/ask for {ticker}: bid={bid}, ask={ask}, skipping")
+            return False
+
+        # Check bid-ask spread before entry
+        mid_price = (bid + ask) / 2.0
+        spread = ask - bid
+        spread_percent = (spread / mid_price) * 100 if mid_price > 0 else 100
+        if spread_percent > cls.max_bid_ask_spread_percent:
+            logger.warning(
+                f"Skipping {ticker}: bid-ask spread too wide: {spread_percent:.2f}% > {cls.max_bid_ask_spread_percent}%"
+            )
+            return False
+
         is_long = action == "buy_to_open"
-        enter_price = (
-            ticker_quote.get("ap", 0.0) if is_long else ticker_quote.get("bp", 0.0)
-        )
+        enter_price = ask if is_long else bid
 
         if enter_price <= 0:
             logger.warning(f"Invalid entry price for {ticker}, skipping")
             return False
 
-        logger.debug(f"Entry price for {ticker}: ${enter_price:.4f}")
+        logger.debug(f"Entry price for {ticker}: ${enter_price:.4f} (bid=${bid:.4f}, ask=${ask:.4f}, spread={spread_percent:.2f}%)")
 
-        # Verify price is still < $5
+        # Verify price is still in valid range
+        if enter_price < cls.min_stock_price:
+            logger.info(
+                f"Skipping {ticker}: entry price ${enter_price:.2f} < ${cls.min_stock_price:.2f}"
+            )
+            return False
         if enter_price >= cls.max_stock_price:
             logger.info(
                 f"Skipping {ticker}: entry price ${enter_price:.2f} >= ${cls.max_stock_price:.2f}"
             )
             return False
+
+        # Validate entry price matches latest bar close price
+        bars_data = market_data_dict.get(ticker)
+        if bars_data:
+            bars_dict = bars_data.get("bars", {})
+            ticker_bars = bars_dict.get(ticker, [])
+            if ticker_bars:
+                latest_bar = ticker_bars[-1]
+                close_price = latest_bar.get("c", 0.0)
+                if close_price > 0:
+                    price_discrepancy = abs(enter_price - close_price) / close_price * 100
+                    if price_discrepancy > cls.max_price_discrepancy_percent:
+                        logger.warning(
+                            f"Skipping {ticker}: entry price ${enter_price:.4f} differs from close ${close_price:.4f} "
+                            f"by {price_discrepancy:.2f}% (max: {cls.max_price_discrepancy_percent}%)"
+                        )
+                        return False
 
         # Prepare entry data
         direction = "upward" if is_long else "downward"
