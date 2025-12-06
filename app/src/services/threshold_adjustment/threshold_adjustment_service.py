@@ -8,11 +8,11 @@ import json
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import date
 from app.src.common.loguru_logger import logger
+from app.src.common.alpaca import AlpacaClient
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.bedrock.bedrock_client import BedrockClient
 from app.src.services.trading.momentum_indicator import MomentumIndicator
 from app.src.services.trading.deep_analyzer_indicator import DeepAnalyzerIndicator
-from app.src.services.mcp.mcp_client import MCPClient
 
 
 class ThresholdAdjustmentService:
@@ -52,18 +52,22 @@ class ThresholdAdjustmentService:
             try:
                 # Check market open status before running analysis
                 try:
-                    clock_response = await MCPClient.get_market_clock()
-                    if clock_response:
-                        clock = clock_response.get("clock", {})
-                        is_open = clock.get("is_open", False)
-                        if not is_open:
-                            next_open = clock.get("next_open")
+                    is_open = await AlpacaClient.is_market_open()
+                    if not is_open:
+                        # Get clock data for next_open info if needed
+                        try:
+                            clock = await AlpacaClient.clock()
+                            next_open = clock.get("next_open") if clock else None
                             logger.debug(
                                 f"⏸️  Market closed. Skipping threshold adjustment. Next open: {next_open}"
                             )
-                            # Sleep for a shorter interval when market is closed (check every 5 minutes)
-                            await asyncio.sleep(cls.analysis_interval_seconds)
-                            continue
+                        except Exception:
+                            logger.debug(
+                                "⏸️  Market closed. Skipping threshold adjustment."
+                            )
+                        # Sleep for a shorter interval when market is closed (check every 5 minutes)
+                        await asyncio.sleep(cls.analysis_interval_seconds)
+                        continue
                 except Exception as e:
                     logger.warning(
                         f"Could not retrieve market clock, proceeding cautiously: {e}"

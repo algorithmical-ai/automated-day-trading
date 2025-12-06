@@ -20,7 +20,7 @@ import aiohttp
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
 from app.src.common.alpaca import AlpacaClient
-from app.src.services.mcp.mcp_client import MCPClient
+from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
@@ -749,7 +749,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if not ticker or enter_price is None or enter_price <= 0:
                 continue
 
-            market_data_response = await MCPClient.get_market_data(ticker)
+            market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
             if not market_data_response:
                 continue
 
@@ -804,7 +804,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         else:
             return False
 
-        market_data_response = await MCPClient.get_market_data(ticker_to_exit)
+        market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(ticker_to_exit)
         if not market_data_response:
             return False
 
@@ -1478,7 +1478,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
             # Get market data for technical indicators (may be delayed, but don't block exit decisions)
             # Exit decisions are based on get_quote() which is more up-to-date
-            market_data_response = await MCPClient.get_market_data(ticker)
+            market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
             technical_analysis = {}
             atr = 0
             if market_data_response:

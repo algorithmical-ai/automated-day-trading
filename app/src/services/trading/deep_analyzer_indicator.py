@@ -11,7 +11,7 @@ import pytz
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
 from app.src.common.alpaca import AlpacaClient
-from app.src.services.mcp.mcp_client import MCPClient
+from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
 from app.src.services.market_data.market_data_service import MarketDataService
 from app.src.services.mab.mab_service import MABService
 from app.src.db.dynamodb_client import DynamoDBClient
@@ -242,7 +242,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
         """
         try:
             # Get current entry score to detect degradation
-            market_data = await MCPClient.get_market_data(ticker)
+            market_data = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
             if market_data:
                 current_action, current_signal, _, _ = await cls._evaluate_ticker_for_entry(ticker, market_data)
                 
@@ -1039,13 +1039,11 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                         technical_indicators_for_exit = indicators
 
                 if not technical_indicators_for_exit:
-                    # Fallback: get from market data
-                    market_data_response = await MCPClient.get_market_data(ticker)
+                    # Fallback: get from technical analysis directly
+                    market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
                     if market_data_response:
-                        technical_analysis = market_data_response.get(
-                            "technical_analysis", {}
-                        )
-                        technical_indicators_for_exit = technical_analysis.copy()
+                        # TechnicalAnalysisLib returns indicators directly, not nested in "technical_analysis"
+                        technical_indicators_for_exit = market_data_response.copy()
                         if "datetime_price" in technical_indicators_for_exit:
                             technical_indicators_for_exit = {
                                 k: v

@@ -14,7 +14,7 @@ import pytz
 
 from app.src.common.loguru_logger import logger
 from app.src.models.technical_indicators import TechnicalIndicators
-from app.src.services.mcp.mcp_client import MCPClient
+from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
 from app.src.common.utils import dict_to_technical_indicators
 
 
@@ -331,7 +331,7 @@ class MarketDataService:
             logger.debug(f"Shortability check passed for {ticker}: {shortable_reason}")
 
         if market_data is None:  # noqa: C0301
-            market_data = await MCPClient.get_market_data(ticker)
+            market_data = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
             if market_data is None:
                 raise ValueError(f"No market data available for {ticker}")
 
@@ -1451,7 +1451,7 @@ class MarketDataService:
 
         try:
             # Get current market data
-            market_data = await MCPClient.get_market_data(ticker)
+            market_data = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
             if market_data is None:
                 return {
                     "exit_decision": False,

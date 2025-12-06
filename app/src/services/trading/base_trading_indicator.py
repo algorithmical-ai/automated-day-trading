@@ -6,11 +6,13 @@ Abstract base class for trading indicators with shared infrastructure
 import asyncio
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Tuple, Optional, ClassVar
-from datetime import datetime, date, timezone, time
+from datetime import datetime, date, timezone
 import pytz
 
+from app.src.common.alpaca import AlpacaClient
 from app.src.common.loguru_logger import logger
-from app.src.services.mcp.mcp_client import MCPClient
+from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
+from app.src.services.candidate_generator.alpaca_screener import AlpacaScreenerService
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
@@ -49,7 +51,7 @@ class BaseTradingIndicator(ABC):
     @classmethod
     def configure(cls):
         """Configure dependencies"""
-        MCPClient.configure()
+        # MCPClient is no longer used - all calls now go directly to AlpacaClient and TechnicalAnalysisLib
         DynamoDBClient.configure()
         MABService.configure()
         cls.running = True
@@ -121,16 +123,6 @@ class BaseTradingIndicator(ABC):
             cls.daily_trades_count += 1
 
     @classmethod
-    async def _check_market_open(cls) -> bool:
-        """Check if market is open"""
-        clock_response = await MCPClient.get_market_clock()
-        if not clock_response:
-            return False
-
-        clock = clock_response.get("clock", {})
-        return clock.get("is_open", False)
-
-    @classmethod
     async def _reset_daily_stats_if_needed(cls):
         """Reset daily stats only once per day at 9:30 AM EST (market open)
 
@@ -143,11 +135,6 @@ class BaseTradingIndicator(ABC):
         est_tz = pytz.timezone("America/New_York")
         current_time_est = current_time_utc.astimezone(est_tz)
         today = current_time_est.date().isoformat()  # Use EST date for market day
-        market_open_time = time(9, 30)  # 9:30 AM EST
-
-        # Check if it's after 9:30 AM EST (market-hour logic)
-        current_time_only = current_time_est.time()
-        is_after_market_open = current_time_only >= market_open_time
 
         # Check if we've already reset today (using EST date for market day)
         already_reset_today = (
@@ -160,7 +147,7 @@ class BaseTradingIndicator(ABC):
         # 2. We haven't reset today yet
         # 3. The date has changed (safety check)
         if (
-            is_after_market_open
+            await AlpacaClient.is_market_open()
             and not already_reset_today
             and cls.mab_reset_date != today
         ):
@@ -175,7 +162,7 @@ class BaseTradingIndicator(ABC):
             cls.daily_trades_count = 0
             cls.daily_trades_date = today
             cls._get_ticker_exit_timestamps().clear()
-        elif not is_after_market_open:
+        elif not await AlpacaClient.is_market_open():
             # Log if we're before market open (only once to avoid spam)
             if cls.mab_reset_date != today:
                 logger.debug(
@@ -185,19 +172,22 @@ class BaseTradingIndicator(ABC):
 
     @classmethod
     async def _get_screened_tickers(cls) -> List[str]:
-        """Get screened tickers from MCP tool (proxied Alpaca screener)"""
-        screened_data = await MCPClient.get_alpaca_screened_tickers()
+        """Get screened tickers from Alpaca screener service directly"""
+        try:
+            screened_data = await AlpacaScreenerService().get_all_screened_tickers()
+            if not screened_data:
+                return []
 
-        if not screened_data:
+            # Extract sets and convert to lists, then combine
+            most_actives = list(screened_data.get("most_actives", set()))
+            gainers = list(screened_data.get("gainers", set()))
+            losers = list(screened_data.get("losers", set()))
+
+            # Combine all unique tickers
+            return list(set(most_actives + gainers + losers))
+        except Exception as e:
+            logger.error(f"Error getting screened tickers: {e}", exc_info=True)
             return []
-
-        # Extract sets and convert to lists, then combine
-        most_actives = list(screened_data.get("most_actives", set()))
-        gainers = list(screened_data.get("gainers", set()))
-        losers = list(screened_data.get("losers", set()))
-
-        # Combine all unique tickers
-        return list(set(most_actives + gainers + losers))
 
     @classmethod
     async def _fetch_market_data_batch(
@@ -219,7 +209,8 @@ class BaseTradingIndicator(ABC):
         async def fetch_one(ticker: str) -> Tuple[str, Any]:
             """Fetch market data for a single ticker"""
             try:
-                market_data = await MCPClient.get_market_data(ticker)
+                # Use TechnicalAnalysisLib directly instead of MCPClient
+                market_data = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
                 return (ticker, market_data)
             except Exception as e:
                 logger.debug(f"Failed to get market data for {ticker}: {str(e)}")
@@ -433,11 +424,13 @@ class BaseTradingIndicator(ABC):
             return ((enter_price - current_price) / enter_price) * 100
         return 0.0
 
+    @classmethod
     @abstractmethod
     async def entry_service(cls):
         """Entry service - analyze and enter trades"""
         pass
 
+    @classmethod
     @abstractmethod
     async def exit_service(cls):
         """Exit service - monitor and exit trades"""

@@ -7,11 +7,11 @@ import asyncio
 from typing import Set
 
 from app.src.common.loguru_logger import logger
+from app.src.common.alpaca import AlpacaClient
 from app.src.common.singleton import SingletonMeta
 from app.src.common.utils import measure_latency
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.candidate_generator.alpaca_screener import AlpacaScreenerService
-from app.src.services.mcp.mcp_client import MCPClient
 
 
 class ScreenerMonitorService(metaclass=SingletonMeta):
@@ -140,16 +140,20 @@ class ScreenerMonitorService(metaclass=SingletonMeta):
 
         # Initial check (only if market is open)
         try:
-            clock_response = await MCPClient.get_market_clock()
-            if clock_response:
-                clock = clock_response.get("clock", {})
-                is_open = clock.get("is_open", False)
-                if is_open:
-                    await self._check_and_add_tickers()
-                else:
-                    next_open = clock.get("next_open")
+            is_open = await AlpacaClient.is_market_open()
+            if is_open:
+                await self._check_and_add_tickers()
+            else:
+                # Get clock data for next_open info if needed
+                try:
+                    clock = await AlpacaClient.clock()
+                    next_open = clock.get("next_open") if clock else None
                     logger.info(
                         f"⏸️  Market closed. Skipping initial screener check. Next open: {next_open}"
+                    )
+                except Exception:
+                    logger.info(
+                        "⏸️  Market closed. Skipping initial screener check."
                     )
         except Exception as e:
             logger.warning(
@@ -168,16 +172,20 @@ class ScreenerMonitorService(metaclass=SingletonMeta):
 
                 # Check market open status
                 try:
-                    clock_response = await MCPClient.get_market_clock()
-                    if clock_response:
-                        clock = clock_response.get("clock", {})
-                        is_open = clock.get("is_open", False)
-                        if not is_open:
-                            next_open = clock.get("next_open")
+                    is_open = await AlpacaClient.is_market_open()
+                    if not is_open:
+                        # Get clock data for next_open info if needed
+                        try:
+                            clock = await AlpacaClient.clock()
+                            next_open = clock.get("next_open") if clock else None
                             logger.debug(
                                 f"⏸️  Market closed. Skipping screener monitor check. Next open: {next_open}"
                             )
-                            continue
+                        except Exception:
+                            logger.debug(
+                                "⏸️  Market closed. Skipping screener monitor check."
+                            )
+                        continue
                 except Exception as e:
                     logger.warning(
                         f"Could not retrieve market clock, proceeding cautiously: {e}"

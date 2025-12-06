@@ -4,20 +4,20 @@ Uses price momentum to identify entry and exit signals
 """
 
 import asyncio
-import os
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime, timezone, time
 import pytz
-import aiohttp
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
 from app.src.common.alpaca import AlpacaClient
-from app.src.services.mcp.mcp_client import MCPClient
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
 from app.src.services.trading.base_trading_indicator import BaseTradingIndicator
+from app.src.services.technical_analysis.technical_analysis_lib import (
+    TechnicalAnalysisLib,
+)
 from app.src.services.trading.trading_config import (
     ATR_STOP_LOSS_MULTIPLIER,
     ATR_TRAILING_STOP_MULTIPLIER,
@@ -106,32 +106,14 @@ class MomentumIndicator(BaseTradingIndicator):
         15  # Exit positions 15 minutes before market close
     )
 
-    # Dynamic stop loss configuration
-    _alpaca_api_key = os.environ.get("REAL_TRADE_API_KEY", "")
-    _alpaca_api_secret = os.environ.get("REAL_TRADE_SECRET_KEY", "")
-    _alpaca_base_url = "https://data.alpaca.markets/v2/stocks/bars"
-    _alpaca_session: Optional[aiohttp.ClientSession] = (
-        None  # Shared session for API calls
-    )
-
     @classmethod
     def indicator_name(cls) -> str:
         return "Momentum Trading"
 
     @classmethod
     def stop(cls):
-        """Stop the trading indicator and close HTTP session"""
+        """Stop the trading indicator"""
         super().stop()
-        if cls._alpaca_session and not cls._alpaca_session.closed:
-            # Close session in a task to avoid blocking
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(cls._alpaca_session.close())
-                else:
-                    loop.run_until_complete(cls._alpaca_session.close())
-            except Exception as e:
-                logger.warning(f"Error closing Alpaca session: {e}")
 
     @classmethod
     def _is_near_market_close(cls) -> bool:
@@ -351,199 +333,130 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 return dynamic_stop_loss
 
-        # Fallback to Alpaca API for stocks under $3 if ATR not available
+        # Fallback to Alpaca API for stocks under $5 if ATR not available
         if enter_price >= cls.max_stock_price_for_penny_treatment:
             return default_stop_loss
 
-        # Check if we have API credentials
-        if not cls._alpaca_api_key or not cls._alpaca_api_secret:
-            logger.debug(
-                f"No Alpaca API credentials, using default stop loss for {ticker}"
-            )
-            return default_stop_loss
-
         try:
-            # Get today's date in UTC
-            today = datetime.now(timezone.utc).date()
-            start_time = datetime.combine(today, datetime.min.time()).replace(
-                tzinfo=timezone.utc
-            )
-            start_iso = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            # Fetch intraday bars using AlpacaClient.get_market_data()
+            # This will get latest 200 bars (or up to 1000 if we need more)
+            bars_data = await AlpacaClient.get_market_data(ticker, limit=1000)
 
-            # Fetch intraday bars (1-minute) for today
-            url = f"{cls._alpaca_base_url}"
-            params = {
-                "symbols": ticker,
-                "timeframe": "1Min",
-                "start": start_iso,
-                "limit": 1000,
-                "adjustment": "raw",
-                "feed": "sip",
-                "sort": "asc",
-            }
-            headers = {
-                "accept": "application/json",
-                "APCA-API-KEY-ID": cls._alpaca_api_key,
-                "APCA-API-SECRET-KEY": cls._alpaca_api_secret,
-            }
+            if not bars_data:
+                logger.debug(
+                    f"No bars data from AlpacaClient for {ticker}, using default stop loss"
+                )
+                return default_stop_loss
 
-            # Use shared session for efficiency
-            if cls._alpaca_session is None or cls._alpaca_session.closed:
-                cls._alpaca_session = aiohttp.ClientSession()
+            bars_dict = bars_data.get("bars", {})
+            bars = bars_dict.get(ticker, [])
 
-            async with cls._alpaca_session.get(
-                url,
-                params={k: str(v) for k, v in params.items()},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as response:
-                if response.status != 200:
-                    logger.debug(
-                        f"Alpaca API returned status {response.status} for {ticker}, using default stop loss"
-                    )
-                    return default_stop_loss
+            if not bars or len(bars) < 5:
+                logger.debug(
+                    f"Insufficient bars data for {ticker} ({len(bars) if bars else 0} bars), using default stop loss"
+                )
+                return default_stop_loss
 
+            # Extract prices from bars
+            prices = []
+            for bar in bars:
+                if not isinstance(bar, dict):
+                    logger.debug(f"Skipping invalid bar entry for {ticker}: not a dict")
+                    continue
+                # Alpaca bars format: {"t": timestamp, "o": open, "h": high, "l": low, "c": close, "v": volume, "vw": vwap, "n": trades}
                 try:
-                    data = await response.json()
-                except Exception as json_error:
-                    logger.warning(
-                        f"Failed to parse JSON response for {ticker}: {str(json_error)}, using default stop loss"
-                    )
-                    return default_stop_loss
-
-                # Validate response structure
-                if not isinstance(data, dict):
-                    logger.warning(
-                        f"Invalid response format for {ticker}: expected dict, got {type(data)}, using default stop loss"
-                    )
-                    return default_stop_loss
-
-                bars_dict = data.get("bars", {})
-                if not isinstance(bars_dict, dict):
-                    logger.warning(
-                        f"Invalid bars format for {ticker}: expected dict, got {type(bars_dict)}, using default stop loss"
-                    )
-                    return default_stop_loss
-
-                bars = bars_dict.get(ticker, [])
-                if not isinstance(bars, list):
-                    logger.warning(
-                        f"Invalid bars list for {ticker}: expected list, got {type(bars)}, using default stop loss"
-                    )
-                    return default_stop_loss
-
-                if not bars or len(bars) < 5:
+                    close_price = bar.get("c")
+                    if close_price is not None:
+                        close_price = float(close_price)
+                        if close_price > 0:
+                            prices.append(close_price)
+                except (ValueError, TypeError) as price_error:
                     logger.debug(
-                        f"Insufficient bars data for {ticker} ({len(bars) if bars else 0} bars), using default stop loss"
+                        f"Skipping bar with invalid close price for {ticker}: {str(price_error)}"
                     )
-                    return default_stop_loss
+                    continue
 
-                # Extract prices from bars
-                prices = []
-                for bar in bars:
-                    if not isinstance(bar, dict):
-                        logger.debug(
-                            f"Skipping invalid bar entry for {ticker}: not a dict"
-                        )
-                        continue
-                    # Alpaca bars format: {"t": timestamp, "o": open, "h": high, "l": low, "c": close, "v": volume, "vw": vwap, "n": trades}
-                    try:
-                        close_price = bar.get("c")
-                        if close_price is not None:
-                            close_price = float(close_price)
-                            if close_price > 0:
-                                prices.append(close_price)
-                    except (ValueError, TypeError) as price_error:
-                        logger.debug(
-                            f"Skipping bar with invalid close price for {ticker}: {str(price_error)}"
-                        )
-                        continue
+            if len(prices) < 5:
+                logger.debug(
+                    f"Insufficient valid prices for {ticker}, using default stop loss"
+                )
+                return default_stop_loss
 
-                if len(prices) < 5:
+            # Calculate volatility metrics
+            min_price = min(prices)
+            max_price = max(prices)
+            price_range = max_price - min_price
+            price_range_pct = (price_range / min_price) * 100 if min_price > 0 else 0
+
+            # Calculate average true range (ATR) approximation
+            # Use high-low ranges for volatility
+            high_low_ranges = []
+            for bar in bars:
+                if not isinstance(bar, dict):
+                    continue
+                try:
+                    high = bar.get("h")
+                    low = bar.get("l")
+                    if high is not None and low is not None:
+                        high = float(high)
+                        low = float(low)
+                        if high > 0 and low > 0:
+                            high_low_ranges.append((high - low) / low * 100)
+                except (ValueError, TypeError) as vol_error:
                     logger.debug(
-                        f"Insufficient valid prices for {ticker}, using default stop loss"
+                        f"Skipping bar for volatility calculation for {ticker}: {str(vol_error)}"
                     )
-                    return default_stop_loss
+                    continue
 
-                # Calculate volatility metrics
-                min_price = min(prices)
-                max_price = max(prices)
-                price_range = max_price - min_price
-                price_range_pct = (
-                    (price_range / min_price) * 100 if min_price > 0 else 0
-                )
+            avg_volatility = (
+                sum(high_low_ranges) / len(high_low_ranges) if high_low_ranges else 0
+            )
 
-                # Calculate average true range (ATR) approximation
-                # Use high-low ranges for volatility
-                high_low_ranges = []
-                for bar in bars:
-                    if not isinstance(bar, dict):
-                        continue
-                    try:
-                        high = bar.get("h")
-                        low = bar.get("l")
-                        if high is not None and low is not None:
-                            high = float(high)
-                            low = float(low)
-                            if high > 0 and low > 0:
-                                high_low_ranges.append((high - low) / low * 100)
-                    except (ValueError, TypeError) as vol_error:
-                        logger.debug(
-                            f"Skipping bar for volatility calculation for {ticker}: {str(vol_error)}"
-                        )
-                        continue
+            # Calculate recent volatility (last 30 minutes)
+            recent_bars = bars[-30:] if len(bars) >= 30 else bars
+            recent_high_low_ranges = []
+            for bar in recent_bars:
+                if not isinstance(bar, dict):
+                    continue
+                try:
+                    high = bar.get("h")
+                    low = bar.get("l")
+                    if high is not None and low is not None:
+                        high = float(high)
+                        low = float(low)
+                        if high > 0 and low > 0:
+                            recent_high_low_ranges.append((high - low) / low * 100)
+                except (ValueError, TypeError) as vol_error:
+                    logger.debug(
+                        f"Skipping recent bar for volatility calculation for {ticker}: {str(vol_error)}"
+                    )
+                    continue
 
-                avg_volatility = (
-                    sum(high_low_ranges) / len(high_low_ranges)
-                    if high_low_ranges
-                    else 0
-                )
+            recent_volatility = (
+                sum(recent_high_low_ranges) / len(recent_high_low_ranges)
+                if recent_high_low_ranges
+                else 0
+            )
 
-                # Calculate recent volatility (last 30 minutes)
-                recent_bars = bars[-30:] if len(bars) >= 30 else bars
-                recent_high_low_ranges = []
-                for bar in recent_bars:
-                    if not isinstance(bar, dict):
-                        continue
-                    try:
-                        high = bar.get("h")
-                        low = bar.get("l")
-                        if high is not None and low is not None:
-                            high = float(high)
-                            low = float(low)
-                            if high > 0 and low > 0:
-                                recent_high_low_ranges.append((high - low) / low * 100)
-                    except (ValueError, TypeError) as vol_error:
-                        logger.debug(
-                            f"Skipping recent bar for volatility calculation for {ticker}: {str(vol_error)}"
-                        )
-                        continue
+            # Use the higher of average or recent volatility
+            volatility = max(avg_volatility, recent_volatility)
 
-                recent_volatility = (
-                    sum(recent_high_low_ranges) / len(recent_high_low_ranges)
-                    if recent_high_low_ranges
-                    else 0
-                )
+            # Calculate dynamic stop loss:
+            # - Base: 2.5% (default)
+            # - Add 50% of daily price range percentage
+            # - Add 50% of volatility
+            # - Cap at -7% maximum (to prevent excessive losses)
+            # - Minimum of -3.5% for penny stocks (give them more room than default)
+            dynamic_stop_loss = -2.5 - (price_range_pct * 0.5) - (volatility * 0.5)
+            dynamic_stop_loss = max(-7.0, min(-3.5, dynamic_stop_loss))
 
-                # Use the higher of average or recent volatility
-                volatility = max(avg_volatility, recent_volatility)
+            logger.info(
+                f"Dynamic stop loss for {ticker}: {dynamic_stop_loss:.2f}% "
+                f"(price_range: {price_range_pct:.2f}%, volatility: {volatility:.2f}%, "
+                f"enter_price: ${enter_price:.2f})"
+            )
 
-                # Calculate dynamic stop loss:
-                # - Base: 2.5% (default)
-                # - Add 50% of daily price range percentage
-                # - Add 50% of volatility
-                # - Cap at -7% maximum (to prevent excessive losses)
-                # - Minimum of -3.5% for penny stocks (give them more room than default)
-                dynamic_stop_loss = -2.5 - (price_range_pct * 0.5) - (volatility * 0.5)
-                dynamic_stop_loss = max(-7.0, min(-3.5, dynamic_stop_loss))
-
-                logger.info(
-                    f"Dynamic stop loss for {ticker}: {dynamic_stop_loss:.2f}% "
-                    f"(price_range: {price_range_pct:.2f}%, volatility: {volatility:.2f}%, "
-                    f"enter_price: ${enter_price:.2f})"
-                )
-
-                return dynamic_stop_loss
+            return dynamic_stop_loss
 
         except Exception as e:
             logger.warning(
@@ -888,12 +801,11 @@ class MomentumIndicator(BaseTradingIndicator):
             if not ticker or enter_price is None or enter_price <= 0:
                 continue
 
-            market_data_response = await MCPClient.get_market_data(ticker)
-            if not market_data_response:
+            indicators = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
+            if not indicators:
                 continue
 
-            technical_analysis = market_data_response.get("technical_analysis", {})
-            current_price = technical_analysis.get("close_price", 0.0)
+            current_price = indicators.get("close_price", 0.0)
 
             if current_price <= 0:
                 continue
@@ -945,15 +857,14 @@ class MomentumIndicator(BaseTradingIndicator):
             logger.warning(f"Unknown action: {original_action} for {ticker_to_exit}")
             return False
 
-        market_data_response = await MCPClient.get_market_data(ticker_to_exit)
-        if not market_data_response:
+        indicators = await TechnicalAnalysisLib.calculate_all_indicators(ticker_to_exit)
+        if not indicators:
             logger.warning(
-                f"Failed to get market data for {ticker_to_exit} for preemption"
+                f"Failed to get technical indicators for {ticker_to_exit} for preemption"
             )
             return False
 
-        technical_analysis = market_data_response.get("technical_analysis", {})
-        initial_exit_price = technical_analysis.get("close_price", 0.0)
+        initial_exit_price = indicators.get("close_price", 0.0)
 
         if initial_exit_price <= 0:
             logger.warning(f"Invalid exit price for {ticker_to_exit}")
@@ -992,7 +903,7 @@ class MomentumIndicator(BaseTradingIndicator):
         technical_indicators_for_enter = lowest_trade.get(
             "technical_indicators_for_enter"
         )
-        technical_indicators_for_exit = technical_analysis.copy()
+        technical_indicators_for_exit = indicators.copy()
         if "datetime_price" in technical_indicators_for_exit:
             technical_indicators_for_exit = {
                 k: v
@@ -1198,25 +1109,18 @@ class MomentumIndicator(BaseTradingIndicator):
     async def _run_entry_cycle(cls):
         """Execute a single momentum entry cycle."""
         logger.debug("Starting momentum entry cycle")
-        if not await cls._check_market_open():
+        if not await AlpacaClient.is_market_open():
             logger.debug("Market is closed, skipping momentum entry logic")
             await asyncio.sleep(cls.entry_cycle_seconds)
             return
 
+        if not await AlpacaClient.is_market_open():
+            logger.debug("Market is closed, skipping momentum entry logic")
+            await asyncio.sleep(cls.entry_cycle_seconds)
+            return
         logger.info(
             "Market is open, proceeding with momentum entry logic (HIGHLY SELECTIVE)"
         )
-
-        # Check if we're past entry cutoff time (15:00 ET)
-        if cls._is_after_entry_cutoff():
-            est_tz = pytz.timezone("America/New_York")
-            current_time_est = datetime.now(est_tz)
-            logger.info(
-                f"Past entry cutoff time ({cls.max_entry_hour_et}:00 ET), "
-                f"skipping new entries (current: {current_time_est.strftime('%H:%M %Z')})"
-            )
-            await asyncio.sleep(cls.entry_cycle_seconds)
-            return
 
         await cls._reset_daily_stats_if_needed()
 
@@ -1742,7 +1646,7 @@ class MomentumIndicator(BaseTradingIndicator):
     @measure_latency
     async def _run_exit_cycle(cls):
         """Execute a single momentum exit monitoring cycle."""
-        if not await cls._check_market_open():
+        if not await AlpacaClient.is_market_open():
             logger.debug("Market is closed, skipping momentum exit logic")
             await asyncio.sleep(cls.exit_cycle_seconds)
             return
@@ -1818,12 +1722,10 @@ class MomentumIndicator(BaseTradingIndicator):
 
             logger.debug(f"Current price for {ticker}: ${current_price:.4f}")
 
-            # Get market data for technical indicators (may be delayed, but don't block exit decisions)
+            # Get technical indicators (may be delayed, but don't block exit decisions)
             # Exit decisions are based on get_quote() which is more up-to-date
-            market_data_response = await MCPClient.get_market_data(ticker)
-            technical_analysis = {}
-            if market_data_response:
-                technical_analysis = market_data_response.get("technical_analysis", {})
+            indicators = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
+            technical_analysis = indicators if indicators else {}
 
             profit_percent = cls._calculate_profit_percent(
                 enter_price, current_price, original_action

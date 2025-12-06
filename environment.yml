@@ -1,0 +1,9 @@
+name: automated_trading_system_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - ta-lib
+  - pip
+  - pip:
+      - -r requirements.txt

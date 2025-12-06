@@ -11,7 +11,7 @@ import pytz
 from app.src.common.loguru_logger import logger
 from app.src.services.trading.deep_analyzer_indicator import DeepAnalyzerIndicator
 from app.src.db.dynamodb_client import DynamoDBClient
-from app.src.services.mcp.mcp_client import MCPClient
+from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
 
 
 async def analyze_flow():
@@ -25,7 +25,7 @@ async def analyze_flow():
     # Configure services
     DeepAnalyzerIndicator.configure()
     DynamoDBClient.configure()
-    MCPClient.configure()
+    # MCPClient is no longer used - using TechnicalAnalysisLib directly
     
     # 1. Get screened tickers
     print("1. Screened Tickers")
@@ -170,7 +170,7 @@ async def analyze_flow():
     # Get all candidates that passed
     all_candidates = []
     for ticker in candidates_to_fetch[:20]:  # Test with first 20
-        market_data = await MCPClient.get_market_data(ticker)
+        market_data = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
         if not market_data:
             continue
         

@@ -415,8 +415,9 @@ class DynamoDBClient:
         trailing_stop: float,
         peak_profit_percent: float,
         skipped_exit_reason: Optional[str] = None,
+        current_profit_percent: Optional[float] = None,
     ) -> bool:
-        """Update a momentum trade with trailing stop, peak profit, and optionally skipped exit reason"""
+        """Update a momentum trade with trailing stop, peak profit, current profit, and optionally skipped exit reason"""
         try:
             cls._ensure_tables()
             # First verify the indicator matches
@@ -447,6 +448,10 @@ class DynamoDBClient:
                 ":ua": updated_at,
             }
 
+            if current_profit_percent is not None:
+                update_expression += ", current_profit_percent = :cpp"
+                expression_values[":cpp"] = cls._convert_to_decimal(current_profit_percent)
+
             if skipped_exit_reason:
                 update_expression += ", skipped_exit_reason = :ser"
                 expression_values[":ser"] = skipped_exit_reason
@@ -458,6 +463,7 @@ class DynamoDBClient:
             )
             logger.debug(
                 f"Updated trailing stop for {ticker} (indicator: {indicator}): {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%"
+                f"{f', current: {current_profit_percent:.2f}%' if current_profit_percent is not None else ''}"
             )
             return True
         except Exception as e:

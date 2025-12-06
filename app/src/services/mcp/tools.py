@@ -9,10 +9,14 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from app.src.common.loguru_logger import logger
+from app.src.common.alpaca import AlpacaClient
 from app.src.services.candidate_generator.alpaca_screener import AlpacaScreenerService
 from app.src.services.mcp.clients import MarketDataClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.market_data.market_data_service import MarketDataService
+from app.src.services.technical_analysis.technical_analysis_lib import (
+    TechnicalAnalysisLib,
+)
 
 
 def register_tools(
@@ -264,5 +268,268 @@ def register_tools(
         except Exception as e:
             logger.error(f"Error getting screened tickers: {str(e)}", exc_info=True)
             raise ValueError(f"Error fetching screened tickers: {str(e)}") from e
-            
+
+    @app.tool()
+    async def get_quote(ticker: str) -> dict[str, Any]:
+        """
+        Get latest quote for a ticker from Alpaca API.
+
+        Args:
+            ticker: Stock ticker symbol (e.g., "AAPL", "TSLA")
+
+        Returns:
+            Dict containing quote data:
+            {
+                "quote": {
+                    "quotes": {
+                        ticker: {
+                            "bp": bid_price,
+                            "ap": ask_price,
+                            ...
+                        }
+                    }
+                }
+            }
+            or None if quote unavailable
+        """
+        ticker = ticker.upper().strip()
+
+        # Validate ticker
+        invalid_tickers = {"PENDING", "N/A", "NULL", "NONE", ""}
+        if ticker in invalid_tickers or not ticker or len(ticker) < 1:
+            raise ValueError(
+                f"Invalid ticker '{ticker}'. "
+                f"Please provide a valid stock ticker symbol (e.g., AAPL, MSFT, TSLA)"
+            )
+
+        logger.debug(f"get_quote tool called for ticker: {ticker}")
+
+        try:
+            quote_response = await AlpacaClient.quote(ticker)
+
+            if quote_response is None:
+                return {
+                    "success": False,
+                    "ticker": ticker,
+                    "quote": None,
+                    "message": f"No quote data available for {ticker}",
+                }
+
+            return {
+                "success": True,
+                "ticker": ticker,
+                "quote": quote_response,
+            }
+        except Exception as e:
+            logger.error(f"Error getting quote for {ticker}: {str(e)}", exc_info=True)
+            raise ValueError(f"Error fetching quote for {ticker}: {str(e)}") from e
+
+    @app.tool()
+    async def get_market_data(ticker: str, limit: int = 200) -> dict[str, Any]:
+        """
+        Get historical bars for a ticker from Alpaca API.
+        Fetches latest bars in descending order, then sorts in ascending order.
+        Retries with previous day if empty bars are returned.
+
+        Args:
+            ticker: Stock ticker symbol (e.g., "AAPL", "TSLA")
+            limit: Number of bars to retrieve (default: 200, max: 1000)
+
+        Returns:
+            Dict containing bars data:
+            {
+                "bars": {
+                    ticker: [
+                        {
+                            "c": close_price,
+                            "h": high_price,
+                            "l": low_price,
+                            "n": number_of_trades,
+                            "o": open_price,
+                            "t": "2025-11-24T09:00:00Z",  # GMT timestamp
+                            "v": volume,
+                            "vw": vwap
+                        },
+                        ... (sorted in ascending order by timestamp)
+                    ]
+                },
+                "bars_est": {  # Converted to EST
+                    ticker: [
+                        {
+                            ...same structure but "t" is in EST (sorted ascending)...
+                        }
+                    ]
+                }
+            }
+            or None if all retries fail
+        """
+        ticker = ticker.upper().strip()
+
+        # Validate ticker
+        invalid_tickers = {"PENDING", "N/A", "NULL", "NONE", ""}
+        if ticker in invalid_tickers or not ticker or len(ticker) < 1:
+            raise ValueError(
+                f"Invalid ticker '{ticker}'. "
+                f"Please provide a valid stock ticker symbol (e.g., AAPL, MSFT, TSLA)"
+            )
+
+        # Validate limit
+        if not isinstance(limit, int) or limit <= 0 or limit > 1000:
+            raise ValueError(
+                f"Invalid limit: {limit}. Must be a positive integer between 1 and 1000"
+            )
+
+        logger.debug(
+            f"get_market_data tool called for ticker: {ticker}, limit: {limit}"
+        )
+
+        try:
+            bars_data = await AlpacaClient.get_market_data(ticker, limit=limit)
+
+            if bars_data is None:
+                return {
+                    "success": False,
+                    "ticker": ticker,
+                    "bars": None,
+                    "message": f"No market data available for {ticker}",
+                }
+
+            return {
+                "success": True,
+                "ticker": ticker,
+                "bars": bars_data,
+            }
+        except Exception as e:
+            logger.error(
+                f"Error getting market data for {ticker}: {str(e)}", exc_info=True
+            )
+            raise ValueError(
+                f"Error fetching market data for {ticker}: {str(e)}"
+            ) from e
+
+    @app.tool()
+    async def calculate_technical_indicators(ticker: str) -> dict[str, Any]:
+        """
+        Calculate all technical indicators for a ticker using TA-Lib.
+        Fetches market data from Alpaca API and computes comprehensive technical analysis.
+
+        Args:
+            ticker: Stock ticker symbol (e.g., "AAPL", "TSLA")
+
+        Returns:
+            Dict containing all technical indicators:
+            {
+                "rsi": float,
+                "macd": (macd, signal, hist),
+                "bollinger": (upper, middle, lower),
+                "adx": float,
+                "ema_fast": float,
+                "ema_slow": float,
+                "volume_sma": float,
+                "obv": float,
+                "mfi": float,
+                "ad": float,
+                "stoch": (slowk, slowd),
+                "cci": float,
+                "atr": float,
+                "willr": float,
+                "roc": float,
+                "vwap": float,
+                "vwma": float,
+                "wma": float,
+                "volume": float,
+                "close_price": float,
+                "datetime_price": tuple
+            }
+        """
+        ticker = ticker.upper().strip()
+
+        # Validate ticker
+        invalid_tickers = {"PENDING", "N/A", "NULL", "NONE", ""}
+        if ticker in invalid_tickers or not ticker or len(ticker) < 1:
+            raise ValueError(
+                f"Invalid ticker '{ticker}'. "
+                f"Please provide a valid stock ticker symbol (e.g., AAPL, MSFT, TSLA)"
+            )
+
+        logger.debug(f"calculate_technical_indicators tool called for ticker: {ticker}")
+
+        try:
+            indicators = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
+
+            return {
+                "success": True,
+                "ticker": ticker,
+                "indicators": indicators,
+            }
+        except Exception as e:
+            logger.error(
+                f"Error calculating technical indicators for {ticker}: {str(e)}",
+                exc_info=True,
+            )
+            raise ValueError(
+                f"Error calculating technical indicators for {ticker}: {str(e)}"
+            ) from e
+
+    @app.tool()
+    async def is_market_open() -> dict[str, Any]:
+        """
+        Check if the market is currently open.
+
+        Returns:
+            Dict containing:
+            {
+                "is_open": bool,
+                "message": str
+            }
+        """
+        logger.debug("is_market_open tool called")
+
+        try:
+            is_open = await AlpacaClient.is_market_open()
+
+            return {
+                "success": True,
+                "is_open": is_open,
+                "message": "Market is open" if is_open else "Market is closed",
+            }
+        except Exception as e:
+            logger.error(f"Error checking market status: {str(e)}", exc_info=True)
+            raise ValueError(f"Error checking market status: {str(e)}") from e
+
+    @app.tool()
+    async def get_market_clock() -> dict[str, Any]:
+        """
+        Get market clock status including open/close times.
+
+        Returns:
+            Dict containing market clock data:
+            {
+                "is_open": bool,
+                "next_open": str (ISO timestamp),
+                "next_close": str (ISO timestamp),
+                "timestamp": str (current server time),
+                ...
+            }
+        """
+        logger.debug("get_market_clock tool called")
+
+        try:
+            clock = await AlpacaClient.clock()
+
+            if not clock:
+                return {
+                    "success": False,
+                    "clock": None,
+                    "message": "No market clock data available",
+                }
+
+            return {
+                "success": True,
+                "clock": clock,
+            }
+        except Exception as e:
+            logger.error(f"Error getting market clock: {str(e)}", exc_info=True)
+            raise ValueError(f"Error getting market clock: {str(e)}") from e
+
     logger.info("Registered MCP tools")

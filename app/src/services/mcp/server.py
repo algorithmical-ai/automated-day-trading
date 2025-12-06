@@ -301,7 +301,6 @@ async def _run_streamable_with_discovery() -> None:
         host=host,
         port=port,
         log_level="info",
-        allowed_hosts=["*"],  # Allow all hosts for Heroku compatibility
     )
     server = uvicorn.Server(config)
 
@@ -366,7 +365,6 @@ async def _run_sse_with_discovery() -> None:
         host=host,
         port=port,
         log_level="info",
-        allowed_hosts=["*"],  # Allow all hosts for Heroku compatibility
     )
     server = uvicorn.Server(config)
 
