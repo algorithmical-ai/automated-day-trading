@@ -528,7 +528,9 @@ class AlpacaClient:
             raise ValueError("Alpaca API credentials not configured")
 
         # Clock endpoint is on Trading API, not Data API
-        url = f"{cls.BASE_URL}/clock"
+        # Use Trading API base URL for clock endpoint
+        trading_base_url = "https://api.alpaca.markets/v2"
+        url = f"{trading_base_url}/clock"
 
         headers = {
             "APCA-API-KEY-ID": cls.API_KEY_ID,

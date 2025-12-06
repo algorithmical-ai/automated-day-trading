@@ -18,17 +18,19 @@ from app.src.services.threshold_adjustment.threshold_adjustment_service import (
 from app.src.config.constants import MOMENTUM_TOP_K, MCP_SERVER_TRANSPORT
 from app.src.services.mcp.server import main as mcp_server_main
 
+# Global flag for shutdown
+_shutdown_requested = False
+
 
 def setup_signal_handlers():
     """Setup signal handlers for graceful shutdown"""
 
     def signal_handler(sig, frame):
+        global _shutdown_requested
         logger.info("Received shutdown signal, stopping services...")
-        TradingService.stop()
-        ToolDiscoveryService.stop()
-        ScreenerMonitorService().stop()
-        ThresholdAdjustmentService.stop()
-        sys.exit(0)
+        _shutdown_requested = True
+        # Signal handlers can't await, so we set a flag
+        # The main loop will check this and handle async stops
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -84,13 +86,22 @@ async def main():
 
         # Run all services concurrently
         await asyncio.gather(*tasks)
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, shutting down...")
     except Exception as e:
         logger.exception(f"Fatal error in application: {str(e)}")
+    finally:
+        # Cleanup: stop all services
+        logger.info("Stopping all services...")
         ToolDiscoveryService.stop()
         TradingService.stop()
-        ScreenerMonitorService().stop()
+        # ScreenerMonitorService.stop() is async, await it
+        try:
+            await ScreenerMonitorService().stop()
+        except Exception as stop_error:
+            logger.warning(f"Error stopping ScreenerMonitorService: {stop_error}")
         ThresholdAdjustmentService.stop()
-        sys.exit(1)
+        logger.info("All services stopped")
 
 
 if __name__ == "__main__":
