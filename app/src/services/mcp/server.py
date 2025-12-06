@@ -257,12 +257,19 @@ async def _run_streamable_with_discovery() -> None:
     # Initialize database and start executor at server startup
     logger.info("Starting Automated Trading System MCP server.")
     logger.info(f"🌐 MCP Server will listen on {host}:{port}")
+    logger.info(f"🔐 Authentication: {'ENABLED' if settings.mcp_auth_bearer_token else 'DISABLED'}")
+    if settings.mcp_auth_bearer_token:
+        logger.info(f"   Header: {settings.mcp_auth_header_name}")
+        logger.info(f"   Token: {'*' * min(len(settings.mcp_auth_bearer_token), 8)}...")
     logger.info(f"🔗 MCP endpoint will be available at: http://{host}:{port}/mcp")
 
     # Get the Starlette app and run it with uvicorn
     starlette_app = app.streamable_http_app()
     
-    # Add a health check endpoint
+    # Log registered routes for debugging
+    logger.info(f"📋 Registered routes: {[route.path for route in starlette_app.routes if hasattr(route, 'path')]}")
+    
+    # Add a health check endpoint (before other routes to avoid conflicts)
     from starlette.routing import Route
     
     async def health_check(request: Any) -> JSONResponse:
@@ -270,15 +277,22 @@ async def _run_streamable_with_discovery() -> None:
         return JSONResponse({
             "status": "healthy",
             "service": "automated-trading-system-mcp",
-            "port": port
+            "port": port,
+            "auth_configured": bool(settings.mcp_auth_bearer_token)
         })
     
-    # Add health check route if not already present
-    # Check if health route exists, if not add it
-    health_route = Route("/health", health_check, methods=["GET"])
-    if not any(route.path == "/health" for route in starlette_app.routes):
-        starlette_app.routes.append(health_route)
-        logger.info("✅ Health check endpoint added at /health")
+    # Add health check route - insert at beginning to ensure it's checked first
+    try:
+        health_route = Route("/health", health_check, methods=["GET"])
+        # Check if health route already exists
+        existing_health = [r for r in starlette_app.routes if hasattr(r, 'path') and r.path == "/health"]
+        if not existing_health:
+            starlette_app.routes.insert(0, health_route)  # Insert at beginning
+            logger.info("✅ Health check endpoint added at /health")
+        else:
+            logger.info("ℹ️  Health check endpoint already exists")
+    except Exception as e:
+        logger.warning(f"⚠️  Could not add health check endpoint: {e}")
     
     # Track background tasks - use a dict to avoid closure issues
     background_tasks: Dict[str, Optional[asyncio.Task]] = {
@@ -329,11 +343,15 @@ async def _run_streamable_with_discovery() -> None:
     # Get Heroku app URL from environment or construct from request
     heroku_app_name = os.environ.get("HEROKU_APP_NAME", "automated-day-trading")
     logger.info(f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp")
+    logger.info(f"💡 Note: FastMCP streamable HTTP may mount at root '/' - check registered routes above")
     
     try:
+        logger.info("🔄 Server starting...")
         await server.serve()
+    except KeyboardInterrupt:
+        logger.info("🛑 Server stopped by user")
     except Exception as e:
-        logger.exception(f"Error running MCP server: {e}")
+        logger.exception(f"❌ Fatal error running MCP server: {e}")
         raise
 
 
@@ -399,11 +417,15 @@ async def _run_sse_with_discovery() -> None:
     # Get Heroku app URL from environment or construct from request
     heroku_app_name = os.environ.get("HEROKU_APP_NAME", "automated-day-trading")
     logger.info(f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp")
+    logger.info(f"💡 Note: FastMCP streamable HTTP may mount at root '/' - check registered routes above")
     
     try:
+        logger.info("🔄 Server starting...")
         await server.serve()
+    except KeyboardInterrupt:
+        logger.info("🛑 Server stopped by user")
     except Exception as e:
-        logger.exception(f"Error running MCP server: {e}")
+        logger.exception(f"❌ Fatal error running MCP server: {e}")
         raise
 
 
