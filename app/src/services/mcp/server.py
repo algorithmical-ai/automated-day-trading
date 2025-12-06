@@ -256,9 +256,29 @@ async def _run_streamable_with_discovery() -> None:
 
     # Initialize database and start executor at server startup
     logger.info("Starting Automated Trading System MCP server.")
+    logger.info(f"🌐 MCP Server will listen on {host}:{port}")
+    logger.info(f"🔗 MCP endpoint will be available at: http://{host}:{port}/mcp")
 
     # Get the Starlette app and run it with uvicorn
     starlette_app = app.streamable_http_app()
+    
+    # Add a health check endpoint
+    from starlette.routing import Route
+    
+    async def health_check(request: Any) -> JSONResponse:
+        """Health check endpoint for Heroku"""
+        return JSONResponse({
+            "status": "healthy",
+            "service": "automated-trading-system-mcp",
+            "port": port
+        })
+    
+    # Add health check route if not already present
+    # Check if health route exists, if not add it
+    health_route = Route("/health", health_check, methods=["GET"])
+    if not any(route.path == "/health" for route in starlette_app.routes):
+        starlette_app.routes.append(health_route)
+        logger.info("✅ Health check endpoint added at /health")
     
     # Track background tasks - use a dict to avoid closure issues
     background_tasks: Dict[str, Optional[asyncio.Task]] = {
@@ -305,6 +325,11 @@ async def _run_streamable_with_discovery() -> None:
     )
     server = uvicorn.Server(config)
 
+    logger.info(f"🚀 Starting uvicorn server on {host}:{port}")
+    # Get Heroku app URL from environment or construct from request
+    heroku_app_name = os.environ.get("HEROKU_APP_NAME", "automated-day-trading")
+    logger.info(f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp")
+    
     try:
         await server.serve()
     except Exception as e:
@@ -370,6 +395,11 @@ async def _run_sse_with_discovery() -> None:
     )
     server = uvicorn.Server(config)
 
+    logger.info(f"🚀 Starting uvicorn server on {host}:{port}")
+    # Get Heroku app URL from environment or construct from request
+    heroku_app_name = os.environ.get("HEROKU_APP_NAME", "automated-day-trading")
+    logger.info(f"📡 MCP server ready. Connect to: https://{heroku_app_name}.herokuapp.com/mcp")
+    
     try:
         await server.serve()
     except Exception as e:
