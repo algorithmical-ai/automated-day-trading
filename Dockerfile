@@ -47,13 +47,35 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONIOENCODING=utf-8
 
-# Create a wrapper script that ensures proper logging to stdout/stderr
-RUN echo '#!/bin/bash' > /usr/local/bin/heroku-start.sh && \
-    echo 'set -e' >> /usr/local/bin/heroku-start.sh && \
-    echo 'echo "🚀 HEROKU WRAPPER: Starting Automated Trading System Service" >&1' >> /usr/local/bin/heroku-start.sh && \
-    echo 'echo "🚀 HEROKU WRAPPER: Starting Automated Trading System Service" >&2' >> /usr/local/bin/heroku-start.sh && \
-    echo 'exec conda run --no-capture-output -n automated_trading_system_env python -u start-heroku.py' >> /usr/local/bin/heroku-start.sh && \
-    chmod +x /usr/local/bin/heroku-start.sh
+# Create wrapper scripts for web and worker processes
+RUN echo '#!/bin/bash' > /usr/local/bin/heroku-web.sh && \
+    echo 'set -e' >> /usr/local/bin/heroku-web.sh && \
+    echo 'echo "🚀 HEROKU WEB: Starting MCP Server" >&1' >> /usr/local/bin/heroku-web.sh && \
+    echo 'echo "🚀 HEROKU WEB: Starting MCP Server" >&2' >> /usr/local/bin/heroku-web.sh && \
+    echo 'exec conda run --no-capture-output -n automated_trading_system_env python -u -m app.src.web' >> /usr/local/bin/heroku-web.sh && \
+    chmod +x /usr/local/bin/heroku-web.sh && \
+    echo '#!/bin/bash' > /usr/local/bin/heroku-worker.sh && \
+    echo 'set -e' >> /usr/local/bin/heroku-worker.sh && \
+    echo 'echo "🚀 HEROKU WORKER: Starting Trading Application" >&1' >> /usr/local/bin/heroku-worker.sh && \
+    echo 'echo "🚀 HEROKU WORKER: Starting Trading Application" >&2' >> /usr/local/bin/heroku-worker.sh && \
+    echo 'exec conda run --no-capture-output -n automated_trading_system_env python -u -m app.src.app' >> /usr/local/bin/heroku-worker.sh && \
+    chmod +x /usr/local/bin/heroku-worker.sh
 
-# Command to run the application with proper logging wrapper
-CMD ["/usr/local/bin/heroku-start.sh"]
+# Create a smart entrypoint that routes based on DYNO type
+RUN echo '#!/bin/bash' > /usr/local/bin/heroku-entrypoint.sh && \
+    echo 'set -e' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo 'DYNO_TYPE=${DYNO%%\.*}' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo 'if [ "$DYNO_TYPE" = "web" ]; then' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo '  echo "🌐 Detected web process, starting MCP server..."' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo '  exec /usr/local/bin/heroku-web.sh' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo 'elif [ "$DYNO_TYPE" = "worker" ]; then' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo '  echo "⚙️ Detected worker process, starting trading application..."' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo '  exec /usr/local/bin/heroku-worker.sh' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo 'else' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo '  echo "⚠️ Unknown process type: $DYNO_TYPE, defaulting to web..."' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo '  exec /usr/local/bin/heroku-web.sh' >> /usr/local/bin/heroku-entrypoint.sh && \
+    echo 'fi' >> /usr/local/bin/heroku-entrypoint.sh && \
+    chmod +x /usr/local/bin/heroku-entrypoint.sh
+
+# Command to run the application with proper routing
+CMD ["/usr/local/bin/heroku-entrypoint.sh"]
