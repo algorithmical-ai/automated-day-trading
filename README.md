@@ -5,15 +5,18 @@ An automated day trading application that monitors market conditions and execute
 ## Features
 
 ### Multi-Strategy Trading System
+
 - **Momentum Trading Indicator**: Price momentum analysis with technical filters (RSI, ADX, stochastic, Bollinger Bands)
-- **Deep Analyzer Indicator**: Advanced technical analysis via MarketDataService with signal scoring and degradation detection
-- **UW-Enhanced Momentum Indicator**: Momentum trading enhanced with Unusual Whales options flow validation and volatility-aware risk management
+- **Penny Stocks Indicator**: Trend-following strategy for stocks < $5 USD with aggressive entry/exit cycles (1 second) and quick profit-taking
+- **Deep Analyzer Indicator**: Advanced technical analysis via MarketDataService with signal scoring and degradation detection (currently disabled)
+- **UW-Enhanced Momentum Indicator**: Momentum trading enhanced with Unusual Whales options flow validation and volatility-aware risk management (currently disabled)
 
 ### Advanced Features
+
 - **Dynamic Threshold Adjustment**: LLM-powered analysis of inactive tickers to optimize trading thresholds in real-time
 - **Multi-Armed Bandit (MAB)**: Contextual bandit algorithm for intelligent ticker selection with Thompson Sampling
 - **Market-Aware Execution**: Comprehensive market clock monitoring and time-based trade management
-- **Risk Management**: 
+- **Risk Management**:
   - ATR-based dynamic stop losses and trailing stops
   - Volatility-adjusted position sizing
   - Portfolio correlation checks
@@ -30,35 +33,42 @@ The application consists of multiple async services running concurrently:
 ### Core Services
 
 #### 1. Trading Service Coordinator (`trading_service.py`)
-Orchestrates three trading indicators running in parallel:
-- **Momentum Trading Indicator**: Price momentum-based strategy
-- **Deep Analyzer Indicator**: MarketDataService-based deep technical analysis
-- **UW-Enhanced Momentum Indicator**: Momentum + Unusual Whales validation
+
+Orchestrates multiple trading indicators running in parallel:
+
+- **Momentum Trading Indicator**: Price momentum-based strategy (active)
+- **Penny Stocks Indicator**: Trend-following strategy for stocks < $5 USD (active)
+- **Deep Analyzer Indicator**: MarketDataService-based deep technical analysis (currently disabled)
+- **UW-Enhanced Momentum Indicator**: Momentum + Unusual Whales validation (currently disabled)
 
 Each indicator runs independent entry and exit services with graceful error handling.
 
 #### 2. Tool Discovery Service (`tool_discovery.py`)
+
 - Runs in the background, refreshing every 5 minutes
 - Discovers available MCP tools from the Market Data Analyzer API
 - Uses HTTP fallback for compatibility
 - Caches tool metadata for efficient lookups
 
 #### 3. Screener Monitor Service (`screener_monitor_service.py`)
+
 - Monitors Alpaca screener for trading candidates
 - Provides ticker screening for all indicators
 
 #### 4. Threshold Adjustment Service (`threshold_adjustment_service.py`)
+
 - Runs every 5 minutes during market hours
 - Analyzes inactive ticker reasons using AWS Bedrock LLM
 - Dynamically adjusts trading thresholds based on market conditions
 - Stores adjustment events in `DayTraderEvents` DynamoDB table
-- Supports Momentum Trading and Deep Analyzer indicators
+- Supports Momentum Trading and Deep Analyzer indicators (when enabled)
 
 ## Trading Indicators
 
 ### 1. Momentum Trading Indicator (`momentum_indicator.py`)
 
 **Entry Logic** (runs every 5 seconds):
+
 - Analyzes `datetime_price` array from market data
 - Calculates momentum: compares early 30% vs recent 30% of price data
 - Technical filters:
@@ -75,6 +85,7 @@ Each indicator runs independent entry and exit services with graceful error hand
 - Position size: $2000 fixed
 
 **Exit Logic** (runs every 5 seconds):
+
 - Hard stop loss: dynamic (2.0x ATR, capped at -4%)
 - Trailing stop: 1.5x ATR after activation threshold
 - Profit target: 2x stop distance
@@ -83,15 +94,67 @@ Each indicator runs independent entry and exit services with graceful error hand
 - Minimum holding period: 60 seconds
 
 **Configuration**:
+
 - `max_active_trades`: 5
 - `max_daily_trades`: 5
 - `min_momentum_threshold`: 1.5%
 - `max_momentum_threshold`: 15%
 - `ticker_cooldown_minutes`: 60
 
-### 2. Deep Analyzer Indicator (`deep_analyzer_indicator.py`)
+### 2. Penny Stocks Indicator (`penny_stocks_indicator.py`)
+
+**Entry Logic** (runs every 1 second - FAST MODE):
+
+- Trend-following strategy for stocks < $5 USD
+- Analyzes recent 5 bars to determine clear upward/downward trends
+- Entry conditions:
+  - Long: Clear upward trend with momentum ≥1.5% and <15%
+  - Short: Clear downward trend with momentum ≥1.5% and <15%
+  - Trend continuation check: Requires ≥50% continuation in recent bars
+  - Avoids entry at peaks (long) or bottoms (short)
+- Filters:
+  - Price range: $0.01 to $5.00
+  - Bid-ask spread: max 2%
+  - Volume: minimum 500 shares in recent bars
+  - Excludes special securities (warrants, rights, units)
+  - Excludes losing tickers from today
+- MAB selection: top-2 tickers per direction
+- Preemption: Can preempt low-profit trades for exceptional momentum (≥8%)
+- Position size: $2000 fixed
+
+**Exit Logic** (runs every 1 second - FAST MODE):
+
+- Priority 1: Immediate exit if trade becomes unprofitable (cuts losses fast)
+- Priority 2: Trend reversal detection:
+  - Long: Exit on dip from peak (trend reverses downward)
+  - Short: Exit on rise from bottom (trend reverses upward)
+- Priority 3: Significant loss exit: -0.25% threshold
+- Profit target: 0.5% (quick cash in)
+- Trailing stop: 0.5% (tight, exits quickly)
+- Minimum holding period: 15 seconds
+- Losing tickers excluded from MAB for rest of day
+
+**Configuration**:
+
+- `max_stock_price`: $5.00
+- `min_stock_price`: $0.01
+- `trailing_stop_percent`: 0.5%
+- `profit_threshold`: 0.5%
+- `immediate_loss_exit_threshold`: -0.25%
+- `min_momentum_threshold`: 1.5%
+- `max_momentum_threshold`: 15.0%
+- `exceptional_momentum_threshold`: 8.0%
+- `max_active_trades`: 10
+- `max_daily_trades`: 30
+- `entry_cycle_seconds`: 1
+- `exit_cycle_seconds`: 1
+- `min_holding_period_seconds`: 15
+- `recent_bars_for_trend`: 5
+
+### 3. Deep Analyzer Indicator (`deep_analyzer_indicator.py`) - Currently Disabled
 
 **Entry Logic** (runs every 5 seconds):
+
 - Uses `MarketDataService.enter_trade()` for deep technical analysis
 - Evaluates both long and short opportunities
 - Entry score threshold: 0.60 (dynamic, adjusts based on market conditions)
@@ -101,19 +164,22 @@ Each indicator runs independent entry and exit services with graceful error hand
 - Stores entry_score for degradation checks on exit
 
 **Exit Logic** (runs every 5 seconds):
+
 - Signal reversal detection: exits if opposite signal qualifies
 - Entry score degradation: exits if score drops >50% from entry
 - Uses `MarketDataService.exit_trade()` for exit signals
 - Fallback to comprehensive technical analysis
 
 **Configuration**:
+
 - `min_entry_score`: 0.60
 - `exceptional_entry_score`: 0.75
 - `top_k`: 2
 
-### 3. UW-Enhanced Momentum Indicator (`uw_enhanced_momentum_indicator.py`)
+### 4. UW-Enhanced Momentum Indicator (`uw_enhanced_momentum_indicator.py`) - Currently Disabled
 
 **Entry Logic** (runs every 5 seconds):
+
 - Combines momentum analysis with Unusual Whales options flow validation
 - Same momentum calculation as Momentum Indicator
 - Additional filters:
@@ -125,12 +191,14 @@ Each indicator runs independent entry and exit services with graceful error hand
 - Risk-adjusted position sizing based on volatility and penny stock risk
 
 **Exit Logic** (runs every 5 seconds):
+
 - Dynamic stop loss: 2.0x ATR
 - Trailing stop: 1.5x ATR (wider for shorts: 1.5x multiplier)
 - Protects against losses from peak profit (even if current profit is negative)
 - Profit target: 2x stop distance
 
 **Configuration**:
+
 - Uses Unusual Whales API for options flow validation
 - Volatility-aware position sizing
 - Enhanced risk management for penny stocks
@@ -140,6 +208,7 @@ Each indicator runs independent entry and exit services with graceful error hand
 All indicators inherit from `BaseTradingIndicator`, providing:
 
 ### Shared Features
+
 - **Market Clock Monitoring**: All operations check market status
 - **Ticker Screening**: Integrated Alpaca screener access
 - **Cooldown Management**: Per-ticker cooldown periods (60 minutes default)
@@ -150,6 +219,7 @@ All indicators inherit from `BaseTradingIndicator`, providing:
 - **DynamoDB Operations**: Standardized trade entry/exit handling
 
 ### Common Configuration
+
 - `max_active_trades`: 5 (configurable per indicator)
 - `max_daily_trades`: 5 (configurable per indicator)
 - `ticker_cooldown_minutes`: 60
@@ -162,11 +232,13 @@ All indicators inherit from `BaseTradingIndicator`, providing:
 Standardized constants for consistency across all indicators:
 
 - **ATR Multipliers**:
+
   - Stop Loss: 2.0x ATR
   - Trailing Stop: 1.5x ATR
   - Legacy Volatility Utils: 2.5x ATR (trailing), 3.0x ATR (stop loss)
 
 - **Stop Loss Bounds**:
+
   - Penny stocks: -8.0% to -4.0%
   - Standard stocks: -6.0% to -4.0%
 
@@ -180,12 +252,14 @@ Standardized constants for consistency across all indicators:
 ### Active Trades Tables
 
 #### 1. ActiveTickersForAutomatedDayTrader
+
 **Partition Key**: `ticker` (String)
 
 Stores active trades for all trading indicators:
+
 - `ticker` (String): Stock symbol
 - `action` (String): "buy_to_open" or "sell_to_open"
-- `indicator` (String): Indicator name ("Momentum Trading", "Deep Analyzer", "UW-Enhanced Momentum Trading")
+- `indicator` (String): Indicator name ("Momentum Trading", "Penny Stocks", "Deep Analyzer", "UW-Enhanced Momentum Trading")
 - `enter_price` (Number): Entry price
 - `enter_reason` (String): Reason for entry
 - `technical_indicators_for_enter` (Map): Technical indicators at entry
@@ -198,10 +272,12 @@ Stores active trades for all trading indicators:
 ### Completed Trades Table
 
 #### 2. CompletedTradesForMarketData
+
 **Partition Key**: `date` (String, format: yyyy-mm-dd)
 **Sort Key**: `ticker#indicator` (String)
 
 Stores completed trades:
+
 - `date` (String): Trading date
 - `ticker#indicator` (String): Composite key
 - `ticker` (String): Stock symbol
@@ -216,10 +292,12 @@ Stores completed trades:
 ### Inactive Tickers Tables
 
 #### 3. InactiveTickersForDayTrading
+
 **Partition Key**: `ticker` (String)
 **Sort Key**: `timestamp` (String)
 
 Logs reasons why tickers were not traded:
+
 - `ticker` (String): Stock symbol
 - `indicator` (String): Indicator name
 - `timestamp` (String): ISO timestamp
@@ -230,10 +308,12 @@ Logs reasons why tickers were not traded:
 ### Events Table
 
 #### 4. DayTraderEvents
+
 **Partition Key**: `date` (String, format: yyyy-mm-dd)
 **Sort Key**: `indicator` (String)
 
 Stores threshold adjustment events:
+
 - `date` (String): Trading date
 - `indicator` (String): Indicator name
 - `last_updated` (String): ISO timestamp (EST)
@@ -245,11 +325,15 @@ Stores threshold adjustment events:
 ### Other Tables
 
 #### 5. TickerBlackList
+
 **Partition Key**: `ticker` (String)
+
 - Excludes tickers from all trading operations
 
 #### 6. MABStats
+
 **Partition Key**: `indicator#ticker` (String)
+
 - Stores multi-armed bandit statistics for ticker selection
 
 ## Setup
@@ -288,6 +372,11 @@ PYTHONPATH=app/src python app/src/app.py
 
 ## Deployment to Heroku
 
+The application uses a dual-process architecture on Heroku:
+
+- **Web Process**: Runs MCP server and trading application (`web.py`)
+- **Worker Process**: Runs trading application only (`app.py`) - optional, typically not needed
+
 1. Create a Heroku app:
 
 ```bash
@@ -303,8 +392,8 @@ heroku config:set MARKET_DATA_MCP_TOKEN=your_mcp_token
 heroku config:set AWS_ACCESS_KEY_ID=your_key
 heroku config:set AWS_SECRET_ACCESS_KEY=your_secret
 heroku config:set AWS_DEFAULT_REGION=us-east-1
-heroku config:set UW_API_TOKEN=your_uw_token  # Optional, for UW-Enhanced indicator
-heroku config:set REAL_TRADE_API_KEY=your_alpaca_key  # For Alpaca API fallback
+heroku config:set UW_API_TOKEN=your_uw_token  # Optional, for UW-Enhanced indicator (when enabled)
+heroku config:set REAL_TRADE_API_KEY=your_alpaca_key  # For Alpaca API
 heroku config:set REAL_TRADE_SECRET_KEY=your_alpaca_secret
 ```
 
@@ -314,11 +403,13 @@ heroku config:set REAL_TRADE_SECRET_KEY=your_alpaca_secret
 git push heroku main
 ```
 
-4. Scale the worker:
+4. Scale the web process (runs both MCP server and trading app):
 
 ```bash
-heroku ps:scale worker=1
+heroku ps:scale web=1
 ```
+
+The web process (`web.py`) automatically starts both the MCP server and trading application concurrently. The MCP server is available at `https://your-app-name.herokuapp.com/mcp`.
 
 ## Environment Variables
 
@@ -353,18 +444,20 @@ The application connects to the Market Data Analyzer MCP API:
 - `get_alpaca_screened_tickers`: Get gainers, losers, and most active tickers
 - `get_quote`: Get current bid/ask prices for a ticker
 - `get_market_data`: Get market data including technical analysis and price history
-- `enter`: Determine if entry conditions are met (Deep Analyzer uses this)
-- `exit`: Determine if exit conditions are met (Deep Analyzer uses this)
+- `enter`: Determine if entry conditions are met (used by Deep Analyzer when enabled)
+- `exit`: Determine if exit conditions are met (used by Deep Analyzer when enabled)
 - `send_webhook_signal`: Send trading signals to external webhook endpoints
 
 ## Risk Management
 
 ### Stop Loss System
+
 - **Dynamic Stop Loss**: Based on 2.0x ATR (standardized across all indicators)
 - **Bounds**: Capped between -4% and -8% depending on stock price category
 - **Hard Stop**: Always applies, cannot be bypassed
 
 ### Trailing Stop System
+
 - **Activation**: After reaching profit threshold (varies by indicator)
 - **Multiplier**: 1.5x ATR (standardized)
 - **Base Minimum**: 2.0% minimum trailing distance
@@ -372,12 +465,14 @@ The application connects to the Market Data Analyzer MCP API:
 - **Protection**: Protects against losses from peak profit even if current profit becomes negative
 
 ### Position Sizing
+
 - **Base**: $2000 fixed position size
 - **Volatility Adjustment**: Reduced size for high-volatility stocks
 - **Penny Stock Risk**: Additional reduction for high-risk penny stocks
 - **Minimum**: Never less than $500
 
 ### Entry Filters
+
 - **Momentum**: Minimum 1.5% momentum, maximum 15%
 - **Technical Indicators**: ADX ≥20, RSI ranges, stochastic confirmation
 - **Volume**: Must be >1.5x SMA
@@ -385,6 +480,7 @@ The application connects to the Market Data Analyzer MCP API:
 - **Volatility**: ATR-based filters prevent extreme volatility entries
 
 ### Exit Conditions
+
 - **Profit Target**: 2x stop distance (e.g., 4% if stop is 2%)
 - **Stop Loss**: Hard stop at dynamic threshold
 - **Trailing Stop**: Activates after profit threshold, protects peak gains
@@ -397,6 +493,7 @@ The application connects to the Market Data Analyzer MCP API:
 The Threshold Adjustment Service uses AWS Bedrock LLM to analyze why tickers are not entering trades and suggests threshold optimizations:
 
 ### Process
+
 1. Every 5 minutes during market hours, analyzes inactive tickers from last 5 minutes
 2. Groups tickers by rejection reason
 3. Calls AWS Bedrock LLM with current thresholds and rejection patterns
@@ -405,6 +502,7 @@ The Threshold Adjustment Service uses AWS Bedrock LLM to analyze why tickers are
 6. Stores event in `DayTraderEvents` table for audit trail
 
 ### Supported Adjustments
+
 - Momentum thresholds (min/max)
 - ADX threshold
 - RSI ranges
@@ -414,6 +512,7 @@ The Threshold Adjustment Service uses AWS Bedrock LLM to analyze why tickers are
 - Max daily trades (long and short separately)
 
 ### Table Schema
+
 - **Partition Key**: `date` (String, yyyy-mm-dd)
 - **Sort Key**: `indicator` (String)
 - Stores threshold changes, max trades, and full LLM response
@@ -446,7 +545,7 @@ Comprehensive error handling throughout:
 
 ## Key Design Decisions
 
-1. **Multi-Strategy Architecture**: Three independent indicators allow diversification and strategy comparison
+1. **Multi-Strategy Architecture**: Multiple independent indicators allow diversification and strategy comparison
 2. **Base Class Pattern**: Shared infrastructure reduces code duplication
 3. **Centralized Configuration**: `trading_config.py` ensures consistency across indicators
 4. **Thread-Safe Operations**: Async locks prevent race conditions
@@ -456,10 +555,13 @@ Comprehensive error handling throughout:
 8. **Comprehensive Filtering**: Multi-layer filters reduce false signals
 9. **Resource Management**: Shared HTTP sessions and proper cleanup
 10. **Observability**: Detailed logging and event tracking
+11. **Dual-Process Architecture**: Web process runs both MCP server and trading app on Heroku
+12. **Fast-Cycle Trading**: Penny Stocks indicator uses 1-second cycles for rapid entry/exit
 
 ## Recent Improvements (Nov 2024)
 
 ### Critical Bug Fixes
+
 - Fixed duplicate code blocks
 - Fixed inverted RSI filter logic for shorts
 - Fixed short exit pricing (now uses ask price, not bid)
@@ -467,6 +569,7 @@ Comprehensive error handling throughout:
 - Fixed trailing stop to protect against losses from peak
 
 ### High Priority Improvements
+
 - Added thread-safe daily trade counting with async locks
 - Fixed class-level mutable state using ClassVar
 - Standardized timezone usage (UTC internally)
@@ -474,11 +577,13 @@ Comprehensive error handling throughout:
 - Added graceful shutdown handling with error monitoring
 
 ### Standardization
+
 - Created centralized `trading_config.py` for ATR multipliers
 - Standardized all indicators to use same ATR multipliers
 - Improved error logging with detailed diagnostics
 
 ### Resource Management
+
 - Optimized HTTP session usage (shared sessions)
 - Added session cleanup in stop() methods
 - Added LRU cache size limits (500 entries)
@@ -487,8 +592,14 @@ Comprehensive error handling throughout:
 
 - The application runs continuously until stopped (SIGINT/SIGTERM)
 - All services run concurrently using `asyncio.gather()`
-- Entry services run every 5 seconds, exit services run every 5 seconds
+- Entry/exit cycle times vary by indicator:
+  - Momentum Trading: 5 seconds
+  - Penny Stocks: 1 second (fast mode)
+  - Deep Analyzer: 5 seconds (when enabled)
+  - UW-Enhanced Momentum: 5 seconds (when enabled)
 - Threshold adjustment runs every 5 minutes during market hours
 - Market checks occur before all trading operations
 - All timestamps stored in UTC internally
 - Golden tickers (exceptional opportunities) can bypass daily trade limits
+- Penny Stocks indicator excludes losing tickers from MAB selection for the rest of the day
+- On Heroku, the web process runs both MCP server and trading application concurrently
