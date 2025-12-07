@@ -21,6 +21,27 @@ class AlpacaClient:
     API_SECRET_KEY = os.getenv("REAL_TRADE_SECRET_KEY", "")
     BASE_URL = "https://data.alpaca.markets/v2/stocks"
 
+    # Cache variables for clock endpoint
+    _clock_cache: Optional[Dict[str, Any]] = None
+    _clock_cache_timestamp: Optional[datetime] = None
+    _clock_cache_lock: asyncio.Lock = asyncio.Lock()
+    _clock_cache_ttl_seconds: int = 600  # 10 minutes
+
+    @classmethod
+    def _is_clock_cache_valid(cls) -> bool:
+        """
+        Check if the cached clock response is still valid.
+
+        Returns:
+            True if cache exists and is less than TTL seconds old, False otherwise
+        """
+        if cls._clock_cache is None or cls._clock_cache_timestamp is None:
+            return False
+
+        current_time = datetime.now(timezone.utc)
+        cache_age = (current_time - cls._clock_cache_timestamp).total_seconds()
+        return cache_age < cls._clock_cache_ttl_seconds
+
     @classmethod
     async def quote(cls, ticker: str) -> Optional[Dict[str, Any]]:
         """
@@ -519,7 +540,7 @@ class AlpacaClient:
     @classmethod
     async def clock(cls) -> Dict[str, Any]:
         """
-        Get market clock status with retry logic for rate limits
+        Get market clock status with retry logic for rate limits and caching
 
         Returns:
             Dict with market clock data (is_open, next_open, next_close, etc.)
@@ -527,56 +548,84 @@ class AlpacaClient:
         if not cls.API_KEY_ID or not cls.API_SECRET_KEY:
             raise ValueError("Alpaca API credentials not configured")
 
-        # Clock endpoint is on Trading API, not Data API
-        # Use Trading API base URL for clock endpoint
-        trading_base_url = "https://api.alpaca.markets/v2"
-        url = f"{trading_base_url}/clock"
+        # Acquire lock to ensure thread-safe cache access
+        async with cls._clock_cache_lock:
+            # Check if we have a valid cached response
+            if cls._is_clock_cache_valid():
+                cache_age = (
+                    datetime.now(timezone.utc) - cls._clock_cache_timestamp
+                ).total_seconds()
+                logger.debug(
+                    f"Using cached clock response (age: {cache_age:.1f} seconds)"
+                )
+                return cls._clock_cache
 
-        headers = {
-            "APCA-API-KEY-ID": cls.API_KEY_ID,
-            "APCA-API-SECRET-KEY": cls.API_SECRET_KEY,
-        }
+            # Cache miss or expired - log and fetch from API
+            if cls._clock_cache is None:
+                logger.debug("Clock cache miss, fetching from API")
+            else:
+                cache_age = (
+                    datetime.now(timezone.utc) - cls._clock_cache_timestamp
+                ).total_seconds()
+                logger.debug(
+                    f"Clock cache expired (age: {cache_age:.1f} seconds), refreshing"
+                )
 
-        max_retries = 3
-        retry_delay = 2  # seconds
+            # Clock endpoint is on Trading API, not Data API
+            # Use Trading API base URL for clock endpoint
+            trading_base_url = "https://api.alpaca.markets/v2"
+            url = f"{trading_base_url}/clock"
 
-        for attempt in range(max_retries):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=headers) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            return data
+            headers = {
+                "APCA-API-KEY-ID": cls.API_KEY_ID,
+                "APCA-API-SECRET-KEY": cls.API_SECRET_KEY,
+            }
 
-                        error_text = await response.text()
-                        
-                        # Handle 429 rate limit with retry
-                        if response.status == 429:
-                            if attempt < max_retries - 1:
-                                logger.debug(
-                                    f"Alpaca clock API rate limited (429). Retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})"
-                                )
-                                await asyncio.sleep(retry_delay)
-                                continue
-                            else:
-                                logger.error(
-                                    f"Alpaca clock API rate limited after {max_retries} attempts: {error_text}"
-                                )
-                                raise ValueError(f"Failed to fetch market clock after {max_retries} retries: rate limited")
-                        
-                        # For other errors, log and raise immediately
-                        logger.warning(
-                            f"Alpaca clock API returned {response.status}: {error_text}"
-                        )
-                        raise ValueError(f"Failed to fetch market clock: {response.status}")
-            except aiohttp.ClientError as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Network error fetching market clock. Retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_delay)
-                    continue
-                else:
-                    logger.error(f"Error fetching market clock after {max_retries} attempts: {str(e)}", exc_info=True)
-                    raise ValueError(f"Error fetching market clock: {str(e)}") from e
+            max_retries = 3
+            retry_delay = 2  # seconds
+
+            for attempt in range(max_retries):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, headers=headers) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                
+                                # Update cache with new response
+                                cls._clock_cache = data
+                                cls._clock_cache_timestamp = datetime.now(timezone.utc)
+                                
+                                return data
+
+                            error_text = await response.text()
+                            
+                            # Handle 429 rate limit with retry
+                            if response.status == 429:
+                                if attempt < max_retries - 1:
+                                    logger.debug(
+                                        f"Alpaca clock API rate limited (429). Retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})"
+                                    )
+                                    await asyncio.sleep(retry_delay)
+                                    continue
+                                else:
+                                    logger.error(
+                                        f"Alpaca clock API rate limited after {max_retries} attempts: {error_text}"
+                                    )
+                                    raise ValueError(f"Failed to fetch market clock after {max_retries} retries: rate limited")
+                            
+                            # For other errors, log and raise immediately
+                            logger.warning(
+                                f"Alpaca clock API returned {response.status}: {error_text}"
+                            )
+                            raise ValueError(f"Failed to fetch market clock: {response.status}")
+                except aiohttp.ClientError as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Network error fetching market clock. Retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        logger.error(f"Error fetching market clock after {max_retries} attempts: {str(e)}", exc_info=True)
+                        raise ValueError(f"Error fetching market clock: {str(e)}") from e
 
     @classmethod
     async def is_market_open(cls) -> bool:
