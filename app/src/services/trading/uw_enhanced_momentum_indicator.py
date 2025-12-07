@@ -721,11 +721,20 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     ):
         """Send trade event via webhook"""
         try:
+            # Prepare technical indicators for webhook (exclude datetime_price)
+            webhook_technical_indicators = None
+            if technical_indicators:
+                webhook_technical_indicators = {
+                    k: v for k, v in technical_indicators.items() if k != "datetime_price"
+                }
+            
             await send_signal_to_webhook(
                 ticker=ticker,
                 action=action,
                 indicator=cls.indicator_name(),
                 enter_reason=reason,
+                enter_price=price,
+                technical_indicators=webhook_technical_indicators,
             )
             logger.info(
                 f"📡 Trade event sent: {event_type} for {ticker} at ${price:.2f} - {reason}"
@@ -881,7 +890,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     async def _run_entry_cycle(cls):
         """Execute a single momentum entry cycle with enhanced filtering"""
         logger.debug("Starting UW-Enhanced Momentum entry cycle")
-        if not await cls._check_market_open():
+        if not await AlpacaClient.is_market_open():
             logger.debug("Market is closed, skipping entry logic")
             await asyncio.sleep(cls.entry_cycle_seconds)
             return
@@ -1417,7 +1426,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
     @measure_latency
     async def _run_exit_cycle(cls):
         """Execute a single momentum exit monitoring cycle with cooling period"""
-        if not await cls._check_market_open():
+        if not await AlpacaClient.is_market_open():
             await asyncio.sleep(cls.exit_cycle_seconds)
             return
 

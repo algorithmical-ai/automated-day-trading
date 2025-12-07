@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/technical_analysis/technical_analysis_lib.py
+# hypothesis_version: 6.148.7
+
+[-50.0, 0.0, 0.01, 0.25, 0.75, 0.98, 1.02, 20.0, 50.0, 100.0, 1000.0, 25000.0, 200, 1000, 'ad', 'adx', 'atr', 'bars', 'bars_est', 'bollinger', 'c', 'cci', 'close', 'close_price', 'datetime_price', 'dummy', 'ema_fast', 'ema_slow', 'h', 'high', 'isoformat', 'l', 'linear', 'low', 'macd', 'mfi', 'o', 'obv', 'open', 'price', 'roc', 'rsi', 'stoch', 't', 'ticker', 'timestamp', 'v', 'volume', 'volume_sma', 'vwap', 'vwma', 'willr', 'wma']

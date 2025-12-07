@@ -9,13 +9,14 @@ import time
 import aiohttp
 from typing import Optional, Dict, Any
 from app.src.common.loguru_logger import logger
+from app.src.common.logging_utils import log_error_with_context
+from app.src.common.lru_cache import AsyncLRUCache
 from app.src.config.constants import (
     DEBUG_DAY_TRADING,
     MARKET_DATA_MCP_URL,
     MCP_AUTH_HEADER_NAME,
     MARKET_DATA_MCP_TOKEN,
 )
-from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
 from app.src.services.candidate_generator.alpaca_screener import (
     AlpacaScreenerService,
 )
@@ -27,18 +28,22 @@ class MCPClient:
     _base_url: str = MARKET_DATA_MCP_URL
     _auth_header_name: str = MCP_AUTH_HEADER_NAME
     _auth_token: Optional[str] = MARKET_DATA_MCP_TOKEN
-    _tool_discovery_cls: Optional[type] = ToolDiscoveryService
     _last_request_time: float = 0.0
     _min_request_interval: float = 0.1  # 100ms minimum between requests
+    _shared_session: Optional[aiohttp.ClientSession] = None
+    _session_lock: asyncio.Lock = asyncio.Lock()
+    _market_data_cache: Optional[AsyncLRUCache] = None
+    _cache_ttl: float = 60.0  # Cache TTL in seconds (1 minute)
 
     @classmethod
     def configure(
         cls,
         *,
-        tool_discovery_cls: Optional[type] = ToolDiscoveryService,
         base_url: Optional[str] = None,
         auth_header_name: Optional[str] = None,
         auth_token: Optional[str] = None,
+        cache_maxsize: int = 500,
+        cache_ttl: float = 60.0,
     ):
         """Configure MCP client for classmethod-only usage"""
         if base_url:
@@ -47,8 +52,34 @@ class MCPClient:
             cls._auth_header_name = auth_header_name
         if auth_token is not None:
             cls._auth_token = auth_token
-        if tool_discovery_cls is not None:
-            cls._tool_discovery_cls = tool_discovery_cls
+        
+        # Initialize market data cache with specified size limit
+        cls._market_data_cache = AsyncLRUCache(maxsize=cache_maxsize)
+        cls._cache_ttl = cache_ttl
+        logger.info(f"MCP client configured with market data cache (maxsize={cache_maxsize}, ttl={cache_ttl}s)")
+
+    @classmethod
+    async def _get_session(cls) -> aiohttp.ClientSession:
+        """Get or create shared HTTP session"""
+        async with cls._session_lock:
+            if cls._shared_session is None or cls._shared_session.closed:
+                timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
+                cls._shared_session = aiohttp.ClientSession(timeout=timeout)
+            return cls._shared_session
+
+    @classmethod
+    async def close_session(cls) -> None:
+        """Close shared HTTP session and clean up resources"""
+        async with cls._session_lock:
+            if cls._shared_session is not None and not cls._shared_session.closed:
+                await cls._shared_session.close()
+                cls._shared_session = None
+                logger.info("MCP client HTTP session closed")
+        
+        # Clear cache on shutdown
+        if cls._market_data_cache is not None:
+            await cls._market_data_cache.clear()
+            logger.info("MCP client market data cache cleared")
 
     @classmethod
     def _extract_result_payload(cls, data: Any) -> Any:
@@ -116,91 +147,90 @@ class MCPClient:
                     "params": {"name": tool_name, "arguments": params},
                 }
 
-                # Use longer timeout since API can take 5-10 seconds
-                timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(
-                        cls._base_url, json=jsonrpc_body, headers=headers
-                    ) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            return cls._extract_result_payload(data)
-                        elif (
-                            response.status == 503
-                            and retry_on_503
-                            and attempt < max_retries - 1
-                        ):
-                            # 503 Service Unavailable - server is overloaded, retry with backoff
-                            delay = base_delay * (2**attempt)  # 2s, 4s, 8s
-                            logger.warning(
-                                f"Server overloaded (503) calling {tool_name}, "
-                                f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
-                            )
-                            await asyncio.sleep(delay)
-                            continue
-                        else:
-                            # Handle error response - check if it's HTML or JSON
-                            content_type = response.headers.get(
-                                "Content-Type", ""
-                            ).lower()
-                            error_text = await response.text()
+                # Use shared session for efficiency
+                session = await cls._get_session()
+                async with session.post(
+                    cls._base_url, json=jsonrpc_body, headers=headers
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return cls._extract_result_payload(data)
+                    elif (
+                        response.status == 503
+                        and retry_on_503
+                        and attempt < max_retries - 1
+                    ):
+                        # 503 Service Unavailable - server is overloaded, retry with backoff
+                        delay = base_delay * (2**attempt)  # 2s, 4s, 8s
+                        logger.warning(
+                            f"Server overloaded (503) calling {tool_name}, "
+                            f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        # Handle error response - check if it's HTML or JSON
+                        content_type = response.headers.get(
+                            "Content-Type", ""
+                        ).lower()
+                        error_text = await response.text()
 
-                            # Detect HTML responses (Heroku error pages)
-                            if (
-                                "text/html" in content_type
-                                or error_text.strip().startswith("<!DOCTYPE")
-                                or error_text.strip().startswith("<html")
-                            ):
-                                if response.status == 503:
-                                    if attempt < max_retries - 1:
-                                        delay = base_delay * (2**attempt)
-                                        logger.warning(
-                                            f"Server overloaded (503) calling {tool_name}, "
-                                            f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
-                                        )
-                                        await asyncio.sleep(delay)
-                                        continue
-                                    else:
-                                        logger.warning(
-                                            f"Server overloaded (503) calling {tool_name} after {max_retries} attempts - "
-                                            f"MCP server is experiencing high load"
-                                        )
+                        # Detect HTML responses (Heroku error pages)
+                        if (
+                            "text/html" in content_type
+                            or error_text.strip().startswith("<!DOCTYPE")
+                            or error_text.strip().startswith("<html")
+                        ):
+                            if response.status == 503:
+                                if attempt < max_retries - 1:
+                                    delay = base_delay * (2**attempt)
+                                    logger.warning(
+                                        f"Server overloaded (503) calling {tool_name}, "
+                                        f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+                                    )
+                                    await asyncio.sleep(delay)
+                                    continue
                                 else:
-                                    logger.error(
-                                        f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - Server returned HTML error page"
+                                    logger.warning(
+                                        f"Server overloaded (503) calling {tool_name} after {max_retries} attempts - "
+                                        f"MCP server is experiencing high load"
                                     )
                             else:
-                                # Try to extract meaningful error message from JSON response
-                                try:
-                                    error_json = json.loads(error_text)
-                                    # Check if it's a JSON-RPC error response
-                                    if "error" in error_json:
-                                        error_data = error_json.get("error", {})
-                                        error_msg = error_data.get(
-                                            "message", str(error_data)
-                                        )
-                                        error_code = error_data.get("code", "unknown")
+                                logger.error(
+                                    f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - Server returned HTML error page"
+                                )
+                        else:
+                            # Try to extract meaningful error message from JSON response
+                            try:
+                                error_json = json.loads(error_text)
+                                # Check if it's a JSON-RPC error response
+                                if "error" in error_json:
+                                    error_data = error_json.get("error", {})
+                                    error_msg = error_data.get(
+                                        "message", str(error_data)
+                                    )
+                                    error_code = error_data.get("code", "unknown")
 
-                                        extra_hint = ""
-                                        if "Unknown tool" in str(error_msg):
-                                            extra_hint = " (tool not registered on MCP server; redeploy or restart MCP service)"
+                                    extra_hint = ""
+                                    if "Unknown tool" in str(error_msg):
+                                        extra_hint = " (tool not registered on MCP server; redeploy or restart MCP service)"
 
-                                        logger.debug(
-                                            f"JSON-RPC Error calling {tool_name}: {error_code} - {error_msg}{extra_hint}"
-                                        )
-                                    else:
-                                        error_msg = str(error_json).replace("\n", " ")[
-                                            :200
-                                        ]
-                                        logger.error(
-                                            f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - {error_msg}"
-                                        )
-                                except (json.JSONDecodeError, ValueError):
-                                    error_msg = error_text[:200]
+                                    logger.debug(
+                                        f"JSON-RPC Error calling {tool_name}: {error_code} - {error_msg}{extra_hint}"
+                                    )
+                                else:
+                                    error_msg = str(error_json).replace("\n", " ")[
+                                        :200
+                                    ]
                                     logger.error(
                                         f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - {error_msg}"
                                     )
-                            return None
+                            except (json.JSONDecodeError, ValueError):
+                                error_msg = error_text[:200]
+                                logger.error(
+                                    f"HTTP Error calling {tool_name} (MCP JSON-RPC): {response.status} - {error_msg}"
+                                )
+                        return None
             except asyncio.TimeoutError:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2**attempt)
@@ -239,15 +269,6 @@ class MCPClient:
         cls, tool_name: str, params: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """Generic method to call MCP tools - uses HTTP directly since MCP protocol fails with 500 errors"""
-        # Check if tool is available via discovery service
-        discovery_cls = cls._tool_discovery_cls
-        if discovery_cls and hasattr(discovery_cls, "is_tool_available"):
-            is_available = await discovery_cls.is_tool_available(tool_name)
-            if not is_available:
-                logger.debug(
-                    f"Tool {tool_name} not found in discovered tools list, trying anyway..."
-                )
-
         # Since MCP protocol is consistently failing with 500 errors, use HTTP directly
         # The server appears to not be handling our MCP protocol requests correctly
         # MCP Inspector might be using a different approach or version
@@ -299,9 +320,10 @@ class MCPClient:
                 },
             }
         except Exception as exc:  # pylint: disable=broad-except
-            logger.error(
-                f"Error getting screened tickers from local Alpaca service: {exc}",
-                exc_info=True,
+            log_error_with_context(
+                error=exc,
+                context="Getting screened tickers from local Alpaca service",
+                component="MCPClient"
             )
             return None
 
@@ -326,7 +348,106 @@ class MCPClient:
         return await cls._call_mcp_tool("exit", params)
 
     @classmethod
-    async def get_market_data(cls, ticker: str) -> Optional[Dict[str, Any]]:
-        """Get market data for a ticker including technical analysis and datetime_price"""
+    async def get_market_data(cls, ticker: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Get market data for a ticker including technical analysis and datetime_price.
+        
+        Args:
+            ticker: Stock symbol
+            use_cache: If True, check cache before making API call (default: True)
+            
+        Returns:
+            Market data dictionary or None if failed
+        """
+        # Initialize cache if not already done
+        if cls._market_data_cache is None:
+            cls._market_data_cache = AsyncLRUCache(maxsize=500)
+        
+        cache_key = f"market_data:{ticker}"
+        
+        # Check cache first if enabled
+        if use_cache:
+            cached_data = await cls._market_data_cache.get(cache_key)
+            if cached_data is not None:
+                data, timestamp = cached_data
+                # Check if cache entry is still valid (within TTL)
+                if time.time() - timestamp < cls._cache_ttl:
+                    logger.debug(f"Cache hit for market data: {ticker}")
+                    return data
+                else:
+                    # Cache entry expired, invalidate it
+                    await cls._market_data_cache.invalidate(cache_key)
+                    logger.debug(f"Cache expired for market data: {ticker}")
+        
+        # Cache miss or disabled, fetch from API
         params = {"ticker": ticker}
-        return await cls._call_mcp_tool("get_market_data", params)
+        data = await cls._call_mcp_tool("get_market_data", params)
+        
+        # Store in cache if successful
+        if data is not None and use_cache:
+            await cls._market_data_cache.put(cache_key, (data, time.time()))
+            logger.debug(f"Cached market data for: {ticker}")
+        
+        return data
+    
+    @classmethod
+    async def invalidate_market_data_cache(cls, ticker: Optional[str] = None) -> None:
+        """
+        Invalidate market data cache entries.
+        
+        Args:
+            ticker: If provided, invalidate only this ticker. If None, clear entire cache.
+        """
+        if cls._market_data_cache is None:
+            return
+        
+        if ticker is not None:
+            cache_key = f"market_data:{ticker}"
+            await cls._market_data_cache.invalidate(cache_key)
+            logger.debug(f"Invalidated market data cache for: {ticker}")
+        else:
+            await cls._market_data_cache.clear()
+            logger.info("Cleared entire market data cache")
+    
+    @classmethod
+    async def get_cache_stats(cls) -> Dict[str, Any]:
+        """
+        Get statistics about the market data cache.
+        
+        Returns:
+            Dictionary with cache statistics
+        """
+        if cls._market_data_cache is None:
+            return {"error": "Cache not initialized"}
+        
+        return await cls._market_data_cache.stats()
+
+    @classmethod
+    async def send_webhook_signal(cls, signal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Send trading signal to webhook endpoints
+        
+        Args:
+            signal_data: Dictionary containing:
+                - ticker: Stock symbol
+                - action: Trade action (buy_to_open, sell_to_open, buy_to_close, sell_to_close)
+                - price: Entry/exit price
+                - reason: Reason for trade
+                - technical_indicators: Dict of technical indicators
+                - indicator: Name of trading indicator
+                - profit_loss: (optional) Profit/loss for exit signals
+        
+        Returns:
+            Response from webhook or None if failed
+        """
+        params = {"signal_data": signal_data}
+        result = await cls._call_mcp_tool("send_webhook_signal", params)
+        
+        # Log error but don't raise - webhook failures should not stop trading
+        if result is None:
+            logger.warning(
+                f"Failed to send webhook signal for {signal_data.get('ticker', 'unknown')} "
+                f"action {signal_data.get('action', 'unknown')}"
+            )
+        
+        return result

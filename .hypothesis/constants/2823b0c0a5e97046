@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/trading/penny_stocks_indicator.py
+# hypothesis_version: 6.148.7
+
+[-0.5, -0.3, -0.25, 0.0, 0.01, 0.3, 0.5, 0.6, 0.7, 1.5, 2.0, 5.0, 8.0, 10.0, 15.0, 100, 200, 500, 1000, '+00:00', '.R', '.RT', '.U', '.V', '.W', '.WS', 'No market data', 'Penny Stocks', 'Unable to get quote', 'Z', '_losing_tickers_date', 'action', 'ap', 'bars', 'bp', 'buy_to_close', 'buy_to_open', 'c', 'close_price', 'created_at', 'downward', 'enter_price', 'failed_filters', 'h', 'high', 'indicator', 'insufficient_bars', 'l', 'low', 'low_momentum', 'no_market_data', 'o', 'open', 'passed', 'peak_profit_percent', 'quote', 'quotes', 'sell_to_close', 'sell_to_open', 'technical_analysis', 'technical_indicators', 'ticker', 'trailing_stop', 'upward', 'v', 'volume']

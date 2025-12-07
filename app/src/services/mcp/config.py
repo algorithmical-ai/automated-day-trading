@@ -36,9 +36,6 @@ class ServerSettings(BaseSettings):
             Literal["stdio", "sse", "streamable-http"], constants.MCP_SERVER_TRANSPORT
         )
     )
-    tool_discovery_interval_seconds: int = Field(
-        default=constants.MCP_TOOL_DISCOVERY_INTERVAL_SECONDS
-    )
     mcp_auth_header_name: str = Field(default=constants.MCP_AUTH_HEADER_NAME)
     mcp_auth_bearer_token: Optional[str] = Field(
         default=constants.MCP_AUTH_BEARER_TOKEN

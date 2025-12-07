@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/common/lru_cache.py
+# hypothesis_version: 6.148.7
+
+[0.0, 100, 500, 'T', 'hit_rate', 'hits', 'maxsize', 'misses', 'size', 'total_requests']

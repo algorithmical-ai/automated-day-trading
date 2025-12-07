@@ -306,7 +306,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
         """Execute a single Deep Analyzer entry cycle."""
         logger.debug("Starting Deep Analyzer entry cycle")
         # Check market open
-        if not await cls._check_market_open():
+        if not await AlpacaClient.is_market_open():
             logger.debug("Market is closed, skipping Deep Analyzer entry logic")
             await asyncio.sleep(cls.entry_cycle_seconds)
             return
@@ -670,15 +670,6 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
 
             from app.src.services.webhook.send_signal import send_signal_to_webhook
 
-            await send_signal_to_webhook(
-                ticker=ticker,
-                action=action,
-                indicator=cls.indicator_name(),
-                enter_reason=ranked_reason,
-                is_golden_exception=is_golden,
-                portfolio_allocation_percent=portfolio_allocation,
-            )
-
             technical_indicators = market_data_dict.get(ticker, {}).get(
                 "technical_analysis", {}
             )
@@ -689,6 +680,17 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                     for k, v in technical_indicators_for_enter.items()
                     if k != "datetime_price"
                 }
+
+            await send_signal_to_webhook(
+                ticker=ticker,
+                action=action,
+                indicator=cls.indicator_name(),
+                enter_reason=ranked_reason,
+                is_golden_exception=is_golden,
+                portfolio_allocation_percent=portfolio_allocation,
+                enter_price=enter_price,
+                technical_indicators=technical_indicators_for_enter,
+            )
 
             success = await cls._enter_trade(
                 ticker=ticker,
@@ -802,15 +804,6 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
 
             from app.src.services.webhook.send_signal import send_signal_to_webhook
 
-            await send_signal_to_webhook(
-                ticker=ticker,
-                action=action,
-                indicator=cls.indicator_name(),
-                enter_reason=ranked_reason,
-                is_golden_exception=is_golden,
-                portfolio_allocation_percent=portfolio_allocation,
-            )
-
             technical_indicators = market_data_dict.get(ticker, {}).get(
                 "technical_analysis", {}
             )
@@ -821,6 +814,17 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                     for k, v in technical_indicators_for_enter.items()
                     if k != "datetime_price"
                 }
+
+            await send_signal_to_webhook(
+                ticker=ticker,
+                action=action,
+                indicator=cls.indicator_name(),
+                enter_reason=ranked_reason,
+                is_golden_exception=is_golden,
+                portfolio_allocation_percent=portfolio_allocation,
+                enter_price=enter_price,
+                technical_indicators=technical_indicators_for_enter,
+            )
 
             success = await cls._enter_trade(
                 ticker=ticker,
@@ -874,7 +878,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
     @measure_latency
     async def _run_exit_cycle(cls):
         """Execute a single Deep Analyzer exit monitoring cycle."""
-        if not await cls._check_market_open():
+        if not await AlpacaClient.is_market_open():
             logger.debug("Market is closed, skipping Deep Analyzer exit logic")
             await asyncio.sleep(cls.exit_cycle_seconds)
             return

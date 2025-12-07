@@ -29,7 +29,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
     - Max 30 trades per day
     """
 
-    # Configuration - AGGRESSIVE PENNY STOCK TRADING
+    # Configuration - HIGHLY SELECTIVE PENNY STOCK TRADING
     max_stock_price: float = 5.0  # Only trade stocks < $5
     min_stock_price: float = 0.01  # Minimum stock price (avoid extreme penny stocks)
     trailing_stop_percent: float = 0.5  # 0.5% trailing stop (TIGHT - exit quickly)
@@ -38,8 +38,8 @@ class PennyStocksIndicator(BaseTradingIndicator):
         -0.25
     )  # Exit immediately on -0.25% loss (CUT LOSSES FAST)
     top_k: int = 2  # Top K tickers to select
-    min_momentum_threshold: float = 1.5  # Minimum momentum to enter
-    max_momentum_threshold: float = 15.0  # Maximum momentum (avoid peaks)
+    min_momentum_threshold: float = 3.0  # INCREASED: Minimum 3% momentum to enter (STRONG TREND REQUIRED)
+    max_momentum_threshold: float = 10.0  # DECREASED: Maximum 10% momentum (avoid entering near peaks/bottoms)
     exceptional_momentum_threshold: float = (
         8.0  # Exceptional momentum to trigger preemption
     )
@@ -123,12 +123,12 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # Only consider it a clear trend if most bars move in same direction
         momentum_score = (0.7 * overall_change_percent) + (0.3 * consistency_score)
 
-        # Require clear trend: at least 60% of moves in same direction
+        # Require STRONG clear trend: at least 70% of moves in same direction (INCREASED from 60%)
         trend_strength = (
             max(up_moves, down_moves) / len(price_changes) if price_changes else 0
         )
-        if trend_strength < 0.6:
-            momentum_score *= 0.5  # Reduce score if trend is not clear
+        if trend_strength < 0.7:
+            momentum_score *= 0.3  # Heavily reduce score if trend is not clear (INCREASED penalty from 0.5)
 
         # Check if trend is still continuing (most recent bars should continue the trend)
         # For entry validation: we want to see the trend continuing, not ending
@@ -537,11 +537,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
             abs_momentum = abs(momentum_score)
 
             # CRITICAL: Don't enter if trend is not continuing (recent bars show reversal)
-            # Require at least 50% continuation in recent bars to ensure trend is still active
-            if recent_continuation < 0.5:
+            # Require at least 70% continuation in recent bars to ensure trend is STRONGLY active (INCREASED from 50%)
+            if recent_continuation < 0.7:
                 stats["low_momentum"] += 1
                 if momentum_score > 0:
-                    reason_text = f"Recent bars show upward trend but trend is not continuing (continuation={recent_continuation:.2f} < 0.5) - likely at peak, avoid long entry"
+                    reason_text = f"Recent bars show upward trend but trend is not continuing strongly (continuation={recent_continuation:.2f} < 0.7) - likely at peak, avoid long entry"
                     inactive_ticker_logs.append(
                         {
                             "ticker": ticker,
@@ -552,7 +552,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                         }
                     )
                 else:
-                    reason_text = f"Recent bars show downward trend but trend is not continuing (continuation={recent_continuation:.2f} < 0.5) - likely at bottom, avoid short entry"
+                    reason_text = f"Recent bars show downward trend but trend is not continuing strongly (continuation={recent_continuation:.2f} < 0.7) - likely at bottom, avoid short entry"
                     inactive_ticker_logs.append(
                         {
                             "ticker": ticker,
@@ -567,13 +567,13 @@ class PennyStocksIndicator(BaseTradingIndicator):
             # CRITICAL: Don't enter if current price is at/near peak (for long) or bottom (for short)
             if current_price and peak_price and bottom_price:
                 if momentum_score > 0:  # Upward trend - check if we're at peak
-                    # Don't enter long if current price is within 0.5% of peak (likely at peak)
+                    # Don't enter long if current price is within 1.0% of peak (INCREASED from 0.5% - more conservative)
                     price_vs_peak = (
                         ((current_price - peak_price) / peak_price) * 100
                         if peak_price > 0
                         else 0
                     )
-                    if price_vs_peak > -0.5:  # Current price is within 0.5% of peak
+                    if price_vs_peak > -1.0:  # Current price is within 1.0% of peak (INCREASED from 0.5%)
                         stats["low_momentum"] += 1
                         reason_text = f"Current price ${current_price:.4f} is at/near peak ${peak_price:.4f} (diff: {price_vs_peak:.2f}%) - likely at peak, avoid long entry"
                         inactive_ticker_logs.append(
@@ -587,13 +587,13 @@ class PennyStocksIndicator(BaseTradingIndicator):
                         )
                         continue
                 else:  # Downward trend - check if we're at bottom
-                    # Don't enter short if current price is within 0.5% of bottom (likely at bottom)
+                    # Don't enter short if current price is within 1.0% of bottom (INCREASED from 0.5% - more conservative)
                     price_vs_bottom = (
                         ((current_price - bottom_price) / bottom_price) * 100
                         if bottom_price > 0
                         else 0
                     )
-                    if price_vs_bottom < 0.5:  # Current price is within 0.5% of bottom
+                    if price_vs_bottom < 1.0:  # Current price is within 1.0% of bottom (INCREASED from 0.5%)
                         stats["low_momentum"] += 1
                         reason_text = f"Current price ${current_price:.4f} is at/near bottom ${bottom_price:.4f} (diff: {price_vs_bottom:.2f}%) - likely at bottom, avoid short entry"
                         inactive_ticker_logs.append(
@@ -1071,13 +1071,6 @@ class PennyStocksIndicator(BaseTradingIndicator):
         direction = "upward" if is_long else "downward"
         ranked_reason = f"{reason} (ranked #{rank} {direction} momentum)"
 
-        await send_signal_to_webhook(
-            ticker=ticker,
-            action=action,
-            indicator=cls.indicator_name(),
-            enter_reason=ranked_reason,
-        )
-
         # Get bars data for technical indicators
         bars_data = market_data_dict.get(ticker)
         technical_indicators = {}
@@ -1093,6 +1086,15 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     "low": latest_bar.get("l", 0.0),
                     "open": latest_bar.get("o", 0.0),
                 }
+
+        await send_signal_to_webhook(
+            ticker=ticker,
+            action=action,
+            indicator=cls.indicator_name(),
+            enter_reason=ranked_reason,
+            enter_price=enter_price,
+            technical_indicators=technical_indicators,
+        )
 
         # Enter trade with tight 0.5% trailing stop (AGGRESSIVE)
         entry_success = await cls._enter_trade(
@@ -1256,69 +1258,92 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
             should_exit = False
             exit_reason = None
-
-            # PRIORITY 1: Exit immediately if trade becomes unprofitable
             is_long = original_action == "buy_to_open"
-            if is_long:
-                # For long: exit if current_price < enter_price (unprofitable)
-                if current_price < enter_price:
-                    should_exit = True
-                    exit_reason = (
-                        f"Unprofitable exit (LONG): current ${current_price:.4f} < enter ${enter_price:.4f} "
-                        f"(loss: {profit_percent:.2f}%)"
-                    )
-                    logger.warning(
-                        f"🚨 IMMEDIATE EXIT for {ticker} LONG - unprofitable: {profit_percent:.2f}%"
-                    )
-                    cls._losing_tickers_today.add(ticker)
-            else:
-                # For short: exit if current_price > enter_price (unprofitable)
-                if current_price > enter_price:
-                    should_exit = True
-                    exit_reason = (
-                        f"Unprofitable exit (SHORT): current ${current_price:.4f} > enter ${enter_price:.4f} "
-                        f"(loss: {profit_percent:.2f}%)"
-                    )
-                    logger.warning(
-                        f"🚨 IMMEDIATE EXIT for {ticker} SHORT - unprofitable: {profit_percent:.2f}%"
-                    )
-                    cls._losing_tickers_today.add(ticker)
 
-            # PRIORITY 2: Exit on trend reversal (dip from peak for long, rise from bottom for short)
-            if not should_exit and bars_data:
-                bars_dict = bars_data.get("bars", {})
+            # Get recent bars for peak/bottom tracking
+            bars_data_for_exit = await AlpacaClient.get_market_data(
+                ticker, limit=cls.recent_bars_for_trend + 10
+            )
+            
+            # Track peak price (for long) and bottom price (for short) since entry
+            peak_price_since_entry = None
+            bottom_price_since_entry = None
+            
+            if bars_data_for_exit:
+                bars_dict = bars_data_for_exit.get("bars", {})
                 ticker_bars = bars_dict.get(ticker, [])
-                if ticker_bars and len(ticker_bars) >= cls.recent_bars_for_trend:
-                    recent_trend_score, _, recent_peak, recent_bottom, _ = (
-                        cls._calculate_recent_trend(ticker_bars)
-                    )
+                if ticker_bars:
+                    # Get all prices since entry to find peak/bottom
+                    prices_since_entry = [bar.get("c", 0.0) for bar in ticker_bars if bar.get("c", 0.0) > 0]
+                    if prices_since_entry:
+                        peak_price_since_entry = max(prices_since_entry)
+                        bottom_price_since_entry = min(prices_since_entry)
 
-                    if is_long:
-                        # For long: exit if price dips from peak (trend reversal)
-                        # Check if current price is below recent peak and trend is reversing
-                        if recent_peak and current_price < recent_peak:
-                            # Check if trend has reversed (negative trend score)
-                            if recent_trend_score < -0.3:  # Trend reversed downward
-                                should_exit = True
-                                exit_reason = (
-                                    f"Dip from peak exit (LONG): current ${current_price:.4f} < peak ${recent_peak:.4f}, "
-                                    f"trend reversed to {recent_trend_score:.2f}%"
-                                )
-                                logger.info(f"Exit signal for {ticker} - {exit_reason}")
-                    else:
-                        # For short: exit if price rises from bottom (trend reversal)
-                        # Check if current price is above recent bottom and trend is reversing
-                        if recent_bottom and current_price > recent_bottom:
-                            # Check if trend has reversed (positive trend score)
-                            if recent_trend_score > 0.3:  # Trend reversed upward
-                                should_exit = True
-                                exit_reason = (
-                                    f"Rise from bottom exit (SHORT): current ${current_price:.4f} > bottom ${recent_bottom:.4f}, "
-                                    f"trend reversed to {recent_trend_score:.2f}%"
-                                )
-                                logger.info(f"Exit signal for {ticker} - {exit_reason}")
+            # PRIORITY 1: Exit on profitable trend reversal (BOOK PROFIT QUICKLY)
+            # This is the PRIMARY exit strategy - get in and out with profit
+            if is_long:
+                # For LONG: Exit if price starts dipping from peak
+                # Strategy: Enter on upward momentum, exit as soon as it dips from peak
+                if peak_price_since_entry and peak_price_since_entry > enter_price:
+                    # We have a peak above entry price (we're in profit territory)
+                    # Check if current price is dipping from that peak
+                    dip_from_peak_percent = ((current_price - peak_price_since_entry) / peak_price_since_entry) * 100
+                    
+                    # Exit if price has dipped by 0.3% or more from peak
+                    if dip_from_peak_percent <= -0.3:
+                        should_exit = True
+                        profit_from_entry = ((current_price - enter_price) / enter_price) * 100
+                        exit_reason = (
+                            f"Dip from peak (LONG): peak ${peak_price_since_entry:.4f} → current ${current_price:.4f} "
+                            f"(dip: {dip_from_peak_percent:.2f}%, profit from entry: {profit_from_entry:.2f}%)"
+                        )
+                        logger.info(f"💰 PROFIT EXIT for {ticker} - {exit_reason}")
+            else:
+                # For SHORT: Exit if price starts rising from bottom
+                # Strategy: Enter on downward momentum, exit as soon as it rises from bottom
+                if bottom_price_since_entry and bottom_price_since_entry < enter_price:
+                    # We have a bottom below entry price (we're in profit territory)
+                    # Check if current price is rising from that bottom
+                    rise_from_bottom_percent = ((current_price - bottom_price_since_entry) / bottom_price_since_entry) * 100
+                    
+                    # Exit if price has risen by 0.3% or more from bottom
+                    if rise_from_bottom_percent >= 0.3:
+                        should_exit = True
+                        profit_from_entry = ((enter_price - current_price) / enter_price) * 100
+                        exit_reason = (
+                            f"Rise from bottom (SHORT): bottom ${bottom_price_since_entry:.4f} → current ${current_price:.4f} "
+                            f"(rise: {rise_from_bottom_percent:.2f}%, profit from entry: {profit_from_entry:.2f}%)"
+                        )
+                        logger.info(f"💰 PROFIT EXIT for {ticker} - {exit_reason}")
 
-            # PRIORITY 3: Exit on significant loss (safety net)
+            # PRIORITY 2: Exit if trade becomes unprofitable (CUT LOSSES)
+            if not should_exit:
+                if is_long:
+                    # For long: exit if current_price < enter_price (unprofitable)
+                    if current_price < enter_price:
+                        should_exit = True
+                        exit_reason = (
+                            f"Unprofitable exit (LONG): current ${current_price:.4f} < enter ${enter_price:.4f} "
+                            f"(loss: {profit_percent:.2f}%)"
+                        )
+                        logger.warning(
+                            f"🚨 LOSS EXIT for {ticker} LONG - unprofitable: {profit_percent:.2f}%"
+                        )
+                        cls._losing_tickers_today.add(ticker)
+                else:
+                    # For short: exit if current_price > enter_price (unprofitable)
+                    if current_price > enter_price:
+                        should_exit = True
+                        exit_reason = (
+                            f"Unprofitable exit (SHORT): current ${current_price:.4f} > enter ${enter_price:.4f} "
+                            f"(loss: {profit_percent:.2f}%)"
+                        )
+                        logger.warning(
+                            f"🚨 LOSS EXIT for {ticker} SHORT - unprofitable: {profit_percent:.2f}%"
+                        )
+                        cls._losing_tickers_today.add(ticker)
+
+            # PRIORITY 3: Exit on significant loss (SAFETY NET)
             if not should_exit and profit_percent < cls.immediate_loss_exit_threshold:
                 should_exit = True
                 exit_reason = (

@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/webhook/send_signal.py
+# hypothesis_version: 6.148.7
+
+[0.0, 8.0, 'Action is required', 'Connection', 'Content-Type', 'Ticker is required', 'action', 'ap', 'application/json', 'close', 'current_price', 'enter_reason', 'indicator', 'is_golden_exception', 'quote', 'quotes', 'ticker_symbol', '🌈 CLOSE SHORT', '💰 CLOSE LONG', '🔻 OPEN SHORT', '🚀 OPEN LONG']

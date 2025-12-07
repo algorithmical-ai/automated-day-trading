@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/db/dynamodb_client.py
+# hypothesis_version: 6.148.7
+
+[0.0, '#date', '#date = :date', ':date', ':indicator', 'AWS_ACCESS_KEY_ID', 'AWS_DEFAULT_REGION', 'Code', 'DynamoDBClient', 'Error', 'FilterExpression', 'Item', 'Items', 'Key', 'Message', 'UpdateExpression', 'action', 'created_at', 'date', 'delete_item', 'dynamic_stop_loss', 'dynamodb', 'enter_price', 'enter_reason', 'enter_timestamp', 'entry_score', 'error', 'error_code', 'error_message', 'exit_price', 'exit_reason', 'exit_timestamp', 'failed', 'found', 'get_item', 'indicator', 'items_count', 'operation', 'peak_profit_percent', 'profit_or_loss', 'put_item', 'query', 'scan', 'status', 'success', 'table', 'technical_indicators', 'ticker', 'ticker_indicator', 'timestamp', 'trailing_stop', 'update_item', 'us-east-1']

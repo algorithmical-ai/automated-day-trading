@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/trading/base_trading_indicator.py
+# hypothesis_version: 6.148.7
+
+[0.0, 60.0, 2000.0, 100, 'America/New_York', 'action', 'buy_to_close', 'buy_to_open', 'created_at', 'enter_price', 'enter_reason', 'exit_price', 'gainers', 'indicator', 'losers', 'most_actives', 'profit_percent', 'sell_to_close', 'sell_to_open', 'ticker', 'timestamp']

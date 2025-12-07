@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/tool_discovery/tool_discovery.py
+# hypothesis_version: 6.148.7
+
+[300, 'available_tools', 'tool_count', 'tool_metadata']

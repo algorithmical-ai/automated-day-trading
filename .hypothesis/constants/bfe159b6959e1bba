@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/common/alpaca.py
+# hypothesis_version: 6.148.7
+
+[200, 500, '%Y-%m-%dT%H:%M:%SZ', '+00:00', '1Min', 'APCA-API-KEY-ID', 'APCA-API-SECRET-KEY', 'America/New_York', 'REAL_TRADE_API_KEY', 'Z', 'accept', 'adjustment', 'application/json', 'bars', 'bars_est', 'desc', 'feed', 'is_open', 'limit', 'quote', 'quotes', 'raw', 'sip', 'sort', 'start', 'symbol', 'symbols', 't', 'timeframe']

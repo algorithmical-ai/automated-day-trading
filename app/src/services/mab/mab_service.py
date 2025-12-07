@@ -1,230 +1,401 @@
 """
-Contextual Multi-Armed Bandit Service for ticker selection
-Uses Thompson Sampling for contextual bandits to balance exploration and exploitation
+Multi-Armed Bandit Service for ticker selection using Thompson Sampling.
+
+Implements MAB algorithm to intelligently select which tickers to trade based on
+historical success rates. Uses Thompson Sampling to balance exploration and exploitation.
 """
 
 import numpy as np
-from typing import List, Tuple, Dict, Any, Optional
-from datetime import datetime
-from app.src.common.loguru_logger import logger
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+from loguru import logger
+
+from app.src.common.logging_utils import log_mab_selection, log_error_with_context
 from app.src.db.dynamodb_client import DynamoDBClient
+from app.src.models.trade_models import MABStats
 
 
 class MABService:
     """
-    Contextual Multi-Armed Bandit service for selecting profitable tickers
+    Multi-Armed Bandit service for intelligent ticker selection.
     
-    Uses Thompson Sampling with linear contextual features:
-    - Tracks profitability per ticker per day
-    - Uses context features (momentum, time, volatility, etc.)
-    - Balances exploration vs exploitation
-    - Resets daily at market open
+    Uses Thompson Sampling to rank tickers based on historical success rates.
+    Maintains separate statistics for each indicator#ticker combination.
+    Supports ticker exclusion for losing trades.
     """
-
-    alpha: float = 1.0
-    beta: float = 1.0
-    exploration_rate: float = 0.1
-    min_pulls_for_penalty: int = 3
-
+    
+    # Table name for MAB statistics
+    MAB_STATS_TABLE = "MABStats"
+    
+    # Singleton instance
+    _instance: Optional['MABService'] = None
+    
+    def __init__(self):
+        """Initialize MAB service with DynamoDB client."""
+        self.dynamodb_client = DynamoDBClient()
+        logger.info("MAB service initialized")
+    
     @classmethod
     def configure(cls):
-        """Ensure DynamoDB client resources are ready"""
-        DynamoDBClient.configure()
+        """Configure and initialize the singleton MAB service instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+            logger.info("MAB service configured")
     
     @classmethod
-    def _extract_context_features(
-        cls,
-        momentum_score: float,
-        market_data: Optional[Dict[str, Any]] = None,
-        time_of_day: Optional[float] = None
-    ) -> np.ndarray:
+    def _get_instance(cls) -> 'MABService':
+        """Get the singleton instance, creating it if necessary."""
+        if cls._instance is None:
+            cls.configure()
+        return cls._instance
+    
+    async def get_stats(self, indicator: str, ticker: str) -> Optional[Dict[str, Any]]:
         """
-        Extract context features for the bandit
-        Returns normalized feature vector
+        Get MAB statistics for a specific indicator#ticker combination.
+        
+        Args:
+            indicator: Trading indicator name
+            ticker: Stock ticker symbol
+            
+        Returns:
+            Dictionary with statistics or None if not found
         """
-        features = []
+        indicator_ticker = f"{indicator}#{ticker}"
         
-        # Momentum score (normalized to [-1, 1])
-        features.append(np.tanh(momentum_score / 10.0))  # Normalize momentum
+        stats = await self.dynamodb_client.get_item(
+            table_name=self.MAB_STATS_TABLE,
+            key={"indicator_ticker": indicator_ticker}
+        )
         
-        # Time of day (0 = market open, 1 = market close)
-        if time_of_day is None:
-            now = datetime.now()
-            # Assume market hours 9:30 AM - 4:00 PM (6.5 hours)
-            market_open_hour = 9.5
-            market_close_hour = 16.0
-            current_hour = now.hour + now.minute / 60.0
-            if market_open_hour <= current_hour <= market_close_hour:
-                time_of_day = (current_hour - market_open_hour) / (market_close_hour - market_open_hour)
+        if stats:
+            logger.debug(
+                f"Retrieved MAB stats for {indicator_ticker}: "
+                f"successes={stats.get('successes', 0)}, "
+                f"failures={stats.get('failures', 0)}, "
+                f"total={stats.get('total_trades', 0)}"
+            )
+        
+        return stats
+    
+    async def update_stats(self, indicator: str, ticker: str, success: bool) -> bool:
+        """
+        Update MAB statistics after a trade completion.
+        
+        Args:
+            indicator: Trading indicator name
+            ticker: Stock ticker symbol
+            success: True if trade was profitable, False otherwise
+            
+        Returns:
+            True if update successful, False otherwise
+        """
+        indicator_ticker = f"{indicator}#{ticker}"
+        
+        # Get current stats or initialize new ones
+        current_stats = await self.get_stats(indicator, ticker)
+        
+        if current_stats:
+            # Update existing stats
+            successes = current_stats.get('successes', 0)
+            failures = current_stats.get('failures', 0)
+            total_trades = current_stats.get('total_trades', 0)
+            
+            if success:
+                successes += 1
             else:
-                time_of_day = 0.5  # Default to middle of day
-        features.append(time_of_day)
-        
-        # Volatility (if available from market_data)
-        if market_data:
-            technical_analysis = market_data.get("technical_analysis", {})
-            # Use price range as proxy for volatility
-            datetime_price = technical_analysis.get("datetime_price", [])
-            if datetime_price and len(datetime_price) > 1:
-                prices = []
-                for entry in datetime_price:
-                    try:
-                        if isinstance(entry, list):
-                            # Handle list format: [datetime, price]
-                            if len(entry) >= 2:
-                                prices.append(float(entry[1]))
-                        elif isinstance(entry, dict):
-                            # Handle dict format: try common price keys
-                            price = entry.get("price") or entry.get("close") or entry.get("close_price")
-                            if price is not None:
-                                prices.append(float(price))
-                    except (ValueError, TypeError, KeyError, IndexError):
-                        # Skip invalid entries
-                        continue
-                if prices:
-                    price_range = (max(prices) - min(prices)) / (sum(prices) / len(prices)) if prices else 0.0
-                    features.append(np.tanh(price_range))  # Normalize volatility
-                else:
-                    features.append(0.0)
-            else:
-                features.append(0.0)
+                failures += 1
+            total_trades += 1
+            
+            # Update in DynamoDB
+            result = await self.dynamodb_client.update_item(
+                table_name=self.MAB_STATS_TABLE,
+                key={"indicator_ticker": indicator_ticker},
+                update_expression="SET successes = :s, failures = :f, total_trades = :t, last_updated = :lu",
+                expression_attribute_values={
+                    ":s": successes,
+                    ":f": failures,
+                    ":t": total_trades,
+                    ":lu": datetime.now(timezone.utc).isoformat()
+                }
+            )
         else:
-            features.append(0.0)
+            # Create new stats
+            stats = MABStats(
+                indicator_ticker=indicator_ticker,
+                successes=1 if success else 0,
+                failures=0 if success else 1,
+                total_trades=1,
+                last_updated=datetime.now(timezone.utc).isoformat(),
+                excluded_until=None
+            )
+            
+            result = await self.dynamodb_client.put_item(
+                table_name=self.MAB_STATS_TABLE,
+                item=stats.to_dict()
+            )
         
-        # Bias term
-        features.append(1.0)
+        if result:
+            logger.info(
+                f"Updated MAB stats for {indicator_ticker}: "
+                f"success={success}, new_total={total_trades if current_stats else 1}"
+            )
+        else:
+            logger.error(f"Failed to update MAB stats for {indicator_ticker}")
         
-        return np.array(features)
+        return result
     
-    @classmethod
-    def _calculate_thompson_score(
-        cls,
+    async def exclude_ticker(
+        self,
+        indicator: str,
         ticker: str,
-        context_features: np.ndarray,
-        mab_stats: Optional[Dict[str, Any]] = None
-    ) -> float:
+        duration_hours: int = 24
+    ) -> bool:
         """
-        Calculate Thompson Sampling score for a ticker given context
-        Higher score = more likely to be selected
+        Exclude a ticker from MAB selection for a specified duration.
+        
+        Used by Penny Stocks Indicator to exclude losing tickers for the rest of the day.
+        
+        Args:
+            indicator: Trading indicator name
+            ticker: Stock ticker symbol
+            duration_hours: Hours to exclude ticker (default 24 for rest of day)
+            
+        Returns:
+            True if exclusion successful, False otherwise
         """
-        if mab_stats is None:
-            # New ticker: use prior (exploration)
-            # Sample from Beta(alpha, beta) which is uniform when alpha=beta=1
-            prior_mean = cls.alpha / (cls.alpha + cls.beta)
-            # Add context-based adjustment for new tickers
-            context_bias = np.dot(context_features[:3], [0.1, 0.05, 0.05])  # Small context influence
-            return prior_mean + context_bias
+        indicator_ticker = f"{indicator}#{ticker}"
         
-        # Calculate success rate
-        successful_trades = mab_stats.get("successful_trades", 0)
-        failed_trades = mab_stats.get("failed_trades", 0)
-        total_pulls = mab_stats.get("total_pulls", 0)
+        # Calculate exclusion end time
+        from datetime import timedelta
+        excluded_until = (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat()
         
-        if total_pulls == 0:
-            # No history, use prior
-            prior_mean = cls.alpha / (cls.alpha + cls.beta)
-            context_bias = np.dot(context_features[:3], [0.1, 0.05, 0.05])
-            return prior_mean + context_bias
+        # Get current stats or create new entry
+        current_stats = await self.get_stats(indicator, ticker)
         
-        # Thompson Sampling: sample from Beta distribution
-        # Posterior: Beta(alpha + successes, beta + failures)
-        alpha_posterior = cls.alpha + successful_trades
-        beta_posterior = cls.beta + failed_trades
+        if current_stats:
+            # Update existing stats with exclusion
+            result = await self.dynamodb_client.update_item(
+                table_name=self.MAB_STATS_TABLE,
+                key={"indicator_ticker": indicator_ticker},
+                update_expression="SET excluded_until = :eu, last_updated = :lu",
+                expression_attribute_values={
+                    ":eu": excluded_until,
+                    ":lu": datetime.now(timezone.utc).isoformat()
+                }
+            )
+        else:
+            # Create new stats with exclusion
+            stats = MABStats(
+                indicator_ticker=indicator_ticker,
+                successes=0,
+                failures=0,
+                total_trades=0,
+                last_updated=datetime.now(timezone.utc).isoformat(),
+                excluded_until=excluded_until
+            )
+            
+            result = await self.dynamodb_client.put_item(
+                table_name=self.MAB_STATS_TABLE,
+                item=stats.to_dict()
+            )
         
-        # Sample from Beta distribution
-        # Using approximation: mean + small random noise
-        mean_success_rate = alpha_posterior / (alpha_posterior + beta_posterior)
+        if result:
+            logger.info(
+                f"Excluded {indicator_ticker} from MAB selection until {excluded_until}"
+            )
+        else:
+            logger.error(f"Failed to exclude {indicator_ticker} from MAB selection")
         
-        # Add context-based adjustment
-        # Higher momentum and volatility in favorable context should boost score
-        context_adjustment = np.dot(context_features[:3], [0.15, 0.1, 0.1])
+        return result
+    
+    def _is_excluded(self, stats: Optional[Dict[str, Any]]) -> bool:
+        """
+        Check if a ticker is currently excluded from selection.
         
-        # Penalize tickers with many failed trades relative to successful ones
-        if total_pulls >= cls.min_pulls_for_penalty:
-            failure_penalty = (failed_trades / total_pulls) * 0.3  # Up to 30% penalty
-            mean_success_rate -= failure_penalty
+        Args:
+            stats: MAB statistics dictionary
+            
+        Returns:
+            True if ticker is excluded, False otherwise
+        """
+        if not stats or not stats.get('excluded_until'):
+            return False
         
-        # Boost tickers with high success rate
-        if successful_trades > 0 and total_pulls > 0:
-            success_boost = (successful_trades / total_pulls) * 0.2  # Up to 20% boost
-            mean_success_rate += success_boost
+        excluded_until_str = stats['excluded_until']
+        excluded_until = datetime.fromisoformat(excluded_until_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
         
-        # Add some exploration noise (Thompson Sampling naturally does this via sampling)
-        exploration_noise = np.random.normal(0, 0.05) if np.random.random() < cls.exploration_rate else 0
+        return now < excluded_until
+    
+    def thompson_sampling(self, stats_list: List[Dict[str, Any]]) -> List[int]:
+        """
+        Perform Thompson Sampling to rank tickers.
         
-        final_score = mean_success_rate + context_adjustment + exploration_noise
+        Uses Beta distribution: Beta(alpha + successes, beta + failures)
+        where alpha=1, beta=1 (uniform prior).
         
-        # Ensure score is in [0, 1] range
-        return np.clip(final_score, 0.0, 1.0)
+        Args:
+            stats_list: List of statistics dictionaries with 'successes' and 'failures'
+            
+        Returns:
+            List of indices sorted by Thompson Sampling scores (descending)
+        """
+        if not stats_list:
+            return []
+        
+        scores = []
+        
+        for stats in stats_list:
+            successes = stats.get('successes', 0)
+            failures = stats.get('failures', 0)
+            
+            # Thompson Sampling: sample from Beta(1 + successes, 1 + failures)
+            # Beta(1, 1) is uniform distribution for new tickers (exploration)
+            alpha = 1 + successes
+            beta = 1 + failures
+            
+            # Sample from Beta distribution
+            score = np.random.beta(alpha, beta)
+            scores.append(score)
+        
+        # Return indices sorted by score (descending)
+        ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        
+        return ranked_indices
+    
+    async def select_tickers(
+        self,
+        indicator: str,
+        candidates: List[str],
+        direction: str,
+        top_k: int
+    ) -> List[str]:
+        """
+        Select top-k tickers using Thompson Sampling.
+        
+        Returns separate ranked lists for long and short directions.
+        Excludes tickers that are currently excluded.
+        
+        Args:
+            indicator: Trading indicator name
+            candidates: List of candidate ticker symbols
+            direction: "long" or "short"
+            top_k: Number of tickers to select
+            
+        Returns:
+            List of selected ticker symbols, ranked by Thompson Sampling
+        """
+        if not candidates:
+            logger.debug(f"No candidates provided for MAB selection")
+            return []
+        
+        # Get stats for all candidates
+        stats_list = []
+        valid_tickers = []
+        
+        for ticker in candidates:
+            stats = await self.get_stats(indicator, ticker)
+            
+            # Skip excluded tickers
+            if self._is_excluded(stats):
+                logger.debug(f"Skipping excluded ticker {ticker} for {indicator}")
+                continue
+            
+            # Use empty stats for new tickers (will be explored)
+            if stats is None:
+                stats = {
+                    'successes': 0,
+                    'failures': 0,
+                    'total_trades': 0
+                }
+            
+            stats_list.append(stats)
+            valid_tickers.append(ticker)
+        
+        if not valid_tickers:
+            logger.warning(
+                f"All {len(candidates)} candidates are excluded for {indicator} {direction}"
+            )
+            return []
+        
+        # Perform Thompson Sampling
+        ranked_indices = self.thompson_sampling(stats_list)
+        
+        # Select top-k
+        selected_tickers = [valid_tickers[i] for i in ranked_indices[:top_k]]
+        
+        # Prepare top selections with stats for logging
+        top_selections = []
+        if selected_tickers:
+            for ticker in selected_tickers[:5]:  # Log top 5
+                stats = await self.get_stats(indicator, ticker)
+                if stats:
+                    top_selections.append(
+                        f"{ticker}(s:{stats.get('successes', 0)}/f:{stats.get('failures', 0)})"
+                    )
+                else:
+                    top_selections.append(f"{ticker}(new)")
+        
+        # Use structured logging for MAB selection
+        log_mab_selection(
+            indicator_name=indicator,
+            direction=direction,
+            candidates_count=len(valid_tickers),
+            selected_count=len(selected_tickers),
+            top_selections=top_selections
+        )
+        
+        return selected_tickers
     
     @classmethod
     async def select_tickers_with_mab(
         cls,
         indicator: str,
-        ticker_candidates: List[Tuple[str, float, str]],  # (ticker, momentum_score, reason)
-        market_data_dict: Optional[Dict[str, Dict[str, Any]]] = None,
-        top_k: int = 10
+        ticker_candidates: List[Tuple[str, float, str]],
+        market_data_dict: Dict[str, Any],
+        top_k: int
     ) -> List[Tuple[str, float, str]]:
         """
-        Select top-k tickers using contextual MAB
+        Helper method to select tickers using MAB from a list of (ticker, score, reason) tuples.
         
         Args:
+            indicator: Trading indicator name
             ticker_candidates: List of (ticker, momentum_score, reason) tuples
-            market_data_dict: Optional dict mapping ticker -> market_data
+            market_data_dict: Dictionary of market data (not used, kept for compatibility)
             top_k: Number of tickers to select
-        
+            
         Returns:
-            List of selected (ticker, momentum_score, reason) tuples, sorted by MAB score
+            List of selected (ticker, score, reason) tuples, ranked by Thompson Sampling
         """
         if not ticker_candidates:
             return []
         
-        scored_tickers = []
+        # Extract ticker symbols and determine direction from first score
+        tickers = [t[0] for t in ticker_candidates]
         
-        for ticker, momentum_score, reason in ticker_candidates:
-            # Get MAB stats for this ticker
-            mab_stats = await DynamoDBClient.get_mab_stats(ticker, indicator)
-            
-            # Extract context features
-            market_data = market_data_dict.get(ticker) if market_data_dict else None
-            context_features = cls._extract_context_features(
-                momentum_score=momentum_score,
-                market_data=market_data
-            )
-            
-            # Calculate MAB score
-            mab_score = cls._calculate_thompson_score(
-                ticker=ticker,
-                context_features=context_features,
-                mab_stats=mab_stats
-            )
-            
-            scored_tickers.append((ticker, momentum_score, reason, mab_score))
+        # Determine direction based on first ticker's score
+        # Positive scores = long, negative scores = short
+        first_score = ticker_candidates[0][1] if ticker_candidates else 0
+        direction = "long" if first_score > 0 else "short"
         
-        # Sort by MAB score (descending)
-        scored_tickers.sort(key=lambda x: x[3], reverse=True)
-        
-        # Select top-k
-        selected = scored_tickers[:top_k]
-        
-        if len(selected) == 0 and len(ticker_candidates) > 0:
-            logger.warning(
-                f"⚠️ MAB service selected ZERO tickers from {len(ticker_candidates)} candidates! "
-                f"This should not happen. All scores: {[(t[0], f'{s:.4f}') for t, _, _, s in scored_tickers[:10]]}"
-            )
-        elif len(selected) < len(ticker_candidates) and len(selected) < top_k:
-            logger.debug(
-                f"MAB selected {len(selected)} tickers (requested top_k={top_k}) from {len(ticker_candidates)} candidates. "
-                f"All scores: {[(t[0], f'{s:.4f}') for t, _, _, s in scored_tickers[:10]]}"
-            )
-        
-        logger.info(
-            f"MAB selected {len(selected)} tickers from {len(ticker_candidates)} candidates. "
-            f"Top scores: {[f'{t[0]}:{t[3]:.3f}' for t in selected[:5]]}"
+        # Get MAB instance and select tickers
+        instance = cls._get_instance()
+        selected_ticker_symbols = await instance.select_tickers(
+            indicator=indicator,
+            candidates=tickers,
+            direction=direction,
+            top_k=top_k
         )
         
-        # Return in original format (ticker, momentum_score, reason)
-        return [(ticker, momentum, reason) for ticker, momentum, reason, _ in selected]
+        # Return the original tuples for selected tickers, preserving order from MAB
+        ticker_to_tuple = {t[0]: t for t in ticker_candidates}
+        selected_tuples = [
+            ticker_to_tuple[ticker] 
+            for ticker in selected_ticker_symbols 
+            if ticker in ticker_to_tuple
+        ]
+        
+        return selected_tuples
     
     @classmethod
     async def record_trade_outcome(
@@ -237,114 +408,84 @@ class MABService:
         context: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
-        Record the outcome of a trade (profit/loss) as a reward for MAB
+        Record the outcome of a trade and update MAB statistics.
         
         Args:
-            ticker: Ticker symbol
+            indicator: Trading indicator name
+            ticker: Stock ticker symbol
             enter_price: Entry price
             exit_price: Exit price
-            action: Original action (buy_to_open or sell_to_open)
-            context: Optional context features
-        
+            action: Trade action ("buy_to_open" or "sell_to_open")
+            context: Additional context (profit_percent, etc.)
+            
         Returns:
-            True if successfully recorded
+            True if successful, False otherwise
         """
-        # Calculate profit percentage
+        instance = cls._get_instance()
+        
+        # Determine if trade was successful (profitable)
         if action == "buy_to_open":
-            # Long trade: profit if exit > enter
-            profit_percent = ((exit_price - enter_price) / enter_price) * 100
+            # Long trade: profitable if exit > enter
+            success = exit_price > enter_price
         elif action == "sell_to_open":
-            # Short trade: profit if exit < enter
-            profit_percent = ((enter_price - exit_price) / enter_price) * 100
+            # Short trade: profitable if exit < enter
+            success = exit_price < enter_price
         else:
-            logger.warning(f"Unknown action {action} for ticker {ticker}")
-            return False
+            logger.warning(f"Unknown action {action} for {ticker}, treating as failure")
+            success = False
         
-        # Convert profit percentage to reward
-        # Normalize to [-1, 1] range for MAB
-        # Positive profit = positive reward, negative profit = negative reward
-        reward = np.tanh(profit_percent / 10.0)  # Scale: 10% profit = ~0.76 reward
+        # Update MAB statistics
+        result = await instance.update_stats(indicator, ticker, success)
         
-        # Add context if not provided
-        if context is None:
-            context = {
-                "profit_percent": profit_percent,
-                "enter_price": enter_price,
-                "exit_price": exit_price,
-                "action": action,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-        
-        # Update MAB stats
-        success = await DynamoDBClient.update_mab_reward(
-            ticker=ticker,
-            indicator=indicator,
-            reward=reward,
-            context=context
-        )
-        
-        if success:
+        if result:
+            profit_percent = context.get('profit_percent', 0.0) if context else 0.0
             logger.info(
-                f"Recorded MAB reward for {ticker}: {profit_percent:.2f}% profit "
-                f"(reward: {reward:.4f})"
+                f"Recorded MAB outcome for {indicator}#{ticker}: "
+                f"success={success}, profit={profit_percent:.2f}%"
             )
-        else:
-            logger.warning(f"Failed to record MAB reward for {ticker}")
         
-        return success
-    
-    @classmethod
-    async def should_trade_ticker(
-        cls,
-        indicator: str,
-        ticker: str,
-        momentum_score: float,
-        market_data: Optional[Dict[str, Any]] = None
-    ) -> Tuple[bool, float, str]:
-        """
-        Determine if a ticker should be traded based on MAB
-        
-        Returns:
-            (should_trade, mab_score, reason)
-        """
-        # Get MAB stats
-        mab_stats = await DynamoDBClient.get_mab_stats(ticker, indicator)
-        
-        # Extract context
-        context_features = cls._extract_context_features(
-            momentum_score=momentum_score,
-            market_data=market_data
-        )
-        
-        # Calculate MAB score
-        mab_score = cls._calculate_thompson_score(
-            ticker=ticker,
-            context_features=context_features,
-            mab_stats=mab_stats
-        )
-        
-        # Decision threshold
-        # Lower threshold = more permissive (trades more tickers)
-        # Higher threshold = more selective (only trades high-scoring tickers)
-        threshold = 0.3  # Trade if MAB score >= 0.3
-        
-        should_trade = mab_score >= threshold
-        
-        if mab_stats:
-            total_pulls = mab_stats.get("total_pulls", 0)
-            successful_trades = mab_stats.get("successful_trades", 0)
-            failed_trades = mab_stats.get("failed_trades", 0)
-            reason = (
-                f"MAB score: {mab_score:.3f} (pulls: {total_pulls}, "
-                f"success: {successful_trades}, failures: {failed_trades})"
-            )
-        else:
-            reason = f"MAB score: {mab_score:.3f} (new ticker, exploring)"
-        
-        return should_trade, mab_score, reason
+        return result
     
     @classmethod
     async def reset_daily_stats(cls, indicator: str) -> bool:
-        """Reset daily MAB statistics (call at market open)"""
-        return await DynamoDBClient.reset_daily_mab_stats(indicator)
+        """
+        Reset daily MAB statistics for an indicator.
+        
+        This clears exclusions and resets temporary state for a new trading day.
+        
+        Args:
+            indicator: Trading indicator name
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        instance = cls._get_instance()
+        
+        # Scan for all tickers with this indicator that have exclusions
+        all_stats = await instance.dynamodb_client.scan(
+            table_name=cls.MAB_STATS_TABLE,
+            filter_expression='begins_with(indicator_ticker, :indicator)',
+            expression_attribute_values={':indicator': f"{indicator}#"}
+        )
+        
+        # Clear exclusions for all tickers
+        cleared_count = 0
+        for stats in all_stats:
+            if stats.get('excluded_until'):
+                indicator_ticker = stats['indicator_ticker']
+                await instance.dynamodb_client.update_item(
+                    table_name=cls.MAB_STATS_TABLE,
+                    key={'indicator_ticker': indicator_ticker},
+                    update_expression='REMOVE excluded_until SET last_updated = :lu',
+                    expression_attribute_values={
+                        ':lu': datetime.now(timezone.utc).isoformat()
+                    }
+                )
+                cleared_count += 1
+        
+        logger.info(
+            f"Reset daily MAB stats for {indicator}: cleared {cleared_count} exclusions"
+        )
+        
+        return True
 

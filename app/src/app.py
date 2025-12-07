@@ -1,107 +1,143 @@
 """
 Automated Day Trading Application
-Main entry point for the Heroku worker process
+Main entry point for the trading application
+
+Requirements: 1.1, 1.3, 20.2, 20.5
 """
 
 import asyncio
 import signal
-import sys
 from app.src.common.loguru_logger import logger
-from app.src.services.trading.trading_service import TradingService
-from app.src.services.tool_discovery.tool_discovery import ToolDiscoveryService
-from app.src.services.candidate_generator.screener_monitor_service import (
-    ScreenerMonitorService,
-)
+from app.src.common.logging_utils import log_operation, log_error_with_context
+from app.src.services.trading.trading_service import TradingServiceCoordinator
 from app.src.services.threshold_adjustment.threshold_adjustment_service import (
     ThresholdAdjustmentService,
 )
-from app.src.config.constants import MOMENTUM_TOP_K, MCP_SERVER_TRANSPORT
-from app.src.services.mcp.server import main as mcp_server_main
 
-# Global flag for shutdown
-_shutdown_requested = False
+# Global flag for graceful shutdown
+_shutdown_event: asyncio.Event = None
 
 
 def setup_signal_handlers():
-    """Setup signal handlers for graceful shutdown"""
+    """
+    Setup signal handlers for graceful shutdown (SIGINT, SIGTERM)
+    Requirement 1.3: Gracefully stop all Trading Indicators and clean up resources
+    """
 
     def signal_handler(sig, frame):
-        global _shutdown_requested
-        logger.info("Received shutdown signal, stopping services...")
-        _shutdown_requested = True
-        # Signal handlers can't await, so we set a flag
-        # The main loop will check this and handle async stops
+        logger.info(f"Received shutdown signal ({signal.Signals(sig).name}), initiating graceful shutdown...")
+        if _shutdown_event:
+            _shutdown_event.set()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
 
-async def _run_mcp_server():
-    """Start the MCP server in the background"""
-    try:
-        logger.info("Starting MCP server...")
-        await mcp_server_main()
-    except asyncio.CancelledError:
-        logger.info("MCP server task cancelled")
-        raise
-    except Exception as e:
-        logger.exception(f"Error in MCP server: {str(e)}")
-
-
 async def main():
-    """Main application entry point"""
-    logger.info("Initializing Automated Day Trading Application...")
+    """
+    Main application entry point
+    
+    Requirements:
+    - 1.1: Initialize and run Trading Service Coordinator, Tool Discovery, Threshold Adjustment
+    - 1.3: Graceful shutdown handling
+    - 20.2: Resource cleanup on stop
+    - 20.5: Graceful connection closure and resource release
+    """
+    global _shutdown_event
+    _shutdown_event = asyncio.Event()
+    
+    logger.info("=" * 80)
+    logger.info("Automated Day Trading Application Starting")
+    logger.info("=" * 80)
 
-    # Initialize tool discovery service
-    ToolDiscoveryService.configure(refresh_interval=300)
-
-    # Initialize momentum trading service with tool discovery and top_k configuration
-    TradingService.configure(
-        tool_discovery_cls=ToolDiscoveryService, top_k=MOMENTUM_TOP_K
+    # Configure services
+    log_operation(
+        operation_type="service_configuration",
+        component="MainApplication",
+        status="started"
+    )
+    
+    # Configure Trading Service Coordinator with all indicators
+    TradingServiceCoordinator.configure()
+    
+    log_operation(
+        operation_type="service_configuration",
+        component="MainApplication",
+        status="completed",
+        details={
+            "services": ["TradingServiceCoordinator", "ThresholdAdjustmentService"]
+        }
     )
 
-    # Setup signal handlers
+    # Setup signal handlers for graceful shutdown
     setup_signal_handlers()
 
-    # MCP server is now running as a separate web process on Heroku
-    # Only start MCP server in worker if explicitly needed (e.g., for local development)
-    # For Heroku, the web process handles MCP server via app.src.web
-    start_mcp_server = False  # Disabled - web process handles MCP server
-
     try:
-        # Prepare tasks list
+        # Requirement 1.1: Run all services concurrently
+        # Using return_exceptions=True for error isolation (Requirement 1.2)
+        logger.info("Starting concurrent service execution...")
+        logger.info("  - Trading Service Coordinator")
+        logger.info("  - Threshold Adjustment Service")
+        
+        # Create service tasks
         tasks = [
-            ToolDiscoveryService.discovery_job(),
-            TradingService.run(),
-            ScreenerMonitorService().start(),
-            ThresholdAdjustmentService.start()
+            asyncio.create_task(TradingServiceCoordinator.run(), name="TradingCoordinator"),
+            asyncio.create_task(ThresholdAdjustmentService.start(), name="ThresholdAdjustment"),
         ]
-
-        # Add MCP server task if applicable (typically only for local dev)
-        if start_mcp_server:
-            tasks.append(_run_mcp_server())
-            logger.info(f"MCP server will start with transport: {MCP_SERVER_TRANSPORT}")
-        else:
-            logger.info("MCP server is running as separate web process (not in worker)")
-
-        # Run all services concurrently
-        await asyncio.gather(*tasks)
+        
+        # Wait for either all tasks to complete or shutdown signal
+        done, pending = await asyncio.wait(
+            tasks + [asyncio.create_task(_shutdown_event.wait(), name="ShutdownEvent")],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # If shutdown was triggered, cancel remaining tasks
+        if _shutdown_event.is_set():
+            logger.info("Shutdown signal received, cancelling running tasks...")
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for all tasks to complete cancellation
+            await asyncio.gather(*pending, return_exceptions=True)
+        
+        # Check for exceptions in completed tasks
+        for task in done:
+            if task.get_name() != "ShutdownEvent" and not task.cancelled():
+                try:
+                    result = task.result()
+                    if isinstance(result, Exception):
+                        logger.error(f"Task {task.get_name()} failed with exception: {result}")
+                except Exception as e:
+                    logger.error(f"Task {task.get_name()} raised exception: {e}")
+        
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")
     except Exception as e:
-        logger.exception(f"Fatal error in application: {str(e)}")
+        log_error_with_context(
+            error=e,
+            context="Running main application",
+            component="MainApplication"
+        )
     finally:
-        # Cleanup: stop all services
-        logger.info("Stopping all services...")
-        ToolDiscoveryService.stop()
-        TradingService.stop()
-        # ScreenerMonitorService.stop() is async, await it
-        try:
-            await ScreenerMonitorService().stop()
-        except Exception as stop_error:
-            logger.warning(f"Error stopping ScreenerMonitorService: {stop_error}")
+        # Requirement 20.2 & 20.5: Resource cleanup on shutdown
+        logger.info("=" * 80)
+        logger.info("Initiating resource cleanup...")
+        logger.info("=" * 80)
+        
+        # Stop all services gracefully
+        logger.info("Stopping Trading Service Coordinator...")
+        TradingServiceCoordinator.stop()
+        
+        logger.info("Stopping Threshold Adjustment Service...")
         ThresholdAdjustmentService.stop()
-        logger.info("All services stopped")
+        
+        # Give services a moment to clean up
+        await asyncio.sleep(1)
+        
+        logger.info("=" * 80)
+        logger.info("All services stopped. Application shutdown complete.")
+        logger.info("=" * 80)
 
 
 if __name__ == "__main__":

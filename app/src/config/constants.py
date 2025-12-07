@@ -63,9 +63,6 @@ ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
 # ---------------------------------------------------------------------------
 
 MCP_SERVER_TRANSPORT: str = os.getenv("WORKFLOW_MCP_TRANSPORT", "streamable-http")
-MCP_TOOL_DISCOVERY_INTERVAL_SECONDS: int = int(
-    os.getenv("WORKFLOW_MCP_TOOL_DISCOVERY_SECONDS", "300")
-)
 
 
 # Get AWS credentials from environment variables

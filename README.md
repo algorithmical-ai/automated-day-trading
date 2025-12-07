@@ -24,7 +24,6 @@ An automated day trading application that monitors market conditions and execute
 - **Comprehensive Filtering**: Price, volume, ADX, RSI, stochastic, Bollinger Bands, mean reversion detection
 - **DynamoDB Integration**: Multi-table architecture for active trades, completed trades, inactive tickers, and events
 - **Webhook Integration**: Real-time trading signals to external systems
-- **Tool Discovery Service**: Background service for discovering and caching available MCP tools
 
 ## Architecture
 
@@ -43,19 +42,12 @@ Orchestrates multiple trading indicators running in parallel:
 
 Each indicator runs independent entry and exit services with graceful error handling.
 
-#### 2. Tool Discovery Service (`tool_discovery.py`)
-
-- Runs in the background, refreshing every 5 minutes
-- Discovers available MCP tools from the Market Data Analyzer API
-- Uses HTTP fallback for compatibility
-- Caches tool metadata for efficient lookups
-
-#### 3. Screener Monitor Service (`screener_monitor_service.py`)
+#### 2. Screener Monitor Service (`screener_monitor_service.py`)
 
 - Monitors Alpaca screener for trading candidates
 - Provides ticker screening for all indicators
 
-#### 4. Threshold Adjustment Service (`threshold_adjustment_service.py`)
+#### 3. Threshold Adjustment Service (`threshold_adjustment_service.py`)
 
 - Runs every 5 minutes during market hours
 - Analyzes inactive ticker reasons using AWS Bedrock LLM

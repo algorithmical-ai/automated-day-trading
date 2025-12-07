@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/mab/mab_service.py
+# hypothesis_version: 6.148.7
+
+[0.0, '+00:00', ':eu', ':f', ':indicator', ':lu', ':s', ':t', 'MABService', 'MABStats', 'Z', 'buy_to_open', 'excluded_until', 'failures', 'indicator_ticker', 'long', 'profit_percent', 'sell_to_open', 'short', 'successes', 'total_trades']

@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/trading/base_trading_indicator.py
+# hypothesis_version: 6.148.7
+
+[-2.5, 0.0, 0.5, 1.5, 2.5, 60.0, 2000.0, 100, '+00:00', 'America/New_York', 'Z', 'action', 'ap', 'atr', 'bp', 'buy_to_close', 'buy_to_open', 'created_at', 'dynamic_stop_loss', 'enter_price', 'enter_reason', 'exit_price', 'gainers', 'indicator', 'losers', 'most_actives', 'peak_profit_percent', 'profit_percent', 'quote', 'quotes', 'sell_to_close', 'sell_to_open', 'stop_loss_threshold', 'ticker', 'timestamp']

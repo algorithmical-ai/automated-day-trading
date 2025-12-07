@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/candidate_generator/alpaca_screener.py
+# hypothesis_version: 6.148.7
+
+[100, 200, 'APCA-API-KEY-ID', 'APCA-API-SECRET-KEY', 'REAL_TRADE_API_KEY', 'accept', 'all', 'application/json', 'by', 'gainers', 'losers', 'most_actives', 'symbol', 'top', 'volume']

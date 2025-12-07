@@ -8,6 +8,7 @@ import json
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import date
 from app.src.common.loguru_logger import logger
+from app.src.common.logging_utils import log_threshold_adjustment, log_operation, log_error_with_context
 from app.src.common.alpaca import AlpacaClient
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.bedrock.bedrock_client import BedrockClient
@@ -85,7 +86,11 @@ class ThresholdAdjustmentService:
                 logger.info("Threshold adjustment service cancelled")
                 break
             except Exception as e:
-                logger.exception(f"Error in threshold adjustment service: {str(e)}")
+                log_error_with_context(
+                    error=e,
+                    context="Running threshold adjustment service loop",
+                    component="ThresholdAdjustmentService"
+                )
                 await asyncio.sleep(60)  # Wait 1 minute before retrying
 
     @classmethod
@@ -103,7 +108,12 @@ class ThresholdAdjustmentService:
             try:
                 await cls._analyze_indicator(indicator_name, indicator_cls)
             except Exception as e:
-                logger.exception(f"Error analyzing {indicator_name}: {str(e)}")
+                log_error_with_context(
+                    error=e,
+                    context=f"Analyzing {indicator_name} for threshold adjustments",
+                    component="ThresholdAdjustmentService",
+                    additional_info={"indicator": indicator_name}
+                )
 
     @classmethod
     async def _analyze_indicator(cls, indicator_name: str, indicator_cls: Any):
@@ -149,6 +159,9 @@ class ThresholdAdjustmentService:
         # This helps track when the service ran and what the LLM suggested
         current_date = date.today().isoformat()
 
+        # Get old values for logging
+        old_thresholds = cls._get_current_thresholds(indicator_cls)
+        
         # Apply threshold changes if any
         if threshold_changes:
             await cls._apply_threshold_changes(indicator_cls, threshold_changes)
@@ -162,6 +175,24 @@ class ThresholdAdjustmentService:
             logger.info(
                 f"Updated {indicator_cls.__name__}.max_daily_trades: "
                 f"{old_max} -> {total_max_trades} (long: {max_long}, short: {max_short})"
+            )
+        
+        # Extract reasoning from LLM response
+        try:
+            response_json = json.loads(llm_response.strip().replace("```json", "").replace("```", ""))
+            llm_reasoning = response_json.get("reasoning", "No reasoning provided")
+        except:
+            llm_reasoning = "Unable to parse LLM reasoning"
+        
+        # Log threshold adjustment with structured logging (Requirement 16.5)
+        if threshold_changes or total_max_trades != old_thresholds.get("max_daily_trades", 5):
+            log_threshold_adjustment(
+                indicator_name=indicator_name,
+                old_values=old_thresholds,
+                new_values={**old_thresholds, **threshold_changes, "max_daily_trades": total_max_trades},
+                llm_reasoning=llm_reasoning,
+                max_long_trades=max_long,
+                max_short_trades=max_short
             )
 
         # Store event in DayTraderEvents table (always store if we got LLM response)

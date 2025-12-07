@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/common/logging_utils.py
+# hypothesis_version: 6.148.7
+
+[1000, 1000000, ', ', 'DynamoDB', 'ENTRY', 'N/A', 'No changes', 'action', 'additional_info', 'adx', 'atr', 'candidates_count', 'component', 'context', 'details', 'direction', 'error_code', 'error_message', 'error_type', 'failed', 'indicator', 'item_count', 'llm_reasoning', 'log_mab_selection', 'log_market_status', 'log_operation', 'log_signal', 'mab_selection', 'market_open', 'market_status_check', 'max_long_trades', 'max_short_trades', 'momentum', 'new_values', 'next_close', 'next_open', 'old_values', 'operation', 'operation_type', 'price', 'profit_loss', 'reason', 'rsi', 'selected_count', 'service', 'signal_type', 'started', 'status', 'success', 'table', 'technical_indicators', 'threshold_adjustment', 'ticker', 'top_selections', 'volume']

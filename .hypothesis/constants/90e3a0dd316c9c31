@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/trading/deep_analyzer_indicator.py
+# hypothesis_version: 6.148.7
+
+[0.0, 0.05, 0.5, 0.6, 0.7, 0.75, 0.85, 1.0, 5.0, 100, 'America/New_York', 'BUY_TO_CLOSE', 'Deep Analyzer', 'First position', 'No entry signal', 'SELL_TO_CLOSE', 'action', 'alpaca', 'analysis', 'ap', 'bp', 'buy_to_open', 'close_price', 'current_price', 'daily_limit', 'datetime_price', 'degradation', 'enter', 'enter_price', 'entry_score', 'error', 'exit_decision', 'indicator', 'indicators', 'is_golden', 'long_result', 'low_entry_score', 'max_capacity', 'message', 'no_entry_signal', 'no_market_data', 'none', 'passed', 'peak_profit_percent', 'portfolio_allocation', 'quote', 'quote_failed', 'quotes', 'reason', 'reversal', 'sell_to_open', 'short_result', 'signal', 'technical_analysis', 'technical_indicators', 'ticker', '🟡 GOLDEN: ']

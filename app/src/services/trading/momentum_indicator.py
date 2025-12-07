@@ -1086,18 +1086,20 @@ class MomentumIndicator(BaseTradingIndicator):
         golden_prefix = "🟡 GOLDEN: " if is_golden else ""
         ranked_reason = f"{golden_prefix}{reason} (ranked #{rank} {direction} momentum)"
 
-        await send_signal_to_webhook(
-            ticker=ticker,
-            action=action,
-            indicator=cls.indicator_name(),
-            enter_reason=ranked_reason,
-        )
-
         # market_data_response IS the technical analysis dict (from calculate_all_indicators)
         technical_indicators = market_data_response if isinstance(market_data_response, dict) else {}
         technical_indicators_for_enter = {
             k: v for k, v in technical_indicators.items() if k != "datetime_price"
         }
+
+        await send_signal_to_webhook(
+            ticker=ticker,
+            action=action,
+            indicator=cls.indicator_name(),
+            enter_reason=ranked_reason,
+            enter_price=enter_price,
+            technical_indicators=technical_indicators_for_enter,
+        )
 
         # Calculate dynamic stop loss
         dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
@@ -1855,9 +1857,64 @@ class MomentumIndicator(BaseTradingIndicator):
 
             should_exit = False
             exit_reason = None
+            is_long = original_action == "buy_to_open"
 
-            # Check stop loss FIRST (most critical exit condition)
-            if profit_percent < stop_loss_threshold:
+            # Get recent bars for peak/bottom tracking
+            bars_data_for_exit = await AlpacaClient.get_market_data(ticker, limit=50)
+            
+            # Track peak price (for long) and bottom price (for short) since entry
+            peak_price_since_entry = None
+            bottom_price_since_entry = None
+            
+            if bars_data_for_exit:
+                bars_dict = bars_data_for_exit.get("bars", {})
+                ticker_bars = bars_dict.get(ticker, [])
+                if ticker_bars:
+                    # Get all prices since entry to find peak/bottom
+                    prices_since_entry = [bar.get("c", 0.0) for bar in ticker_bars if bar.get("c", 0.0) > 0]
+                    if prices_since_entry:
+                        peak_price_since_entry = max(prices_since_entry)
+                        bottom_price_since_entry = min(prices_since_entry)
+
+            # PRIORITY 1: Exit on profitable trend reversal (BOOK PROFIT QUICKLY)
+            # This is the PRIMARY exit strategy - get in and out with profit
+            if is_long:
+                # For LONG: Exit if price starts dipping from peak
+                # Strategy: Enter on upward momentum, exit as soon as it dips from peak
+                if peak_price_since_entry and peak_price_since_entry > enter_price:
+                    # We have a peak above entry price (we're in profit territory)
+                    # Check if current price is dipping from that peak
+                    dip_from_peak_percent = ((current_price - peak_price_since_entry) / peak_price_since_entry) * 100
+                    
+                    # Exit if price has dipped by 0.5% or more from peak (slightly more lenient than penny stocks)
+                    if dip_from_peak_percent <= -0.5:
+                        should_exit = True
+                        profit_from_entry = ((current_price - enter_price) / enter_price) * 100
+                        exit_reason = (
+                            f"Dip from peak (LONG): peak ${peak_price_since_entry:.4f} → current ${current_price:.4f} "
+                            f"(dip: {dip_from_peak_percent:.2f}%, profit from entry: {profit_from_entry:.2f}%)"
+                        )
+                        logger.info(f"💰 PROFIT EXIT for {ticker} - {exit_reason}")
+            else:
+                # For SHORT: Exit if price starts rising from bottom
+                # Strategy: Enter on downward momentum, exit as soon as it rises from bottom
+                if bottom_price_since_entry and bottom_price_since_entry < enter_price:
+                    # We have a bottom below entry price (we're in profit territory)
+                    # Check if current price is rising from that bottom
+                    rise_from_bottom_percent = ((current_price - bottom_price_since_entry) / bottom_price_since_entry) * 100
+                    
+                    # Exit if price has risen by 0.5% or more from bottom (slightly more lenient than penny stocks)
+                    if rise_from_bottom_percent >= 0.5:
+                        should_exit = True
+                        profit_from_entry = ((enter_price - current_price) / enter_price) * 100
+                        exit_reason = (
+                            f"Rise from bottom (SHORT): bottom ${bottom_price_since_entry:.4f} → current ${current_price:.4f} "
+                            f"(rise: {rise_from_bottom_percent:.2f}%, profit from entry: {profit_from_entry:.2f}%)"
+                        )
+                        logger.info(f"💰 PROFIT EXIT for {ticker} - {exit_reason}")
+
+            # PRIORITY 2: Check stop loss (cut losses)
+            if not should_exit and profit_percent < stop_loss_threshold:
                 should_exit = True
                 exit_reason = (
                     f"Stop loss triggered: {profit_percent:.2f}% "
@@ -1868,7 +1925,7 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"Exit signal for {ticker} - stop loss: {profit_percent:.2f}%"
                 )
 
-            # Force exit before market close ONLY if trade is profitable
+            # PRIORITY 3: Force exit before market close ONLY if trade is profitable
             # Hold losing trades until next day (unless stop loss is hit)
             if not should_exit and is_near_close:
                 if profit_percent > 0:
@@ -1885,25 +1942,6 @@ class MomentumIndicator(BaseTradingIndicator):
                         f"Holding {ticker} at end of day (current loss: {profit_percent:.2f}%) - "
                         f"will exit when profitable or stop loss triggered"
                     )
-
-            # Check trailing stop if we have a peak profit
-            if not should_exit and peak_profit_percent > 0:
-                trailing_stop_result = await cls._check_trailing_stop(
-                    ticker=ticker,
-                    enter_price=enter_price,
-                    current_price=current_price,
-                    original_action=original_action,
-                    peak_profit_percent=peak_profit_percent,
-                    stop_loss_threshold=stop_loss_threshold,
-                    technical_analysis=technical_analysis,
-                    created_at=created_at,
-                )
-
-                if trailing_stop_result["should_exit"]:
-                    should_exit = True
-                    exit_reason = trailing_stop_result["exit_reason"]
-                    profit_percent = trailing_stop_result["profit_percent"]
-                    logger.info(f"Exit signal for {ticker} - {exit_reason}")
 
             if not should_exit:
                 # For penny stocks: QUICK PROFIT EXIT - bank on volatility, get out fast!

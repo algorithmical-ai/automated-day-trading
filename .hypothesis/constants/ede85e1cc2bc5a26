@@ -1,0 +1,4 @@
+# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/db/dynamodb_client.py
+# hypothesis_version: 6.148.7
+
+['AWS_ACCESS_KEY_ID', 'AWS_DEFAULT_REGION', 'Code', 'Error', 'FilterExpression', 'Item', 'Items', 'Key', 'Message', 'UpdateExpression', 'delete_item', 'dynamodb', 'error', 'error_code', 'error_message', 'failed', 'found', 'get_item', 'items_count', 'operation', 'put_item', 'query', 'scan', 'status', 'success', 'table', 'update_item', 'us-east-1']

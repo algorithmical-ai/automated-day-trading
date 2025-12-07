@@ -1,300 +1,506 @@
 """
-DynamoDB Client for managing active trades
+DynamoDB client for automated day trading application.
+Provides async operations for data persistence with error handling and logging.
 """
-
-from typing_extensions import Set
-import boto3
-import json
-import math
-from typing import Optional, Dict, Any, List
-from decimal import Decimal
-from datetime import datetime, timezone, timedelta
-import pytz
-from app.src.common.loguru_logger import logger
-
-try:
-    import numpy as np
-
-    FLOAT_TYPES = (float, np.floating)
-except Exception:  # numpy might not be available
-    FLOAT_TYPES = (float,)
-from app.src.config.constants import (
-    DYNAMODB_TABLE_NAME,
-    AWS_ACCESS_KEY_ID,
-    AWS_SECRET_ACCESS_KEY,
-    AWS_DEFAULT_REGION,
-)
-
-# New table for momentum-based trading
-MOMENTUM_TRADING_TABLE_NAME = "ActiveTickersForAutomatedDayTrader"
-# Ticker blacklist table
-TICKER_BLACKLIST_TABLE_NAME = "TickerBlackList"
-# MAB table for tracking ticker profitability
-MAB_TABLE_NAME = "MABForDayTradingService"
-# Completed trades table
-COMPLETED_TRADES_TABLE_NAME = "CompletedTradesForAutomatedDayTrading"
-# Inactive tickers table
-INACTIVE_TICKERS_TABLE_NAME = "InactiveTickers"
-# Inactive tickers for day trading table (with indicator as sort key)
-INACTIVE_TICKERS_FOR_DAY_TRADING_TABLE_NAME = "InactiveTickersForDayTrading"
-# Day trader events table for LLM threshold adjustments
-DAY_TRADER_EVENTS_TABLE_NAME = "DayTraderEvents"
+import os
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
+import aioboto3
+from botocore.exceptions import ClientError, BotoCoreError
+from loguru import logger
 
 
 class DynamoDBClient:
-    """Client for DynamoDB operations"""
-
-    _dynamodb = None
-    _table = None
-    _momentum_table = None
-    _blacklist_table = None
-    _mab_table = None
-    _completed_trades_table = None
-    _inactive_tickers_table = None
-    _inactive_tickers_for_day_trading_table = None
-    _day_trader_events_table = None
-
-    @classmethod
-    def configure(cls):
-        """Configure and pre-initialize DynamoDB client resources"""
-        cls._ensure_tables()
-
-    @classmethod
-    def _ensure_tables(cls):
-        if cls._table:
-            return
-
-        if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
-            cls._dynamodb = boto3.resource(
-                "dynamodb",
-                aws_access_key_id=AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                region_name=AWS_DEFAULT_REGION,
-            )
-        else:
-            cls._dynamodb = boto3.resource("dynamodb", region_name=AWS_DEFAULT_REGION)
-
-        cls._table = cls._dynamodb.Table(DYNAMODB_TABLE_NAME)
-        cls._momentum_table = cls._dynamodb.Table(MOMENTUM_TRADING_TABLE_NAME)
-        cls._blacklist_table = cls._dynamodb.Table(TICKER_BLACKLIST_TABLE_NAME)
-        cls._mab_table = cls._dynamodb.Table(MAB_TABLE_NAME)
-        cls._completed_trades_table = cls._dynamodb.Table(COMPLETED_TRADES_TABLE_NAME)
-        cls._inactive_tickers_table = cls._dynamodb.Table(INACTIVE_TICKERS_TABLE_NAME)
-        cls._inactive_tickers_for_day_trading_table = cls._dynamodb.Table(
-            INACTIVE_TICKERS_FOR_DAY_TRADING_TABLE_NAME
+    """
+    Async DynamoDB client with comprehensive error handling.
+    
+    Provides operations: put_item, get_item, delete_item, query, scan, update_item
+    All operations include detailed logging and graceful degradation on failures.
+    """
+    
+    def __init__(self):
+        """Initialize DynamoDB client with AWS credentials from environment."""
+        self.aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+        self.aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+        self.aws_region = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
+        
+        if not self.aws_access_key_id or not self.aws_secret_access_key:
+            logger.warning("AWS credentials not found in environment variables")
+        
+        # Initialize aioboto3 session
+        self.session = aioboto3.Session(
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            region_name=self.aws_region
         )
-        cls._day_trader_events_table = cls._dynamodb.Table(DAY_TRADER_EVENTS_TABLE_NAME)
-
-    @classmethod
-    def _is_float_type(cls, obj):
-        """Check if object is a float type that needs conversion to Decimal"""
-        if isinstance(obj, bool):
-            return False
-        if isinstance(obj, FLOAT_TYPES):
-            return True
-        # Check for numpy float types
-        try:
-            import numpy as np
-
-            if isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
-                return True
-            # Check if it's a numpy number that's a float
-            if hasattr(np, "number") and isinstance(obj, np.number):
-                if isinstance(obj, np.floating):
-                    return True
-        except (ImportError, AttributeError):
-            pass
-        return False
-
-    @classmethod
-    def _is_invalid_number(cls, obj):
-        """Check if a number is Infinity or NaN (not supported by DynamoDB)"""
-        if isinstance(obj, (float, int)):
-            return math.isinf(obj) or math.isnan(obj)
-        try:
-            import numpy as np
-
-            if isinstance(obj, (np.floating, np.integer)):
-                return np.isinf(obj) or np.isnan(obj)
-        except (ImportError, TypeError):
-            pass
-        return False
-
-    @classmethod
-    def _convert_utc_to_est_isoformat(cls, timestamp_str: Optional[str] = None) -> str:
+        
+        logger.info(f"DynamoDB client initialized for region: {self.aws_region}")
+    
+    async def put_item(self, table_name: str, item: Dict[str, Any]) -> bool:
         """
-        Convert UTC timestamp to EST timezone and return as ISO format string.
-        If timestamp_str is provided, convert it from UTC to EST.
-        If None, get current UTC time and convert to EST.
+        Insert item into DynamoDB table.
         
         Args:
-            timestamp_str: Optional ISO format timestamp string (assumed UTC if provided)
+            table_name: Name of the DynamoDB table
+            item: Dictionary containing item data
             
         Returns:
-            ISO format timestamp string in EST timezone
+            True if successful, False otherwise
         """
-        est_tz = pytz.timezone("America/New_York")
-        
-        if timestamp_str:
-            # Parse the timestamp string (assume UTC if no timezone info)
-            try:
-                if timestamp_str.endswith('Z'):
-                    # Remove Z and parse as UTC
-                    dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                elif '+' in timestamp_str or timestamp_str.count('-') > 2:
-                    # Has timezone info
-                    dt = datetime.fromisoformat(timestamp_str)
-                else:
-                    # No timezone info, assume UTC
-                    dt = datetime.fromisoformat(timestamp_str).replace(tzinfo=timezone.utc)
-                
-                # If naive datetime, assume UTC
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                
-                # Convert to EST
-                est_time = dt.astimezone(est_tz)
-            except Exception as e:
-                logger.warning(f"Error parsing timestamp {timestamp_str}, using current time: {e}")
-                est_time = datetime.now(est_tz)
-        else:
-            # Get current UTC time and convert to EST
-            utc_now = datetime.now(timezone.utc)
-            est_time = utc_now.astimezone(est_tz)
-        
-        return est_time.isoformat()
-
-    @classmethod
-    def _convert_to_decimal(cls, obj):
-        """Convert float-like values to Decimal for DynamoDB"""
-        if isinstance(obj, bool):
-            return obj
-        # Check for float types (including numpy floats)
-        if cls._is_float_type(obj):
-            # Convert float (or numpy floating) to Decimal using string to preserve precision
-            return Decimal(str(float(obj)))
-        # Handle numpy integer types
         try:
-            import numpy as np
-
-            if isinstance(obj, (np.integer, np.int8, np.int16, np.int32, np.int64)):
-                return int(obj)
-        except (ImportError, AttributeError):
-            pass
-        # Also check for int types that might need conversion (numpy ints)
-        if isinstance(obj, (int,)) and not isinstance(obj, bool):
-            # Keep as int (DynamoDB supports integers)
-            return obj
-        if isinstance(obj, dict):
-            return {k: cls._convert_to_decimal(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [cls._convert_to_decimal(item) for item in obj]
-        return obj
-
-    @classmethod
-    def _ensure_all_floats_converted(cls, obj):
-        """Recursively ensure all float values in a structure are converted to Decimal.
-        Infinity and NaN values are converted to None (not supported by DynamoDB).
+            async with self.session.resource('dynamodb') as dynamodb:
+                table = await dynamodb.Table(table_name)
+                await table.put_item(Item=item)
+            
+            logger.debug(
+                f"DynamoDB put_item successful",
+                extra={
+                    "operation": "put_item",
+                    "table": table_name,
+                    "status": "success"
+                }
+            )
+            return True
+            
+        except ClientError as e:
+            logger.error(
+                f"DynamoDB ClientError in put_item: {e.response['Error']['Message']}",
+                extra={
+                    "operation": "put_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error_code": e.response['Error']['Code'],
+                    "error_message": e.response['Error']['Message']
+                }
+            )
+            return False
+            
+        except BotoCoreError as e:
+            logger.error(
+                f"DynamoDB BotoCoreError in put_item: {str(e)}",
+                extra={
+                    "operation": "put_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return False
+            
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in put_item: {str(e)}",
+                extra={
+                    "operation": "put_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return False
+    
+    async def get_item(self, table_name: str, key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        if isinstance(obj, dict):
-            converted = {}
-            for key, value in obj.items():
-                if cls._is_invalid_number(value):
-                    # Convert Infinity/NaN to None (DynamoDB doesn't support these)
-                    converted[key] = None
-                elif cls._is_float_type(value):
-                    converted[key] = Decimal(str(float(value)))
-                elif isinstance(value, (dict, list, tuple)):
-                    # Handle tuples by converting to list, processing, then back to tuple
-                    if isinstance(value, tuple):
-                        converted[key] = tuple(cls._ensure_all_floats_converted(list(value)))
-                    else:
-                        converted[key] = cls._ensure_all_floats_converted(value)
-                else:
-                    converted[key] = value
-            return converted
-        elif isinstance(obj, (list, tuple)):
-            # Handle tuples by converting to list, processing, then back to tuple
-            if isinstance(obj, tuple):
-                return tuple([cls._ensure_all_floats_converted(item) for item in obj])
-            return [cls._ensure_all_floats_converted(item) for item in obj]
-        elif cls._is_invalid_number(obj):
-            # Convert Infinity/NaN to None
+        Retrieve item from DynamoDB table by key.
+        
+        Args:
+            table_name: Name of the DynamoDB table
+            key: Dictionary containing partition key (and sort key if applicable)
+            
+        Returns:
+            Item dictionary if found, None otherwise
+        """
+        try:
+            async with self.session.resource('dynamodb') as dynamodb:
+                table = await dynamodb.Table(table_name)
+                response = await table.get_item(Key=key)
+            
+            item = response.get('Item')
+            
+            logger.debug(
+                f"DynamoDB get_item successful",
+                extra={
+                    "operation": "get_item",
+                    "table": table_name,
+                    "status": "success",
+                    "found": item is not None
+                }
+            )
+            
+            return item
+            
+        except ClientError as e:
+            logger.error(
+                f"DynamoDB ClientError in get_item: {e.response['Error']['Message']}",
+                extra={
+                    "operation": "get_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error_code": e.response['Error']['Code'],
+                    "error_message": e.response['Error']['Message']
+                }
+            )
             return None
-        elif cls._is_float_type(obj):
-            return Decimal(str(float(obj)))
-        return obj
-
-    @classmethod
-    def _convert_from_decimal(cls, obj):
-        """Convert Decimal to float from DynamoDB"""
-        if isinstance(obj, Decimal):
-            return float(obj)
-        elif isinstance(obj, dict):
-            return {k: cls._convert_from_decimal(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [cls._convert_from_decimal(item) for item in obj]
-        return obj
-
-    @classmethod
-    async def add_trade(
-        cls,
-        ticker: str,
-        action: str,
-        indicator: str,
-        enter_price: float,
-        enter_reason: str,
-        enter_response: Dict[str, Any],
-    ) -> bool:
-        """Add a trade to DynamoDB"""
+            
+        except BotoCoreError as e:
+            logger.error(
+                f"DynamoDB BotoCoreError in get_item: {str(e)}",
+                extra={
+                    "operation": "get_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return None
+            
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in get_item: {str(e)}",
+                extra={
+                    "operation": "get_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return None
+    
+    async def delete_item(self, table_name: str, key: Dict[str, Any]) -> bool:
+        """
+        Delete item from DynamoDB table.
+        
+        Args:
+            table_name: Name of the DynamoDB table
+            key: Dictionary containing partition key (and sort key if applicable)
+            
+        Returns:
+            True if successful, False otherwise
+        """
         try:
-            cls._ensure_tables()
-            item = {
-                "ticker": ticker,
-                "action": action,
-                "indicator": indicator,
-                "enter_price": cls._convert_to_decimal(enter_price),
-                "enter_reason": enter_reason,
-                "enter_response": cls._convert_to_decimal(enter_response),
-                "created_at": cls._convert_utc_to_est_isoformat(),  # Store in EST timezone
-            }
-            cls._table.put_item(Item=item)
-            logger.info(f"Added trade to DynamoDB: {ticker} - {action}")
+            async with self.session.resource('dynamodb') as dynamodb:
+                table = await dynamodb.Table(table_name)
+                await table.delete_item(Key=key)
+            
+            logger.debug(
+                f"DynamoDB delete_item successful",
+                extra={
+                    "operation": "delete_item",
+                    "table": table_name,
+                    "status": "success"
+                }
+            )
             return True
-        except Exception as e:
-            logger.error(f"Error adding trade to DynamoDB: {str(e)}")
+            
+        except ClientError as e:
+            logger.error(
+                f"DynamoDB ClientError in delete_item: {e.response['Error']['Message']}",
+                extra={
+                    "operation": "delete_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error_code": e.response['Error']['Code'],
+                    "error_message": e.response['Error']['Message']
+                }
+            )
             return False
-
-    @classmethod
-    async def get_all_active_trades(cls) -> List[Dict[str, Any]]:
-        """Get all active trades from DynamoDB"""
-        try:
-            cls._ensure_tables()
-            response = cls._table.scan()
-            trades = []
-            for item in response.get("Items", []):
-                # Convert Decimal back to float
-                converted_item = cls._convert_from_decimal(item)
-                trades.append(converted_item)
-            return trades
+            
+        except BotoCoreError as e:
+            logger.error(
+                f"DynamoDB BotoCoreError in delete_item: {str(e)}",
+                extra={
+                    "operation": "delete_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return False
+            
         except Exception as e:
-            logger.error(f"Error getting active trades from DynamoDB: {str(e)}")
+            logger.error(
+                f"Unexpected error in delete_item: {str(e)}",
+                extra={
+                    "operation": "delete_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return False
+    
+    async def query(
+        self,
+        table_name: str,
+        key_condition_expression: str,
+        expression_attribute_values: Dict[str, Any],
+        expression_attribute_names: Optional[Dict[str, str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Query DynamoDB table with conditions.
+        
+        Args:
+            table_name: Name of the DynamoDB table
+            key_condition_expression: Key condition expression string
+            expression_attribute_values: Dictionary of expression attribute values
+            expression_attribute_names: Optional dictionary of expression attribute names
+            
+        Returns:
+            List of items matching the query, empty list on error
+        """
+        try:
+            async with self.session.resource('dynamodb') as dynamodb:
+                table = await dynamodb.Table(table_name)
+                
+                query_params = {
+                    'KeyConditionExpression': key_condition_expression,
+                    'ExpressionAttributeValues': expression_attribute_values
+                }
+                
+                if expression_attribute_names:
+                    query_params['ExpressionAttributeNames'] = expression_attribute_names
+                
+                response = await table.query(**query_params)
+                items = response.get('Items', [])
+            
+            logger.debug(
+                f"DynamoDB query successful",
+                extra={
+                    "operation": "query",
+                    "table": table_name,
+                    "status": "success",
+                    "items_count": len(items)
+                }
+            )
+            
+            return items
+            
+        except ClientError as e:
+            logger.error(
+                f"DynamoDB ClientError in query: {e.response['Error']['Message']}",
+                extra={
+                    "operation": "query",
+                    "table": table_name,
+                    "status": "failed",
+                    "error_code": e.response['Error']['Code'],
+                    "error_message": e.response['Error']['Message']
+                }
+            )
             return []
-
-    @classmethod
-    async def delete_trade(cls, ticker: str) -> bool:
-        """Delete a trade from DynamoDB"""
-        try:
-            cls._ensure_tables()
-            cls._table.delete_item(Key={"ticker": ticker})
-            logger.info(f"Deleted trade from DynamoDB: {ticker}")
-            return True
+            
+        except BotoCoreError as e:
+            logger.error(
+                f"DynamoDB BotoCoreError in query: {str(e)}",
+                extra={
+                    "operation": "query",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return []
+            
         except Exception as e:
-            logger.error(f"Error deleting trade from DynamoDB: {str(e)}")
+            logger.error(
+                f"Unexpected error in query: {str(e)}",
+                extra={
+                    "operation": "query",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return []
+    
+    async def scan(
+        self,
+        table_name: str,
+        filter_expression: Optional[str] = None,
+        expression_attribute_values: Optional[Dict[str, Any]] = None,
+        expression_attribute_names: Optional[Dict[str, str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Scan DynamoDB table with optional filter.
+        
+        Args:
+            table_name: Name of the DynamoDB table
+            filter_expression: Optional filter expression string
+            expression_attribute_values: Optional dictionary of expression attribute values
+            expression_attribute_names: Optional dictionary of expression attribute names
+            
+        Returns:
+            List of items from scan, empty list on error
+        """
+        try:
+            async with self.session.resource('dynamodb') as dynamodb:
+                table = await dynamodb.Table(table_name)
+                
+                scan_params = {}
+                
+                if filter_expression:
+                    scan_params['FilterExpression'] = filter_expression
+                
+                if expression_attribute_values:
+                    scan_params['ExpressionAttributeValues'] = expression_attribute_values
+                
+                if expression_attribute_names:
+                    scan_params['ExpressionAttributeNames'] = expression_attribute_names
+                
+                response = await table.scan(**scan_params)
+                items = response.get('Items', [])
+            
+            logger.debug(
+                f"DynamoDB scan successful",
+                extra={
+                    "operation": "scan",
+                    "table": table_name,
+                    "status": "success",
+                    "items_count": len(items)
+                }
+            )
+            
+            return items
+            
+        except ClientError as e:
+            logger.error(
+                f"DynamoDB ClientError in scan: {e.response['Error']['Message']}",
+                extra={
+                    "operation": "scan",
+                    "table": table_name,
+                    "status": "failed",
+                    "error_code": e.response['Error']['Code'],
+                    "error_message": e.response['Error']['Message']
+                }
+            )
+            return []
+            
+        except BotoCoreError as e:
+            logger.error(
+                f"DynamoDB BotoCoreError in scan: {str(e)}",
+                extra={
+                    "operation": "scan",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return []
+            
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in scan: {str(e)}",
+                extra={
+                    "operation": "scan",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return []
+    
+    async def update_item(
+        self,
+        table_name: str,
+        key: Dict[str, Any],
+        update_expression: str,
+        expression_attribute_values: Dict[str, Any],
+        expression_attribute_names: Optional[Dict[str, str]] = None
+    ) -> bool:
+        """
+        Update item attributes in DynamoDB table.
+        
+        Args:
+            table_name: Name of the DynamoDB table
+            key: Dictionary containing partition key (and sort key if applicable)
+            update_expression: Update expression string
+            expression_attribute_values: Dictionary of expression attribute values
+            expression_attribute_names: Optional dictionary of expression attribute names
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            async with self.session.resource('dynamodb') as dynamodb:
+                table = await dynamodb.Table(table_name)
+                
+                update_params = {
+                    'Key': key,
+                    'UpdateExpression': update_expression,
+                    'ExpressionAttributeValues': expression_attribute_values
+                }
+                
+                if expression_attribute_names:
+                    update_params['ExpressionAttributeNames'] = expression_attribute_names
+                
+                await table.update_item(**update_params)
+            
+            logger.debug(
+                f"DynamoDB update_item successful",
+                extra={
+                    "operation": "update_item",
+                    "table": table_name,
+                    "status": "success"
+                }
+            )
+            return True
+            
+        except ClientError as e:
+            logger.error(
+                f"DynamoDB ClientError in update_item: {e.response['Error']['Message']}",
+                extra={
+                    "operation": "update_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error_code": e.response['Error']['Code'],
+                    "error_message": e.response['Error']['Message']
+                }
+            )
             return False
-
-    # Methods for ActiveTickersForAutomatedDayTrader table
-
+            
+        except BotoCoreError as e:
+            logger.error(
+                f"DynamoDB BotoCoreError in update_item: {str(e)}",
+                extra={
+                    "operation": "update_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return False
+            
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in update_item: {str(e)}",
+                extra={
+                    "operation": "update_item",
+                    "table": table_name,
+                    "status": "failed",
+                    "error": str(e)
+                }
+            )
+            return False
+    
+    # =========================================================================
+    # Class-level helper methods for trading operations
+    # =========================================================================
+    
+    _instance: Optional['DynamoDBClient'] = None
+    
+    @classmethod
+    def configure(cls):
+        """Configure and initialize the singleton DynamoDB client instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+            logger.info("DynamoDB client configured")
+    
+    @classmethod
+    def _get_instance(cls) -> 'DynamoDBClient':
+        """Get the singleton instance, creating it if necessary."""
+        if cls._instance is None:
+            cls.configure()
+        return cls._instance
+    
     @classmethod
     async def add_momentum_trade(
         cls,
@@ -307,426 +513,87 @@ class DynamoDBClient:
         dynamic_stop_loss: Optional[float] = None,
         entry_score: Optional[float] = None,
     ) -> bool:
-        """Add a momentum-based trade to ActiveTickersForAutomatedDayTrader table"""
-        try:
-            cls._ensure_tables()
-            item = {
-                "ticker": ticker,
-                "action": action,
-                "indicator": indicator,
-                "enter_price": cls._convert_to_decimal(enter_price),
-                "enter_reason": enter_reason,
-                "trailing_stop": cls._convert_to_decimal(0.5),  # Initialize to 0.5%
-                "peak_profit_percent": cls._convert_to_decimal(0.0),  # Initialize to 0%
-                "created_at": cls._convert_utc_to_est_isoformat(),  # Store in EST timezone
-            }
-
-            # Add dynamic stop loss if provided
-            if dynamic_stop_loss is not None:
-                item["dynamic_stop_loss"] = cls._convert_to_decimal(dynamic_stop_loss)
-
-            # Add entry score if provided (for Deep Analyzer degradation checks)
-            if entry_score is not None:
-                item["entry_score"] = cls._convert_to_decimal(entry_score)
-
-            # Add technical indicators if provided
-            if technical_indicators_for_enter:
-                item["technical_indicators_for_enter"] = cls._convert_to_decimal(
-                    technical_indicators_for_enter
-                )
-
-            cls._momentum_table.put_item(Item=item)
-            logger.info(f"Added momentum trade to DynamoDB: {ticker} - {action}")
-            return True
-        except Exception as e:
-            logger.error(f"Error adding momentum trade to DynamoDB: {str(e)}")
-            return False
-
+        """
+        Add an active trade to the ActiveTickersForAutomatedDayTrader table.
+        
+        Args:
+            ticker: Stock ticker symbol
+            action: Trade action ("buy_to_open" or "sell_to_open")
+            indicator: Trading indicator name
+            enter_price: Entry price
+            enter_reason: Reason for entering trade
+            technical_indicators_for_enter: Technical indicators at entry
+            dynamic_stop_loss: Dynamic stop loss value
+            entry_score: Entry score (for Deep Analyzer)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        instance = cls._get_instance()
+        
+        item = {
+            'ticker': ticker,
+            'action': action,
+            'indicator': indicator,
+            'enter_price': enter_price,
+            'enter_reason': enter_reason,
+            'technical_indicators_for_enter': technical_indicators_for_enter or {},
+            'dynamic_stop_loss': dynamic_stop_loss or 0.0,
+            'trailing_stop': 0.0,  # Will be updated when activated
+            'peak_profit_percent': 0.0,
+            'created_at': datetime.now(timezone.utc).isoformat()
+        }
+        
+        if entry_score is not None:
+            item['entry_score'] = entry_score
+        
+        return await instance.put_item(
+            table_name='ActiveTickersForAutomatedDayTrader',
+            item=item
+        )
+    
     @classmethod
     async def get_all_momentum_trades(cls, indicator: str) -> List[Dict[str, Any]]:
-        """Get all active momentum trades from ActiveTickersForAutomatedDayTrader table filtered by indicator"""
-        try:
-            cls._ensure_tables()
-            # Use FilterExpression to filter by indicator
-            response = cls._momentum_table.scan(
-                FilterExpression="#ind = :ind",
-                ExpressionAttributeNames={"#ind": "indicator"},
-                ExpressionAttributeValues={":ind": indicator},
-            )
-            trades = []
-            for item in response.get("Items", []):
-                # Convert Decimal back to float
-                converted_item = cls._convert_from_decimal(item)
-                trades.append(converted_item)
-            return trades
-        except Exception as e:
-            logger.error(f"Error getting momentum trades from DynamoDB: {str(e)}")
-            return []
-
+        """
+        Get all active trades for a specific indicator.
+        
+        Args:
+            indicator: Trading indicator name
+            
+        Returns:
+            List of active trade dictionaries
+        """
+        instance = cls._get_instance()
+        
+        # Scan table with filter for indicator (using expression attribute name for reserved keyword)
+        trades = await instance.scan(
+            table_name='ActiveTickersForAutomatedDayTrader',
+            filter_expression='#ind = :indicator',
+            expression_attribute_names={'#ind': 'indicator'},
+            expression_attribute_values={':indicator': indicator}
+        )
+        
+        return trades
+    
     @classmethod
     async def delete_momentum_trade(cls, ticker: str, indicator: str) -> bool:
-        """Delete a momentum trade from ActiveTickersForAutomatedDayTrader table"""
-        try:
-            cls._ensure_tables()
-            # First verify the indicator matches
-            response = cls._momentum_table.get_item(Key={"ticker": ticker})
-            if "Item" not in response:
-                logger.warning(f"Momentum trade not found for ticker: {ticker}")
-                return False
-
-            item_indicator = response["Item"].get("indicator")
-            if item_indicator != indicator:
-                logger.warning(
-                    f"Indicator mismatch for {ticker}: expected {indicator}, got {item_indicator}"
-                )
-                return False
-
-            cls._momentum_table.delete_item(Key={"ticker": ticker})
-            logger.info(
-                f"Deleted momentum trade from DynamoDB: {ticker} (indicator: {indicator})"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting momentum trade from DynamoDB: {str(e)}")
-            return False
-
-    @classmethod
-    async def update_momentum_trade_skip_reason(
-        cls, ticker: str, indicator: str, skipped_exit_reason: str
-    ) -> bool:
-        """Update a momentum trade with skipped exit reason and updated_at timestamp in EST"""
-        try:
-            cls._ensure_tables()
-            # First verify the indicator matches
-            response = cls._momentum_table.get_item(Key={"ticker": ticker})
-            if "Item" not in response:
-                logger.warning(f"Momentum trade not found for ticker: {ticker}")
-                return False
-
-            item_indicator = response["Item"].get("indicator")
-            if item_indicator != indicator:
-                logger.warning(
-                    f"Indicator mismatch for {ticker}: expected {indicator}, got {item_indicator}"
-                )
-                return False
-
-            # Get EST timezone
-            est_tz = pytz.timezone("US/Eastern")
-            # Get current time in EST
-            est_time = datetime.now(est_tz)
-            updated_at = est_time.isoformat()
-
-            update_expression = "SET skipped_exit_reason = :ser, updated_at = :ua"
-            expression_values = {
-                ":ser": skipped_exit_reason,
-                ":ua": updated_at,
-            }
-
-            cls._momentum_table.update_item(
-                Key={"ticker": ticker},
-                UpdateExpression=update_expression,
-                ExpressionAttributeValues=expression_values,
-            )
-            logger.debug(
-                f"Updated momentum trade skip reason for {ticker} (indicator: {indicator}): {skipped_exit_reason}"
-            )
-            return True
-        except Exception as e:
-            logger.error(
-                f"Error updating momentum trade skip reason for {ticker}: {str(e)}"
-            )
-            return False
-
-    @classmethod
-    async def update_momentum_trade_trailing_stop(
-        cls,
-        ticker: str,
-        indicator: str,
-        trailing_stop: float,
-        peak_profit_percent: float,
-        skipped_exit_reason: Optional[str] = None,
-        current_profit_percent: Optional[float] = None,
-    ) -> bool:
-        """Update a momentum trade with trailing stop, peak profit, current profit, and optionally skipped exit reason"""
-        try:
-            cls._ensure_tables()
-            # First verify the indicator matches
-            response = cls._momentum_table.get_item(Key={"ticker": ticker})
-            if "Item" not in response:
-                logger.warning(f"Momentum trade not found for ticker: {ticker}")
-                return False
-
-            item_indicator = response["Item"].get("indicator")
-            if item_indicator != indicator:
-                logger.warning(
-                    f"Indicator mismatch for {ticker}: expected {indicator}, got {item_indicator}"
-                )
-                return False
-
-            # Get EST timezone
-            est_tz = pytz.timezone("US/Eastern")
-            # Get current time in EST
-            est_time = datetime.now(est_tz)
-            updated_at = est_time.isoformat()
-
-            update_expression = (
-                "SET trailing_stop = :ts, peak_profit_percent = :ppp, updated_at = :ua"
-            )
-            expression_values = {
-                ":ts": cls._convert_to_decimal(trailing_stop),
-                ":ppp": cls._convert_to_decimal(peak_profit_percent),
-                ":ua": updated_at,
-            }
-
-            if current_profit_percent is not None:
-                update_expression += ", current_profit_percent = :cpp"
-                expression_values[":cpp"] = cls._convert_to_decimal(current_profit_percent)
-
-            if skipped_exit_reason:
-                update_expression += ", skipped_exit_reason = :ser"
-                expression_values[":ser"] = skipped_exit_reason
-
-            cls._momentum_table.update_item(
-                Key={"ticker": ticker},
-                UpdateExpression=update_expression,
-                ExpressionAttributeValues=expression_values,
-            )
-            logger.debug(
-                f"Updated trailing stop for {ticker} (indicator: {indicator}): {trailing_stop:.2f}%, peak: {peak_profit_percent:.2f}%"
-                f"{f', current: {current_profit_percent:.2f}%' if current_profit_percent is not None else ''}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Error updating trailing stop for {ticker}: {str(e)}")
-            return False
-
-    # Methods for TickerBlackList table
-
-    @classmethod
-    async def get_blacklisted_tickers(cls) -> List[str]:
-        """Get all blacklisted tickers from TickerBlackList table"""
-        try:
-            cls._ensure_tables()
-            response = cls._blacklist_table.scan()
-            blacklisted_tickers = []
-            for item in response.get("Items", []):
-                ticker = item.get("ticker")
-                if ticker:
-                    blacklisted_tickers.append(ticker)
-            logger.debug(f"Found {len(blacklisted_tickers)} blacklisted tickers")
-            return blacklisted_tickers
-        except Exception as e:
-            logger.error(f"Error getting blacklisted tickers from DynamoDB: {str(e)}")
-            return []
-
-    @classmethod
-    async def is_ticker_blacklisted(cls, ticker: str) -> bool:
-        """Check if a ticker is in the blacklist"""
-        try:
-            cls._ensure_tables()
-            response = cls._blacklist_table.get_item(Key={"ticker": ticker})
-            return "Item" in response
-        except Exception as e:
-            logger.error(f"Error checking if ticker {ticker} is blacklisted: {str(e)}")
-            return False
-
-    # Methods for MABForDayTradingService table
-
-    @classmethod
-    async def get_mab_stats(
-        cls, ticker: str, indicator: str
-    ) -> Optional[Dict[str, Any]]:
-        """Get MAB statistics for a ticker and indicator"""
-        try:
-            cls._ensure_tables()
-            response = cls._mab_table.get_item(
-                Key={"ticker": ticker, "indicator": indicator}
-            )
-            if "Item" in response:
-                item = cls._convert_from_decimal(response["Item"])
-                return item
-            return None
-        except Exception as e:
-            logger.error(f"Error getting MAB stats for {ticker}/{indicator}: {str(e)}")
-            return None
-
-    @classmethod
-    async def update_mab_reward(
-        cls,
-        ticker: str,
-        indicator: str,
-        reward: float,
-        context: Optional[Dict[str, Any]] = None,
-    ) -> bool:
         """
-        Update MAB statistics with a reward (profit/loss)
-        reward: positive for profit, negative for loss
+        Delete an active trade from the ActiveTickersForAutomatedDayTrader table.
+        
+        Args:
+            ticker: Stock ticker symbol
+            indicator: Trading indicator name
+            
+        Returns:
+            True if successful, False otherwise
         """
-        try:
-            # Get current stats or initialize
-            current_stats = await cls.get_mab_stats(ticker, indicator)
-
-            # Convert reward to float first (in case it's a numpy type), then to Decimal for calculation
-            reward_float = float(reward)
-
-            # Calculate new statistics
-            # Get current total_rewards as float (it might be Decimal from DB)
-            current_total_rewards = (
-                current_stats.get("total_rewards", 0.0) if current_stats else 0.0
-            )
-            if isinstance(current_total_rewards, Decimal):
-                current_total_rewards = float(current_total_rewards)
-            total_rewards = current_total_rewards + reward_float
-            total_pulls = (
-                current_stats.get("total_pulls", 0) if current_stats else 0
-            ) + 1
-
-            if reward_float > 0:
-                successful_trades = (
-                    current_stats.get("successful_trades", 0) if current_stats else 0
-                ) + 1
-                failed_trades = (
-                    current_stats.get("failed_trades", 0) if current_stats else 0
-                )
-            else:
-                successful_trades = (
-                    current_stats.get("successful_trades", 0) if current_stats else 0
-                )
-                failed_trades = (
-                    current_stats.get("failed_trades", 0) if current_stats else 0
-                ) + 1
-
-            if current_stats is None:
-                # Create new entry with calculated values
-                item = {
-                    "ticker": ticker,
-                    "indicator": indicator,
-                    "total_rewards": cls._convert_to_decimal(total_rewards),
-                    "total_pulls": total_pulls,
-                    "successful_trades": successful_trades,
-                    "failed_trades": failed_trades,
-                    "last_updated": datetime.utcnow().isoformat(),
-                    "daily_reset_date": datetime.utcnow().date().isoformat(),
-                }
-                if context:
-                    context_converted = cls._convert_to_decimal(context)
-                    context_converted = cls._ensure_all_floats_converted(
-                        context_converted
-                    )
-                    item["last_context"] = context_converted
-
-                item = cls._ensure_all_floats_converted(item)
-
-                # Put the new item
-                cls._ensure_tables()
-                cls._mab_table.put_item(Item=item)
-            else:
-                # Update existing item
-                update_expression = "SET total_rewards = :tr, total_pulls = :tp, successful_trades = :st, failed_trades = :ft, last_updated = :lu"
-                expression_values = {
-                    ":tr": cls._convert_to_decimal(total_rewards),
-                    ":tp": total_pulls,
-                    ":st": successful_trades,
-                    ":ft": failed_trades,
-                    ":lu": datetime.utcnow().isoformat(),
-                }
-
-                if context:
-                    context_converted = cls._convert_to_decimal(context)
-                    context_converted = cls._ensure_all_floats_converted(
-                        context_converted
-                    )
-                    update_expression += ", last_context = :lc"
-                    expression_values[":lc"] = context_converted
-
-                expression_values = cls._ensure_all_floats_converted(expression_values)
-
-                cls._ensure_tables()
-                cls._mab_table.update_item(
-                    Key={"ticker": ticker, "indicator": indicator},
-                    UpdateExpression=update_expression,
-                    ExpressionAttributeValues=expression_values,
-                )
-
-            logger.debug(
-                f"Updated MAB stats for {ticker}/{indicator}: reward={reward:.4f}, total_rewards={total_rewards:.4f}, pulls={total_pulls}"
-            )
-            return True
-        except Exception as e:
-            logger.exception(
-                f"Error updating MAB reward for {ticker}/{indicator}: {str(e)}"
-            )
-            return False
-
-    @classmethod
-    async def reset_daily_mab_stats(cls, indicator: str) -> bool:
-        """
-        Reset daily MAB statistics for all tickers with a given indicator
-        This should be called at market open each day
-        """
-        try:
-            today = datetime.utcnow().date().isoformat()
-
-            # Scan all items with the indicator
-            # Note: This is a scan operation, which can be expensive for large tables
-            # In production, consider using GSI or different table design
-            # Use ExpressionAttributeNames because "indicator" is a reserved keyword
-            cls._ensure_tables()
-            response = cls._mab_table.scan(
-                FilterExpression="#ind = :ind",
-                ExpressionAttributeNames={"#ind": "indicator"},
-                ExpressionAttributeValues={":ind": indicator},
-            )
-
-            reset_count = 0
-            for item in response.get("Items", []):
-                ticker = item.get("ticker")
-                daily_reset_date = item.get("daily_reset_date")
-
-                # Only reset if not already reset today
-                if daily_reset_date != today:
-                    cls._mab_table.update_item(
-                        Key={"ticker": ticker, "indicator": indicator},
-                        UpdateExpression="SET daily_reset_date = :drd, daily_rewards = :dr, daily_pulls = :dp, last_updated = :lu",
-                        ExpressionAttributeValues={
-                            ":drd": today,
-                            ":dr": cls._convert_to_decimal(0.0),
-                            ":dp": 0,
-                            ":lu": datetime.utcnow().isoformat(),
-                        },
-                    )
-                    reset_count += 1
-
-            logger.info(
-                f"Reset daily MAB stats for {reset_count} tickers with indicator {indicator}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Error resetting daily MAB stats: {str(e)}")
-            return False
-
-    @classmethod
-    async def get_all_mab_stats_for_indicator(
-        cls, indicator: str
-    ) -> List[Dict[str, Any]]:
-        """Get all MAB statistics for a given indicator"""
-        try:
-            cls._ensure_tables()
-            response = cls._mab_table.scan(
-                FilterExpression="indicator = :ind",
-                ExpressionAttributeValues={":ind": indicator},
-            )
-            stats = []
-            for item in response.get("Items", []):
-                converted_item = cls._convert_from_decimal(item)
-                stats.append(converted_item)
-            return stats
-        except Exception as e:
-            logger.error(f"Error getting MAB stats for indicator {indicator}: {str(e)}")
-            return []
-
-    # Methods for CompletedTradesForAutomatedDayTrading table
-
+        instance = cls._get_instance()
+        
+        return await instance.delete_item(
+            table_name='ActiveTickersForAutomatedDayTrader',
+            key={'ticker': ticker}
+        )
+    
     @classmethod
     async def add_completed_trade(
         cls,
@@ -745,453 +612,153 @@ class DynamoDBClient:
         technical_indicators_for_exit: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
-        Add a completed trade to CompletedTradesForAutomatedDayTrading table
-        Updates overall statistics (profit/loss, counts, etc.)
-        """
-        try:
-            # Prepare the completed trade entry
-            # Convert timestamps from UTC to EST before storing
-            enter_timestamp_est = cls._convert_utc_to_est_isoformat(enter_timestamp)
-            exit_timestamp_est = cls._convert_utc_to_est_isoformat(exit_timestamp)
+        Add a completed trade to the CompletedTradesForMarketData table.
+        
+        Args:
+            date: Trade date (yyyy-mm-dd)
+            indicator: Trading indicator name
+            ticker: Stock ticker symbol
+            action: Trade action
+            enter_price: Entry price
+            enter_reason: Entry reason
+            enter_timestamp: Entry timestamp (ISO format UTC)
+            exit_price: Exit price
+            exit_timestamp: Exit timestamp (ISO format UTC)
+            exit_reason: Exit reason
+            profit_or_loss: Profit or loss amount
+            technical_indicators_for_enter: Technical indicators at entry
+            technical_indicators_for_exit: Technical indicators at exit
             
-            completed_trade = {
-                "ticker": ticker,
-                "action": action.upper(),  # Ensure uppercase (BUY_TO_OPEN, SELL_TO_OPEN)
-                "enter_price": cls._convert_to_decimal(enter_price),
-                "enter_reason": enter_reason,
-                "enter_timestamp": enter_timestamp_est,  # Store in EST timezone
-                "exit_price": cls._convert_to_decimal(exit_price),
-                "exit_timestamp": exit_timestamp_est,  # Store in EST timezone
-                "exit_reason": exit_reason,
-                "profit_or_loss": cls._convert_to_decimal(profit_or_loss),
-                "technical_indicators_for_enter": cls._convert_to_decimal(
-                    technical_indicators_for_enter or {}
-                ),
-                "technical_indicators_for_exit": cls._convert_to_decimal(
-                    technical_indicators_for_exit or {}
-                ),
-            }
-
-            # Ensure all floats are converted
-            completed_trade = cls._ensure_all_floats_converted(completed_trade)
-
-            # Try to get existing item
-            try:
-                cls._ensure_tables()
-                response = cls._completed_trades_table.get_item(
-                    Key={"date": date, "indicator": indicator}
-                )
-                existing_item = response.get("Item")
-            except Exception as e:
-                logger.warning(
-                    f"Error getting existing completed trades item: {str(e)}"
-                )
-                existing_item = None
-
-            if existing_item:
-                # Update existing item
-                # Convert existing item from Decimal to native types
-                existing_item = cls._convert_from_decimal(existing_item)
-
-                # Get current values
-                completed_trades_list = existing_item.get("completed_trades", [])
-                overall_profit_loss = existing_item.get("overall_profit_loss", 0.0)
-                completed_trade_count = existing_item.get("completed_trade_count", 0)
-                overall_profit_loss_long = existing_item.get(
-                    "overall_profit_loss_long", 0.0
-                )
-                overall_profit_loss_short = existing_item.get(
-                    "overall_profit_loss_short", 0.0
-                )
-
-                # Add new trade to list
-                # Note: completed_trades_list items may need conversion, but we'll convert the whole list when writing
-                completed_trades_list.append(completed_trade)
-
-                # Convert the entire list to ensure all values are properly formatted
-                completed_trades_list = cls._convert_to_decimal(completed_trades_list)
-
-                # Update statistics
-                new_overall_profit_loss = overall_profit_loss + float(profit_or_loss)
-                new_completed_trade_count = completed_trade_count + 1
-
-                # Update long/short profit based on action
-                if action.upper() == "BUY_TO_OPEN":
-                    new_overall_profit_loss_long = overall_profit_loss_long + float(
-                        profit_or_loss
-                    )
-                    new_overall_profit_loss_short = overall_profit_loss_short
-                elif action.upper() == "SELL_TO_OPEN":
-                    new_overall_profit_loss_long = overall_profit_loss_long
-                    new_overall_profit_loss_short = overall_profit_loss_short + float(
-                        profit_or_loss
-                    )
-                else:
-                    # Unknown action, don't update long/short
-                    new_overall_profit_loss_long = overall_profit_loss_long
-                    new_overall_profit_loss_short = overall_profit_loss_short
-
-                expression_values = {
-                    ":ct": completed_trades_list,
-                    ":opl": cls._convert_to_decimal(new_overall_profit_loss),
-                    ":ctc": new_completed_trade_count,
-                    ":opll": cls._convert_to_decimal(new_overall_profit_loss_long),
-                    ":opls": cls._convert_to_decimal(new_overall_profit_loss_short),
-                }
-                expression_values = cls._ensure_all_floats_converted(expression_values)
-
-                # Update item
-                cls._completed_trades_table.update_item(
-                    Key={"date": date, "indicator": indicator},
-                    UpdateExpression=(
-                        "SET completed_trades = :ct, "
-                        "overall_profit_loss = :opl, "
-                        "completed_trade_count = :ctc, "
-                        "overall_profit_loss_long = :opll, "
-                        "overall_profit_loss_short = :opls"
-                    ),
-                    ExpressionAttributeValues=expression_values,
-                )
-            else:
-                # Create new item
-                # Determine initial long/short profit
-                initial_profit_loss_long = (
-                    float(profit_or_loss) if action.upper() == "BUY_TO_OPEN" else 0.0
-                )
-                initial_profit_loss_short = (
-                    float(profit_or_loss) if action.upper() == "SELL_TO_OPEN" else 0.0
-                )
-
-                new_item = {
-                    "date": date,
-                    "indicator": indicator,
-                    "completed_trades": [completed_trade],
-                    "overall_profit_loss": cls._convert_to_decimal(profit_or_loss),
-                    "completed_trade_count": 1,
-                    "overall_profit_loss_long": cls._convert_to_decimal(
-                        initial_profit_loss_long
-                    ),
-                    "overall_profit_loss_short": cls._convert_to_decimal(
-                        initial_profit_loss_short
-                    ),
-                }
-
-                # Ensure all floats are converted
-                new_item = cls._ensure_all_floats_converted(new_item)
-
-                cls._completed_trades_table.put_item(Item=new_item)
-
-            logger.info(
-                f"Added completed trade for {ticker} to CompletedTradesForAutomatedDayTrading "
-                f"(date: {date}, indicator: {indicator}, profit/loss: {profit_or_loss:.2f})"
-            )
-            return True
-        except Exception as e:
-            logger.exception(
-                f"Error adding completed trade for {ticker} to CompletedTradesForAutomatedDayTrading: {str(e)}"
-            )
-            return False
-
+        Returns:
+            True if successful, False otherwise
+        """
+        instance = cls._get_instance()
+        
+        item = {
+            'date': date,
+            'ticker_indicator': f"{ticker}#{indicator}",  # Sort key
+            'ticker': ticker,
+            'indicator': indicator,
+            'action': action,
+            'enter_price': enter_price,
+            'enter_reason': enter_reason,
+            'enter_timestamp': enter_timestamp,
+            'exit_price': exit_price,
+            'exit_timestamp': exit_timestamp,
+            'exit_reason': exit_reason,
+            'profit_or_loss': profit_or_loss,
+            'technical_indicators_for_enter': technical_indicators_for_enter or {},
+            'technical_indicators_for_exit': technical_indicators_for_exit or {}
+        }
+        
+        return await instance.put_item(
+            table_name='CompletedTradesForMarketData',
+            item=item
+        )
+    
     @classmethod
     async def get_completed_trade_count(cls, date: str, indicator: str) -> int:
         """
-        Get the count of completed trades for a specific date and indicator
-
+        Get the count of completed trades for a specific date and indicator.
+        
         Args:
-            date: Date in yyyy-mm-dd format
-            indicator: Indicator name
-
+            date: Trade date (yyyy-mm-dd)
+            indicator: Trading indicator name
+            
         Returns:
-            Number of completed trades (0 if not found or error)
+            Number of completed trades
         """
-        try:
-            cls._ensure_tables()
-            response = cls._completed_trades_table.get_item(
-                Key={"date": date, "indicator": indicator}
-            )
-            item = response.get("Item")
-            if item:
-                count = item.get("completed_trade_count", 0)
-                return int(count) if count else 0
-            return 0
-        except Exception as e:
-            logger.error(
-                f"Error getting completed trade count for {date}/{indicator}: {str(e)}"
-            )
-            return 0
-
+        instance = cls._get_instance()
+        
+        # Query by date partition key and filter by indicator
+        trades = await instance.query(
+            table_name='CompletedTradesForMarketData',
+            key_condition_expression='#date = :date',
+            expression_attribute_names={'#date': 'date'},
+            expression_attribute_values={':date': date}
+        )
+        
+        # Filter by indicator
+        indicator_trades = [t for t in trades if t.get('indicator') == indicator]
+        
+        return len(indicator_trades)
+    
     @classmethod
-    async def ticker_exists_in_inactive(cls, ticker: str) -> bool:
-        """
-        Check if a ticker exists in InactiveTickers table
-
-        Args:
-            ticker: Ticker symbol
-
-        Returns:
-            True if ticker exists, False otherwise
-        """
-        try:
-            cls._ensure_tables()
-            response = cls._inactive_tickers_table.get_item(
-                Key={"ticker": ticker},
-            )
-            return response.get("Item") is not None
-        except Exception as e:
-            logger.error(f"Error checking ticker in InactiveTickers: {str(e)}")
-            return False
-
-    @classmethod
-    async def batch_check_tickers_exist_in_inactive(
-        cls, tickers: List[str]
-    ) -> Dict[str, bool]:
-        """
-        Batch check if multiple tickers exist in InactiveTickers table using parallel async calls
-
-        Args:
-            tickers: List of ticker symbols to check
-
-        Returns:
-            Dict mapping ticker -> exists (True/False)
-        """
-        if not tickers:
-            return {}
-
-        try:
-            # Use asyncio.gather to check all tickers in parallel
-            import asyncio
-
-            tasks = [cls.ticker_exists_in_inactive(ticker) for ticker in tickers]
-            results = await asyncio.gather(*tasks)
-
-            return dict(zip(tickers, results))
-        except Exception as e:
-            logger.error(f"Error batch checking tickers in InactiveTickers: {str(e)}")
-            # Fallback to individual checks
-            result = {}
-            for ticker in tickers:
-                result[ticker] = await cls.ticker_exists_in_inactive(ticker)
-            return result
-
-    @classmethod
-    async def add_ticker_to_inactive(
-        cls,
-        ticker: str,
-        reason: str = "Auto-added from Alpaca screener (most actives/movers)",
-    ) -> bool:
-        """
-        Add a ticker to InactiveTickers table if it doesn't exist
-
-        Args:
-            ticker: Ticker symbol
-            reason: Reason for adding the ticker
-
-        Returns:
-            True if ticker was added, False if it already exists or error occurred
-        """
-        try:
-            # Check if ticker already exists
-            if await cls.ticker_exists_in_inactive(ticker):
-                logger.debug(
-                    f"Ticker {ticker.upper()} already exists in InactiveTickers"
-                )
-                return False
-
-            # Add ticker with minimal structure
-            # Set TTL to 30 days from now (optional, can be removed if TTL not needed)
-            from datetime import datetime, timedelta
-
-            # Use EST timezone for timestamps (NYSE trading timezone)
-            est_tz = pytz.timezone("America/New_York")
-            last_updated_est = datetime.now(est_tz).isoformat()
-            ttl_timestamp = int((datetime.now(est_tz) + timedelta(days=30)).timestamp())
-
-            item = {
-                "ticker": ticker,
-                "reason": reason,
-                "last_updated": last_updated_est,
-                "ttl": ttl_timestamp,
-                # Add minimal details structure to match expected format
-                "details": {
-                    "checks": {},
-                    "conditions_met": "0/5",
-                    "trend_analysis": {  # noqa: C0301
-                        "description": "Auto-added from screener",
-                        "favorable": False,
-                        "strength": 0.0,
-                    },  # noqa: C0301
-                },
-            }
-
-            item = cls._ensure_all_floats_converted(item)
-
-            cls._ensure_tables()
-            cls._inactive_tickers_table.put_item(Item=item)
-            logger.debug(f"Added ticker {ticker} to InactiveTickers: {reason}")
-            return True
-        except Exception as e:
-            logger.error(f"Error adding ticker to InactiveTickers: {str(e)}")
-            return False
-
-    @classmethod
-    async def get_all_inactive_tickers(cls) -> List[str]:
-        """Get all inactive tickers from InactiveTickers table"""
-        try:
-            cls._ensure_tables()
-            response = cls._inactive_tickers_table.scan()
-            tickers = [
-                item.get("ticker")
-                for item in response.get("Items", [])
-                if item.get("ticker")
-            ]
-            return tickers
-        except Exception as e:
-            logger.error(f"Error getting all inactive tickers from DynamoDB: {str(e)}")
-            return []
-
-    @classmethod
-    async def log_inactive_ticker_reason(
+    async def log_inactive_ticker(
         cls,
         ticker: str,
         indicator: str,
-        reason_not_to_enter_long: Optional[str] = None,
-        reason_not_to_enter_short: Optional[str] = None,
-        technical_indicators: Optional[Dict[str, Any]] = None,
-        is_shortable: Optional[bool] = None,
+        reason_not_to_enter_long: str,
+        reason_not_to_enter_short: str,
+        technical_indicators: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
-        Log why a ticker is not entering a trade in InactiveTickersForDayTrading table
-
+        Log an inactive ticker (evaluated but not traded) to InactiveTickersForDayTrading table.
+        
         Args:
-            ticker: Ticker symbol (partition key)
-            indicator: Indicator name (sort key)
+            ticker: Stock ticker symbol
+            indicator: Trading indicator name
             reason_not_to_enter_long: Reason for not entering long position
             reason_not_to_enter_short: Reason for not entering short position
-            technical_indicators: Technical indicators data
-
+            technical_indicators: Technical indicators at evaluation time
+            
         Returns:
-            True if logged successfully, False otherwise
+            True if successful, False otherwise
         """
-        try:
-            cls._ensure_tables()
-
-            # Use EST timezone for timestamps (NYSE trading timezone)
-            est_tz = pytz.timezone("America/New_York")
-            last_updated_est = datetime.now(est_tz).isoformat()
-
-            item = {
-                "ticker": ticker,
-                "indicator": indicator,
-                "last_updated": last_updated_est,
-            }
-
-            if reason_not_to_enter_long is not None:
-                item["reason_not_to_enter_long"] = reason_not_to_enter_long
-
-            if reason_not_to_enter_short is not None:
-                item["reason_not_to_enter_short"] = reason_not_to_enter_short
-
-            if technical_indicators:
-                # Convert technical indicators, removing datetime_price if present
-                tech_indicators_clean = {
-                    k: v
-                    for k, v in technical_indicators.items()
-                    if k != "datetime_price"
-                }
-                item["technical_indicators"] = tech_indicators_clean
-
-            if is_shortable is not None:
-                item["is_shortable"] = is_shortable
-
-            item = cls._ensure_all_floats_converted(item)
-
-            cls._inactive_tickers_for_day_trading_table.put_item(Item=item)
-            logger.debug(
-                f"Logged inactive ticker reason for {ticker} ({indicator}): "
-                f"long={reason_not_to_enter_long}, short={reason_not_to_enter_short}"
-            )
-            return True
-        except Exception as e:
-            logger.error(
-                f"Error logging inactive ticker reason for {ticker} ({indicator}): {str(e)}"
-            )
-            return False
-
-    @classmethod
-    async def get_ticker_shortability_from_db(
-        cls, ticker: str, indicator: str
-    ) -> Optional[bool]:
-        """
-        Get is_shortable value from InactiveTickersForDayTrading table.
-
-        Args:
-            ticker: Ticker symbol
-            indicator: Indicator name
-
-        Returns:
-            is_shortable value if found, None otherwise
-        """
-        try:
-            cls._ensure_tables()
-            response = cls._inactive_tickers_for_day_trading_table.get_item(
-                Key={"ticker": ticker, "indicator": indicator}
-            )
-            item = response.get("Item")
-            if item:
-                is_shortable = item.get("is_shortable")
-                if is_shortable is not None:
-                    return bool(is_shortable)
-            return None
-        except Exception as e:
-            logger.debug(
-                f"Error getting is_shortable from DB for {ticker} ({indicator}): {str(e)}"
-            )
-            return None
-
+        instance = cls._get_instance()
+        
+        timestamp = datetime.now(timezone.utc).isoformat()
+        
+        item = {
+            'ticker': ticker,
+            'timestamp': timestamp,
+            'indicator': indicator,
+            'reason_not_to_enter_long': reason_not_to_enter_long,
+            'reason_not_to_enter_short': reason_not_to_enter_short,
+            'technical_indicators': technical_indicators or {}
+        }
+        
+        return await instance.put_item(
+            table_name='InactiveTickersForDayTrading',
+            item=item
+        )
+    
     @classmethod
     async def get_inactive_tickers_for_indicator(
-        cls, indicator: str, minutes_window: int = 5
+        cls,
+        indicator: str,
+        minutes_window: int = 5
     ) -> List[Dict[str, Any]]:
         """
-        Get inactive tickers for a specific indicator within the last N minutes
-
+        Get inactive tickers for a specific indicator from the last N minutes.
+        
         Args:
-            indicator: Indicator name
-            minutes_window: Number of minutes to look back (default: 5)
-
+            indicator: Trading indicator name
+            minutes_window: Time window in minutes (default: 5)
+            
         Returns:
-            List of inactive ticker records
+            List of inactive ticker dictionaries
         """
-        try:
-            cls._ensure_tables()
-
-            # Calculate cutoff time
-            cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=minutes_window)
-            cutoff_iso = cutoff_time.isoformat()
-
-            # Scan table and filter by indicator and time
-            response = cls._inactive_tickers_for_day_trading_table.scan(
-                FilterExpression="#ind = :ind AND #lu >= :cutoff",
-                ExpressionAttributeNames={
-                    "#ind": "indicator",
-                    "#lu": "last_updated",
-                },
-                ExpressionAttributeValues={
-                    ":ind": indicator,
-                    ":cutoff": cutoff_iso,
-                },
-            )
-
-            items = []
-            for item in response.get("Items", []):
-                converted_item = cls._convert_from_decimal(item)
-                items.append(converted_item)
-
-            return items
-        except Exception as e:
-            logger.error(f"Error getting inactive tickers for {indicator}: {str(e)}")
-            return []
-
+        instance = cls._get_instance()
+        
+        # Calculate the timestamp for N minutes ago
+        from datetime import timedelta
+        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=minutes_window)
+        cutoff_timestamp = cutoff_time.isoformat()
+        
+        # Scan table with filter for indicator and timestamp (using expression attribute names for reserved keywords)
+        inactive_tickers = await instance.scan(
+            table_name='InactiveTickersForDayTrading',
+            filter_expression='#ind = :indicator AND #ts >= :cutoff',
+            expression_attribute_names={'#ind': 'indicator', '#ts': 'timestamp'},
+            expression_attribute_values={
+                ':indicator': indicator,
+                ':cutoff': cutoff_timestamp
+            }
+        )
+        
+        return inactive_tickers
+    
     @classmethod
     async def store_day_trader_event(
         cls,
@@ -1200,56 +767,40 @@ class DynamoDBClient:
         threshold_change: Dict[str, Any],
         max_long_trades: int,
         max_short_trades: int,
-        llm_response: Optional[str] = None,
+        llm_response: str
     ) -> bool:
         """
-        Store a day trader event (LLM threshold adjustment) in DayTraderEvents table
-
+        Store a threshold adjustment event in the DayTraderEvents table.
+        
         Args:
-            date: Date in yyyy-mm-dd format (partition key)
-            indicator: Indicator name (sort key)
-            threshold_change: Dictionary of threshold changes
-            max_long_trades: Maximum long trades
-            max_short_trades: Maximum short trades
-            llm_response: Optional LLM response text
-
+            date: Event date (yyyy-mm-dd)
+            indicator: Trading indicator name
+            threshold_change: Dictionary of threshold changes (old and new values)
+            max_long_trades: Recommended max long trades
+            max_short_trades: Recommended max short trades
+            llm_response: Full LLM response text
+            
         Returns:
-            True if stored successfully, False otherwise
+            True if successful, False otherwise
         """
-        try:
-            cls._ensure_tables()
-
-            est_tz = pytz.timezone("America/New_York")
-            last_updated_est = datetime.now(est_tz).isoformat()
-
-            item = {
-                "date": date,
-                "indicator": indicator,
-                "last_updated": last_updated_est,
-                "threshold_change": cls._convert_to_decimal(threshold_change),
-                "max_long_trades": max_long_trades,
-                "max_short_trades": max_short_trades,
-            }
-
-            if llm_response:
-                item["llm_response"] = llm_response
-
-            item = cls._ensure_all_floats_converted(item)
-
-            cls._day_trader_events_table.put_item(Item=item)
-            logger.info(
-                f"✅ Stored day trader event in DayTraderEvents table: "
-                f"date={date}, indicator={indicator}, "
-                f"max_long={max_long_trades}, max_short={max_short_trades}, "
-                f"threshold_changes={len(threshold_change) if threshold_change else 0}"
-            )
-            return True
-        except Exception as e:
-            logger.error(
-                f"❌ Error storing day trader event for {indicator} on {date}: {str(e)}",
-                exc_info=True,
-            )
-            logger.error(
-                f"Item that failed to store: {json.dumps(item, default=str)[:500]}"
-            )
-            return False
+        instance = cls._get_instance()
+        
+        # Get current time in EST for last_updated
+        from datetime import timezone as tz
+        from zoneinfo import ZoneInfo
+        est_time = datetime.now(ZoneInfo('America/New_York')).isoformat()
+        
+        item = {
+            'date': date,
+            'indicator': indicator,
+            'last_updated': est_time,
+            'threshold_change': threshold_change,
+            'max_long_trades': max_long_trades,
+            'max_short_trades': max_short_trades,
+            'llm_response': llm_response
+        }
+        
+        return await instance.put_item(
+            table_name='DayTraderEvents',
+            item=item
+        )
