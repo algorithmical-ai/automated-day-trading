@@ -553,7 +553,7 @@ class AlpacaClient:
                         # Handle 429 rate limit with retry
                         if response.status == 429:
                             if attempt < max_retries - 1:
-                                logger.warning(
+                                logger.debug(
                                     f"Alpaca clock API rate limited (429). Retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})"
                                 )
                                 await asyncio.sleep(retry_delay)
