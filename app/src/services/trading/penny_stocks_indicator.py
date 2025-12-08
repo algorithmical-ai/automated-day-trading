@@ -712,16 +712,26 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         # Batch write all inactive ticker reasons
         if inactive_ticker_logs:
+            logger.debug(f"Logging {len(inactive_ticker_logs)} inactive tickers to DynamoDB")
 
             async def log_one(log_data):
-                await DynamoDBClient.log_inactive_ticker_reason(**log_data)
+                try:
+                    result = await DynamoDBClient.log_inactive_ticker_reason(**log_data)
+                    if not result:
+                        logger.debug(f"Failed to log inactive ticker {log_data.get('ticker')}")
+                    return result
+                except Exception as e:
+                    logger.error(f"Error logging inactive ticker {log_data.get('ticker')}: {str(e)}")
+                    return False
 
             batch_size = 20
             for i in range(0, len(inactive_ticker_logs), batch_size):
                 batch = inactive_ticker_logs[i : i + batch_size]
-                await asyncio.gather(
+                results = await asyncio.gather(
                     *[log_one(log_data) for log_data in batch], return_exceptions=True
                 )
+                successful = sum(1 for r in results if r is True)
+                logger.debug(f"Batch {i//batch_size + 1}: {successful}/{len(batch)} inactive tickers logged successfully")
 
         logger.info(
             f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers "
