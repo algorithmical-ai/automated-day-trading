@@ -362,7 +362,7 @@ class MarketDataService:
                         "is_golden": is_golden,
                         "golden_reason": golden_reason if is_golden else "",
                         "trend_check": trend_check,
-                        "indicators": indicators,
+                        "indicators": indicators.to_dict(),
                     },
                     "message": f"{ticker} is not in an upward trend",
                 }
@@ -386,7 +386,7 @@ class MarketDataService:
                             "entry_score": entry_score,
                             "is_golden": is_golden,
                             "trend_check": trend_check,
-                            "indicators": indicators,
+                            "indicators": indicators.to_dict(),
                         },
                         "message": f"EMA crossover too weak: {ema_diff_pct:.3f}% (minimum {cls._min_ema_crossover_pct:.1f}% required)",
                     }
@@ -402,7 +402,7 @@ class MarketDataService:
                         "entry_score": entry_score,
                         "is_golden": is_golden,
                         "trend_check": trend_check,
-                        "indicators": indicators,
+                        "indicators": indicators.to_dict(),
                     },
                     "message": f"RSI {indicators.rsi:.1f} too low for long entry (minimum 40)",
                 }
@@ -416,7 +416,7 @@ class MarketDataService:
                         "entry_score": entry_score,
                         "is_golden": is_golden,
                         "trend_check": trend_check,
-                        "indicators": indicators,
+                        "indicators": indicators.to_dict(),
                     },
                     "message": f"RSI {indicators.rsi:.1f} too high for long entry (maximum 65)",
                 }
@@ -433,7 +433,7 @@ class MarketDataService:
                         "entry_score": entry_score,
                         "is_golden": is_golden,
                         "trend_check": trend_check,
-                        "indicators": indicators,
+                        "indicators": indicators.to_dict(),
                     },
                     "message": f"ADX {indicators.adx:.2f} below minimum {min_adx:.2f} required",
                 }
@@ -456,7 +456,7 @@ class MarketDataService:
                             "entry_score": entry_score,
                             "is_golden": is_golden,
                             "trend_check": trend_check,
-                            "indicators": indicators,
+                            "indicators": indicators.to_dict(),
                         },
                         "message": f"Volume ratio {volume_ratio:.2f}x below minimum {min_volume:.2f}x",
                     }
@@ -481,7 +481,7 @@ class MarketDataService:
                             "entry_score": entry_score,
                             "is_golden": is_golden,
                             "trend_check": trend_check,
-                            "indicators": indicators,
+                            "indicators": indicators.to_dict(),
                         },
                         "message": f"Price deviation from VWAP is {abs(vwap_diff_pct):.2f}% which exceeds {max_deviation:.2f}%",
                     }
@@ -495,7 +495,7 @@ class MarketDataService:
                             "entry_score": entry_score,
                             "is_golden": is_golden,
                             "trend_check": trend_check,
-                            "indicators": indicators,
+                            "indicators": indicators.to_dict(),
                         },
                         "message": f"Fast EMA {indicators.ema_fast:.2f} below VWAP {indicators.vwap:.2f}",
                     }
@@ -515,7 +515,7 @@ class MarketDataService:
                                 "entry_score": entry_score,
                                 "is_golden": is_golden,
                                 "trend_check": trend_check,
-                                "indicators": indicators,
+                                "indicators": indicators.to_dict(),
                             },
                             "message": f"Price is {vwap_diff_pct:.2f}% above VWAP which exceeds allowed premium of {max_premium:.2f}%",
                         }
@@ -533,7 +533,7 @@ class MarketDataService:
                         "is_golden": is_golden,
                         "golden_reason": golden_reason if is_golden else "",
                         "trend_check": trend_check,
-                        "indicators": indicators,
+                        "indicators": indicators.to_dict(),
                     },
                     "message": f"{ticker} is not in a downward trend",
                 }
@@ -557,7 +557,7 @@ class MarketDataService:
                             "entry_score": entry_score,
                             "is_golden": is_golden,
                             "trend_check": trend_check,
-                            "indicators": indicators,
+                            "indicators": indicators.to_dict(),
                         },
                         "message": f"EMA crossover too weak: {ema_diff_pct:.3f}% (minimum {cls._min_ema_crossover_pct:.1f}% required)",
                     }
@@ -573,7 +573,7 @@ class MarketDataService:
                         "entry_score": entry_score,
                         "is_golden": is_golden,
                         "trend_check": trend_check,
-                        "indicators": indicators,
+                        "indicators": indicators.to_dict(),
                     },
                     "message": f"RSI {indicators.rsi:.1f} too high for short entry (maximum 60)",
                 }
@@ -587,7 +587,7 @@ class MarketDataService:
                         "entry_score": entry_score,
                         "is_golden": is_golden,
                         "trend_check": trend_check,
-                        "indicators": indicators,
+                        "indicators": indicators.to_dict(),
                     },
                     "message": f"RSI {indicators.rsi:.1f} too low for short entry (minimum 35)",
                 }
@@ -604,7 +604,7 @@ class MarketDataService:
                         "entry_score": entry_score,
                         "is_golden": is_golden,
                         "trend_check": trend_check,
-                        "indicators": indicators,
+                        "indicators": indicators.to_dict(),
                     },
                     "message": f"ADX {indicators.adx:.2f} below minimum {min_adx:.2f} required",
                 }
@@ -627,7 +627,7 @@ class MarketDataService:
                             "entry_score": entry_score,
                             "is_golden": is_golden,
                             "trend_check": trend_check,
-                            "indicators": indicators,
+                            "indicators": indicators.to_dict(),
                         },
                         "message": f"Volume ratio {volume_ratio:.2f}x below minimum {min_volume:.2f}x",
                     }
@@ -652,7 +652,7 @@ class MarketDataService:
                             "entry_score": entry_score,
                             "is_golden": is_golden,
                             "trend_check": trend_check,
-                            "indicators": indicators,
+                            "indicators": indicators.to_dict(),
                         },
                         "message": f"Price deviation from VWAP is {abs(vwap_diff_pct):.2f}% which exceeds {max_deviation:.2f}%",
                     }
@@ -666,7 +666,7 @@ class MarketDataService:
                             "entry_score": entry_score,
                             "is_golden": is_golden,
                             "trend_check": trend_check,
-                            "indicators": indicators,
+                            "indicators": indicators.to_dict(),
                         },
                         "message": f"Price is {vwap_diff_pct:.2f}% below VWAP which exceeds allowed deviation",
                     }
@@ -688,7 +688,7 @@ class MarketDataService:
                     "is_golden": is_golden,
                     "golden_reason": golden_reason if is_golden else "",
                     "trend_check": trend_check,
-                    "indicators": indicators,
+                    "indicators": indicators.to_dict(),
                 },
                 "message": f"Entry score {entry_score:.2f} below threshold {threshold:.2f}",
             }
@@ -706,7 +706,7 @@ class MarketDataService:
                 "ticker": ticker,
                 "entry_score": entry_score,
                 "portfolio_allocation": portfolio_allocation,
-                "indicators": indicators,
+                "indicators": indicators.to_dict(),
                 "is_golden": is_golden,
                 "golden_reason": golden_reason if is_golden else "",
             },
@@ -1521,13 +1521,7 @@ class MarketDataService:
                 "enter_price": round(enter_price, 2),
                 "stop_loss_price": round(stop_loss_price, 2),
                 "stop_loss_pct": round(stop_loss_pct * 100, 1),
-                "indicators": {
-                    "rsi": round(indicators.rsi, 2),
-                    "adx": round(indicators.adx, 2),
-                    "macd_histogram": round(indicators.macd[2], 4),
-                    "ema_fast": round(indicators.ema_fast, 2),
-                    "ema_slow": round(indicators.ema_slow, 2),
-                },
+                "indicators": indicators.to_dict(),
                 "error": False,
             }
 
