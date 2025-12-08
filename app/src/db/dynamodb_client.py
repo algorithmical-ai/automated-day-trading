@@ -7,6 +7,7 @@ import json
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 import aioboto3
 from botocore.exceptions import ClientError, BotoCoreError
 from loguru import logger
@@ -797,7 +798,7 @@ class DynamoDBClient:
         """
         instance = cls._get_instance()
         
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(ZoneInfo('America/New_York')).isoformat()
         
         # Convert technical_indicators to JSON string to avoid DynamoDB type issues
         tech_indicators_json = json.dumps(technical_indicators or {}, default=str)
@@ -867,7 +868,7 @@ class DynamoDBClient:
         
         # Calculate the timestamp for N minutes ago
         from datetime import timedelta
-        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=minutes_window)
+        cutoff_time = datetime.now(ZoneInfo('America/New_York')) - timedelta(minutes=minutes_window)
         cutoff_timestamp = cutoff_time.isoformat()
         
         # Query table by indicator (sort key) with timestamp filter

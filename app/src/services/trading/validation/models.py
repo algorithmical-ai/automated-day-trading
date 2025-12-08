@@ -7,6 +7,7 @@ This module defines the core data structures used throughout the validation pipe
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 
 @dataclass
@@ -149,7 +150,7 @@ class RejectionRecord:
     reason_not_to_enter_long: Optional[str] = None
     reason_not_to_enter_short: Optional[str] = None
     technical_indicators: Optional[Dict[str, Any]] = None
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(ZoneInfo('America/New_York')).isoformat())
     
     def __str__(self) -> str:
         return (
@@ -202,5 +203,5 @@ class RejectionRecord:
             reason_not_to_enter_long=data.get("reason_not_to_enter_long"),
             reason_not_to_enter_short=data.get("reason_not_to_enter_short"),
             technical_indicators=data.get("technical_indicators"),
-            timestamp=data.get("timestamp", datetime.now(timezone.utc).isoformat())
+            timestamp=data.get("timestamp", datetime.now(ZoneInfo('America/New_York')).isoformat())
         )

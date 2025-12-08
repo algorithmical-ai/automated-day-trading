@@ -7,6 +7,7 @@ an entry cycle for batch writing to the database.
 
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from app.src.services.trading.validation.models import RejectionRecord
 
 
@@ -60,7 +61,7 @@ class RejectionCollector:
             reason_not_to_enter_long=reason_long,
             reason_not_to_enter_short=reason_short,
             technical_indicators=technical_indicators,
-            timestamp=datetime.now(timezone.utc).isoformat()
+            timestamp=datetime.now(ZoneInfo('America/New_York')).isoformat()
         )
         
         # Add to internal list

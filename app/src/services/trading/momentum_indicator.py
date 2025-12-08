@@ -1333,8 +1333,8 @@ class MomentumIndicator(BaseTradingIndicator):
             if not passes_filter:
                 stats["failed_quality_filters"] += 1
                 logger.debug(f"Skipping {ticker}: {filter_reason}")
-                # Log at INFO level for better visibility of why trades aren't happening
-                logger.info(
+                # Log at Debug level for better visibility of why trades aren't happening
+                logger.debug(
                     f"❌ {ticker} failed quality filter: {filter_reason} "
                     f"(momentum: {momentum_score:.2f}%)"
                 )
