@@ -70,9 +70,12 @@ class DynamoDBClient:
             True if successful, False otherwise
         """
         try:
+            # Convert floats to Decimals for DynamoDB compatibility
+            converted_item = _convert_floats_to_decimals(item)
+            
             async with self.session.resource('dynamodb') as dynamodb:
                 table = await dynamodb.Table(table_name)
-                await table.put_item(Item=item)
+                await table.put_item(Item=converted_item)
             
             logger.debug(
                 f"DynamoDB put_item successful",
@@ -731,16 +734,13 @@ class DynamoDBClient:
         
         timestamp = datetime.now(timezone.utc).isoformat()
         
-        # Convert technical_indicators to use Decimals instead of floats
-        tech_indicators = _convert_floats_to_decimals(technical_indicators or {})
-        
         item = {
             'ticker': ticker,
             'indicator': indicator,
             'timestamp': timestamp,
             'reason_not_to_enter_long': reason_not_to_enter_long,
             'reason_not_to_enter_short': reason_not_to_enter_short,
-            'technical_indicators': tech_indicators
+            'technical_indicators': technical_indicators or {}
         }
         
         return await instance.put_item(
