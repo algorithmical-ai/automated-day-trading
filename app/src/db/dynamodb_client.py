@@ -3,6 +3,7 @@ DynamoDB client for automated day trading application.
 Provides async operations for data persistence with error handling and logging.
 """
 import os
+import json
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -734,13 +735,16 @@ class DynamoDBClient:
         
         timestamp = datetime.now(timezone.utc).isoformat()
         
+        # Convert technical_indicators to JSON string to avoid DynamoDB type issues
+        tech_indicators_json = json.dumps(technical_indicators or {}, default=str)
+        
         item = {
             'ticker': ticker,
             'indicator': indicator,
             'timestamp': timestamp,
             'reason_not_to_enter_long': reason_not_to_enter_long,
             'reason_not_to_enter_short': reason_not_to_enter_short,
-            'technical_indicators': technical_indicators or {}
+            'technical_indicators': tech_indicators_json
         }
         
         return await instance.put_item(
