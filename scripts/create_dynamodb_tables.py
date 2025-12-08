@@ -68,15 +68,18 @@ def main():
         tables_failed += 1
     
     # 2. CompletedTradesForAutomatedDayTrading
+    # Stores aggregated completed trades per date+indicator
+    # Schema: date (partition key), indicator (sort key)
+    # Each record contains: completed_trades (list), completed_trade_count, overall_profit_loss, etc.
     if create_table_if_not_exists(
         table_name='CompletedTradesForAutomatedDayTrading',
         key_schema=[
             {'AttributeName': 'date', 'KeyType': 'HASH'},  # Partition key
-            {'AttributeName': 'ticker_indicator', 'KeyType': 'RANGE'}  # Sort key
+            {'AttributeName': 'indicator', 'KeyType': 'RANGE'}  # Sort key
         ],
         attribute_definitions=[
             {'AttributeName': 'date', 'AttributeType': 'S'},
-            {'AttributeName': 'ticker_indicator', 'AttributeType': 'S'}
+            {'AttributeName': 'indicator', 'AttributeType': 'S'}
         ]
     ):
         tables_created += 1

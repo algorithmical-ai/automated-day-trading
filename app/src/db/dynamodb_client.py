@@ -642,6 +642,7 @@ class DynamoDBClient:
     ) -> bool:
         """
         Add a completed trade to the CompletedTradesForAutomatedDayTrading table.
+        Uses aggregated format: one record per date+indicator with a list of trades.
         
         Args:
             date: Trade date (yyyy-mm-dd)
@@ -663,31 +664,89 @@ class DynamoDBClient:
         """
         instance = cls._get_instance()
         
-        # Convert technical_indicators to JSON strings to avoid DynamoDB type issues
-        tech_indicators_enter_json = json.dumps(technical_indicators_for_enter or {}, default=str)
-        tech_indicators_exit_json = json.dumps(technical_indicators_for_exit or {}, default=str)
-        
-        item = {
-            'date': date,
-            'ticker_indicator': f"{ticker}#{indicator}",  # Sort key
-            'ticker': ticker,
-            'indicator': indicator,
-            'action': action,
-            'enter_price': enter_price,
-            'enter_reason': enter_reason,
-            'enter_timestamp': enter_timestamp,
-            'exit_price': exit_price,
-            'exit_timestamp': exit_timestamp,
-            'exit_reason': exit_reason,
-            'profit_or_loss': profit_or_loss,
-            'technical_indicators_for_enter': tech_indicators_enter_json,
-            'technical_indicators_for_exit': tech_indicators_exit_json
-        }
-        
-        return await instance.put_item(
-            table_name='CompletedTradesForAutomatedDayTrading',
-            item=item
-        )
+        try:
+            # Get existing record for this date+indicator
+            existing_item = await instance.get_item(
+                table_name='CompletedTradesForAutomatedDayTrading',
+                key={'date': date, 'indicator': indicator}
+            )
+            
+            # Create new trade object
+            new_trade = {
+                'ticker': ticker,
+                'action': action,
+                'enter_price': enter_price,
+                'enter_reason': enter_reason,
+                'enter_timestamp': enter_timestamp,
+                'exit_price': exit_price,
+                'exit_timestamp': exit_timestamp,
+                'exit_reason': exit_reason,
+                'profit_or_loss': profit_or_loss,
+                'technical_indicators_for_enter': technical_indicators_for_enter or {},
+                'technical_indicators_for_exit': technical_indicators_for_exit or {}
+            }
+            
+            if existing_item:
+                # Update existing record
+                completed_trades = existing_item.get('completed_trades', [])
+                completed_trades.append(new_trade)
+                
+                # Calculate aggregated metrics
+                overall_profit_loss = float(existing_item.get('overall_profit_loss', 0)) + profit_or_loss
+                overall_profit_loss_long = float(existing_item.get('overall_profit_loss_long', 0))
+                overall_profit_loss_short = float(existing_item.get('overall_profit_loss_short', 0))
+                
+                if action.upper() in ['BUY_TO_OPEN', 'SELL_TO_CLOSE']:
+                    overall_profit_loss_long += profit_or_loss
+                else:
+                    overall_profit_loss_short += profit_or_loss
+                
+                # Update the record
+                update_expression = (
+                    'SET completed_trades = :trades, '
+                    'completed_trade_count = :count, '
+                    'overall_profit_loss = :total_pl, '
+                    'overall_profit_loss_long = :long_pl, '
+                    'overall_profit_loss_short = :short_pl'
+                )
+                
+                expression_attribute_values = {
+                    ':trades': completed_trades,
+                    ':count': len(completed_trades),
+                    ':total_pl': overall_profit_loss,
+                    ':long_pl': overall_profit_loss_long,
+                    ':short_pl': overall_profit_loss_short
+                }
+                
+                return await instance.update_item(
+                    table_name='CompletedTradesForAutomatedDayTrading',
+                    key={'date': date, 'indicator': indicator},
+                    update_expression=update_expression,
+                    expression_attribute_values=expression_attribute_values
+                )
+            else:
+                # Create new record
+                overall_profit_loss_long = profit_or_loss if action.upper() in ['BUY_TO_OPEN', 'SELL_TO_CLOSE'] else 0
+                overall_profit_loss_short = profit_or_loss if action.upper() in ['SELL_TO_OPEN', 'BUY_TO_CLOSE'] else 0
+                
+                item = {
+                    'date': date,
+                    'indicator': indicator,
+                    'completed_trades': [new_trade],
+                    'completed_trade_count': 1,
+                    'overall_profit_loss': profit_or_loss,
+                    'overall_profit_loss_long': overall_profit_loss_long,
+                    'overall_profit_loss_short': overall_profit_loss_short
+                }
+                
+                return await instance.put_item(
+                    table_name='CompletedTradesForAutomatedDayTrading',
+                    item=item
+                )
+                
+        except Exception as e:
+            logger.error(f"Error adding completed trade: {str(e)}")
+            return False
     
     @classmethod
     async def get_completed_trade_count(cls, date: str, indicator: str) -> int:
@@ -703,18 +762,16 @@ class DynamoDBClient:
         """
         instance = cls._get_instance()
         
-        # Query by date partition key and filter by indicator
-        trades = await instance.query(
+        # Get the aggregated record for this date+indicator
+        item = await instance.get_item(
             table_name='CompletedTradesForAutomatedDayTrading',
-            key_condition_expression='#date = :date',
-            expression_attribute_names={'#date': 'date'},
-            expression_attribute_values={':date': date}
+            key={'date': date, 'indicator': indicator}
         )
         
-        # Filter by indicator
-        indicator_trades = [t for t in trades if t.get('indicator') == indicator]
+        if item:
+            return int(item.get('completed_trade_count', 0))
         
-        return len(indicator_trades)
+        return 0
     
     @classmethod
     async def log_inactive_ticker(
