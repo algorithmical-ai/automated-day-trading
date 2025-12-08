@@ -634,7 +634,7 @@ class DynamoDBClient:
         technical_indicators_for_exit: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
-        Add a completed trade to the CompletedTradesForMarketData table.
+        Add a completed trade to the CompletedTradesForAutomatedDayTrading table.
         
         Args:
             date: Trade date (yyyy-mm-dd)
@@ -674,7 +674,7 @@ class DynamoDBClient:
         }
         
         return await instance.put_item(
-            table_name='CompletedTradesForMarketData',
+            table_name='CompletedTradesForAutomatedDayTrading',
             item=item
         )
     
@@ -694,7 +694,7 @@ class DynamoDBClient:
         
         # Query by date partition key and filter by indicator
         trades = await instance.query(
-            table_name='CompletedTradesForMarketData',
+            table_name='CompletedTradesForAutomatedDayTrading',
             key_condition_expression='#date = :date',
             expression_attribute_names={'#date': 'date'},
             expression_attribute_values={':date': date}

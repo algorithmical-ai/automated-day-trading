@@ -67,9 +67,9 @@ def main():
     else:
         tables_failed += 1
     
-    # 2. CompletedTradesForMarketData
+    # 2. CompletedTradesForAutomatedDayTrading
     if create_table_if_not_exists(
-        table_name='CompletedTradesForMarketData',
+        table_name='CompletedTradesForAutomatedDayTrading',
         key_schema=[
             {'AttributeName': 'date', 'KeyType': 'HASH'},  # Partition key
             {'AttributeName': 'ticker_indicator', 'KeyType': 'RANGE'}  # Sort key

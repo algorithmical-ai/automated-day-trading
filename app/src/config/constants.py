@@ -93,7 +93,7 @@ WEBHOOK_NOTIFIER_TABLE_NAME = os.environ.get(
     "WEBHOOK_NOTIFIER_TABLE_NAME", "TradingSignals"
 )
 TRADING_PERFORMANCE_TABLE_NAME = os.environ.get(
-    "TRADING_PERFORMANCE_TABLE_NAME", "CompletedTradesForMarketData"
+    "TRADING_PERFORMANCE_TABLE_NAME", "CompletedTradesForAutomatedDayTrading"
 )
 
 
