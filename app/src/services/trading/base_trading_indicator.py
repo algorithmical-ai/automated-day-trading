@@ -309,6 +309,10 @@ class BaseTradingIndicator(ABC):
                 )
                 profit_or_loss = 0.0
             else:
+                # Convert Decimal to float if needed (DynamoDB returns Decimal)
+                enter_price = float(enter_price)
+                exit_price = float(exit_price)
+                
                 # Calculate number of shares bought with $2000
                 number_of_shares = cls.position_size_dollars / enter_price
 
@@ -422,6 +426,10 @@ class BaseTradingIndicator(ABC):
         cls, enter_price: float, current_price: float, action: str
     ) -> float:
         """Calculate profit percentage for a trade"""
+        # Convert Decimal to float if needed (DynamoDB returns Decimal)
+        enter_price = float(enter_price) if enter_price is not None else 0.0
+        current_price = float(current_price) if current_price is not None else 0.0
+        
         if action == "buy_to_open":
             return ((current_price - enter_price) / enter_price) * 100
         elif action == "sell_to_open":

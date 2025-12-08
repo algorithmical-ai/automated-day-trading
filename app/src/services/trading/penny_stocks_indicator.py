@@ -13,6 +13,18 @@ from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
 from app.src.services.trading.base_trading_indicator import BaseTradingIndicator
+from app.src.services.trading.validation import (
+    TrendAnalyzer,
+    QuoteData,
+    DataQualityRule,
+    LiquidityRule,
+    TrendDirectionRule,
+    ContinuationRule,
+    PriceExtremeRule,
+    MomentumThresholdRule,
+    RejectionCollector,
+    InactiveTickerRepository
+)
 
 
 class PennyStocksIndicator(BaseTradingIndicator):
@@ -223,6 +235,63 @@ class PennyStocksIndicator(BaseTradingIndicator):
         """Check if ticker is a special security (warrants, rights, units, etc.)"""
         special_suffixes = [".WS", ".RT", ".U", ".W", ".R", ".V"]
         return any(ticker.upper().endswith(suffix) for suffix in special_suffixes)
+
+    @classmethod
+    async def _validate_ticker_with_pipeline(
+        cls,
+        ticker: str,
+        bars: List[Dict[str, Any]],
+        quote_data: QuoteData,
+        collector: RejectionCollector
+    ) -> bool:
+        """
+        Validate ticker using the validation pipeline.
+        
+        Args:
+            ticker: Stock ticker symbol
+            bars: Historical price bars
+            quote_data: Current quote data
+            collector: RejectionCollector to accumulate rejections
+            
+        Returns:
+            True if ticker passes all validation rules, False otherwise
+        """
+        # Calculate trend metrics
+        trend_metrics = TrendAnalyzer.calculate_trend_metrics(bars)
+        
+        # Create validation rules
+        rules = [
+            DataQualityRule(required_bars=cls.recent_bars_for_trend),
+            LiquidityRule(max_spread_percent=cls.max_bid_ask_spread_percent),
+            TrendDirectionRule(),
+            ContinuationRule(min_continuation=0.7),
+            PriceExtremeRule(extreme_threshold_percent=1.0),
+            MomentumThresholdRule(
+                min_momentum=cls.min_momentum_threshold,
+                max_momentum=cls.max_momentum_threshold
+            )
+        ]
+        
+        # Apply validation rules sequentially (early termination on first failure)
+        for rule in rules:
+            result = rule.validate(ticker, trend_metrics, quote_data, bars)
+            
+            if not result.passed:
+                # Add rejection to collector
+                technical_indicators = trend_metrics.to_dict() if trend_metrics else None
+                
+                collector.add_rejection(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    reason_long=result.reason_long,
+                    reason_short=result.reason_short,
+                    technical_indicators=technical_indicators
+                )
+                
+                return False
+        
+        # All rules passed
+        return True
 
     @classmethod
     async def _passes_filters(
@@ -471,7 +540,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             candidates_to_fetch, max_concurrent=25
         )
 
-        # Process results
+        # Process results using validation pipeline
         ticker_momentum_scores = []
         stats = {
             "no_market_data": 0,
@@ -481,8 +550,8 @@ class PennyStocksIndicator(BaseTradingIndicator):
             "passed": 0,
         }
 
-        # Collect inactive ticker reasons for batch writing
-        inactive_ticker_logs = []
+        # Initialize rejection collector for batch writing
+        rejection_collector = RejectionCollector()
 
         for ticker in candidates_to_fetch:
             if not cls.running:
@@ -491,247 +560,61 @@ class PennyStocksIndicator(BaseTradingIndicator):
             bars_data = market_data_dict.get(ticker)
             if not bars_data:
                 stats["no_market_data"] += 1
-                inactive_ticker_logs.append(
-                    {
-                        "ticker": ticker,
-                        "indicator": cls.indicator_name(),
-                        "reason_not_to_enter_long": "No market data response",
-                        "reason_not_to_enter_short": "No market data response",
-                        "technical_indicators": None,
-                    }
-                )
                 continue
 
             bars_dict = bars_data.get("bars", {})
             ticker_bars = bars_dict.get(ticker, [])
-            if not ticker_bars or len(ticker_bars) < cls.recent_bars_for_trend:
-                stats["insufficient_bars"] += 1
-                inactive_ticker_logs.append(
-                    {
-                        "ticker": ticker,
-                        "indicator": cls.indicator_name(),
-                        "reason_not_to_enter_long": f"Insufficient bars data (need {cls.recent_bars_for_trend}, got {len(ticker_bars) if ticker_bars else 0})",
-                        "reason_not_to_enter_short": f"Insufficient bars data (need {cls.recent_bars_for_trend}, got {len(ticker_bars) if ticker_bars else 0})",
-                        "technical_indicators": None,
-                    }
-                )
-                continue
-
-            # Calculate recent trend (simple - just look at last few bars)
-            momentum_score, reason, peak_price, bottom_price, recent_continuation = (
-                cls._calculate_recent_trend(ticker_bars)
-            )
-
-            # Get current price to check if we're entering at peak/bottom
+            
+            # Get current quote for validation
             current_quote = await AlpacaClient.quote(ticker)
-            current_price = None
-            if current_quote:
-                quote_data = current_quote.get("quote", {})
-                quotes = quote_data.get("quotes", {})
-                ticker_quote = quotes.get(ticker, {})
-                bid = ticker_quote.get("bp", 0.0)
-                ask = ticker_quote.get("ap", 0.0)
-                if bid > 0 and ask > 0:
-                    current_price = (bid + ask) / 2.0
-
-            abs_momentum = abs(momentum_score)
-
-            # CRITICAL: Don't enter if trend is not continuing (recent bars show reversal)
-            # Require at least 70% continuation in recent bars to ensure trend is STRONGLY active (INCREASED from 50%)
-            if recent_continuation < 0.7:
-                stats["low_momentum"] += 1
-                if momentum_score > 0:
-                    reason_text = f"Recent bars show upward trend but trend is not continuing strongly (continuation={recent_continuation:.2f} < 0.7) - likely at peak, avoid long entry"
-                    inactive_ticker_logs.append(
-                        {
-                            "ticker": ticker,
-                            "indicator": cls.indicator_name(),
-                            "reason_not_to_enter_long": reason_text,
-                            "reason_not_to_enter_short": f"Recent bars show upward trend ({momentum_score:.2f}%), not suitable for short entry",
-                            "technical_indicators": None,
-                        }
-                    )
-                else:
-                    reason_text = f"Recent bars show downward trend but trend is not continuing strongly (continuation={recent_continuation:.2f} < 0.7) - likely at bottom, avoid short entry"
-                    inactive_ticker_logs.append(
-                        {
-                            "ticker": ticker,
-                            "indicator": cls.indicator_name(),
-                            "reason_not_to_enter_long": f"Recent bars show downward trend ({momentum_score:.2f}%), not suitable for long entry",
-                            "reason_not_to_enter_short": reason_text,
-                            "technical_indicators": None,
-                        }
-                    )
+            if not current_quote:
+                stats["no_market_data"] += 1
                 continue
-
-            # CRITICAL: Don't enter if current price is at/near peak (for long) or bottom (for short)
-            if current_price and peak_price and bottom_price:
-                if momentum_score > 0:  # Upward trend - check if we're at peak
-                    # Don't enter long if current price is within 1.0% of peak (INCREASED from 0.5% - more conservative)
-                    price_vs_peak = (
-                        ((current_price - peak_price) / peak_price) * 100
-                        if peak_price > 0
-                        else 0
-                    )
-                    if price_vs_peak > -1.0:  # Current price is within 1.0% of peak (INCREASED from 0.5%)
-                        stats["low_momentum"] += 1
-                        reason_text = f"Current price ${current_price:.4f} is at/near peak ${peak_price:.4f} (diff: {price_vs_peak:.2f}%) - likely at peak, avoid long entry"
-                        inactive_ticker_logs.append(
-                            {
-                                "ticker": ticker,
-                                "indicator": cls.indicator_name(),
-                                "reason_not_to_enter_long": reason_text,
-                                "reason_not_to_enter_short": f"Recent bars show upward trend ({momentum_score:.2f}%), not suitable for short entry",
-                                "technical_indicators": None,
-                            }
-                        )
-                        continue
-                else:  # Downward trend - check if we're at bottom
-                    # Don't enter short if current price is within 1.0% of bottom (INCREASED from 0.5% - more conservative)
-                    price_vs_bottom = (
-                        ((current_price - bottom_price) / bottom_price) * 100
-                        if bottom_price > 0
-                        else 0
-                    )
-                    if price_vs_bottom < 1.0:  # Current price is within 1.0% of bottom (INCREASED from 0.5%)
-                        stats["low_momentum"] += 1
-                        reason_text = f"Current price ${current_price:.4f} is at/near bottom ${bottom_price:.4f} (diff: {price_vs_bottom:.2f}%) - likely at bottom, avoid short entry"
-                        inactive_ticker_logs.append(
-                            {
-                                "ticker": ticker,
-                                "indicator": cls.indicator_name(),
-                                "reason_not_to_enter_long": f"Recent bars show downward trend ({momentum_score:.2f}%), not suitable for long entry",
-                                "reason_not_to_enter_short": reason_text,
-                                "technical_indicators": None,
-                            }
-                        )
-                        continue
-
-            if abs_momentum < cls.min_momentum_threshold:
-                stats["low_momentum"] += 1
-                # Direction-specific: low upward trend = no long entry, low downward trend = no short entry
-                if momentum_score > 0:
-                    reason_text = f"Recent bars show weak upward trend: {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}% (trend not strong enough for long entry)"
-                    inactive_ticker_logs.append(
-                        {
-                            "ticker": ticker,
-                            "indicator": cls.indicator_name(),
-                            "reason_not_to_enter_long": reason_text,
-                            "reason_not_to_enter_short": f"Recent bars show upward trend ({momentum_score:.2f}%), not suitable for short entry",
-                            "technical_indicators": None,
-                        }
-                    )
-                else:
-                    reason_text = f"Recent bars show weak downward trend: {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}% (trend not strong enough for short entry)"
-                    inactive_ticker_logs.append(
-                        {
-                            "ticker": ticker,
-                            "indicator": cls.indicator_name(),
-                            "reason_not_to_enter_long": f"Recent bars show downward trend ({momentum_score:.2f}%), not suitable for long entry",
-                            "reason_not_to_enter_short": reason_text,
-                            "technical_indicators": None,
-                        }
-                    )
-                continue
-
-            if abs_momentum > cls.max_momentum_threshold:
-                stats["low_momentum"] += 1
-                # Direction-specific: too high upward momentum = likely at peak (no long), too high downward momentum = likely at bottom (no short)
-                if momentum_score > 0:
-                    reason_text = f"Recent bars show excessive upward trend: {momentum_score:.2f}% > maximum threshold {cls.max_momentum_threshold}% (likely at peak, avoid long entry)"
-                    inactive_ticker_logs.append(
-                        {
-                            "ticker": ticker,
-                            "indicator": cls.indicator_name(),
-                            "reason_not_to_enter_long": reason_text,
-                            "reason_not_to_enter_short": f"Recent bars show strong upward trend ({momentum_score:.2f}%), not suitable for short entry",
-                            "technical_indicators": None,
-                        }
-                    )
-                else:
-                    reason_text = f"Recent bars show excessive downward trend: {momentum_score:.2f}% > maximum threshold {cls.max_momentum_threshold}% (likely at bottom, avoid short entry)"
-                    inactive_ticker_logs.append(
-                        {
-                            "ticker": ticker,
-                            "indicator": cls.indicator_name(),
-                            "reason_not_to_enter_long": f"Recent bars show strong downward trend ({momentum_score:.2f}%), not suitable for long entry",
-                            "reason_not_to_enter_short": reason_text,
-                            "technical_indicators": None,
-                        }
-                    )
-                continue
-
-            # Check filters (universal filters - apply to both long and short)
-            passes, filter_reason, reason_for_direction = await cls._passes_filters(
-                ticker, bars_data, momentum_score
+                
+            quote_data_obj = current_quote.get("quote", {})
+            quotes = quote_data_obj.get("quotes", {})
+            ticker_quote = quotes.get(ticker, {})
+            bid = ticker_quote.get("bp", 0.0)
+            ask = ticker_quote.get("ap", 0.0)
+            
+            # Create QuoteData object
+            quote = QuoteData.from_bid_ask(ticker, bid, ask)
+            
+            # Validate using pipeline
+            passed = await cls._validate_ticker_with_pipeline(
+                ticker, ticker_bars, quote, rejection_collector
             )
-            if not passes:
+            
+            if not passed:
                 stats["failed_filters"] += 1
-                # Universal filters apply to both directions (price, spread, volume, etc.)
-                # Only momentum-related filters are direction-specific
-                if reason_for_direction:
-                    # Direction-specific reason (momentum-related)
-                    if momentum_score > 0:
-                        inactive_ticker_logs.append(
-                            {
-                                "ticker": ticker,
-                                "indicator": cls.indicator_name(),
-                                "reason_not_to_enter_long": filter_reason,
-                                "reason_not_to_enter_short": None,
-                                "technical_indicators": None,
-                            }
-                        )
-                    else:
-                        inactive_ticker_logs.append(
-                            {
-                                "ticker": ticker,
-                                "indicator": cls.indicator_name(),
-                                "reason_not_to_enter_long": None,
-                                "reason_not_to_enter_short": filter_reason,
-                                "technical_indicators": None,
-                            }
-                        )
-                else:
-                    # Universal filter (applies to both long and short)
-                    inactive_ticker_logs.append(
-                        {
-                            "ticker": ticker,
-                            "indicator": cls.indicator_name(),
-                            "reason_not_to_enter_long": filter_reason,
-                            "reason_not_to_enter_short": filter_reason,
-                            "technical_indicators": None,
-                        }
-                    )
                 continue
-
+            
+            # Calculate trend metrics for passing tickers
+            trend_metrics = TrendAnalyzer.calculate_trend_metrics(ticker_bars)
+            momentum_score = trend_metrics.momentum_score
+            reason = trend_metrics.reason
+            
             stats["passed"] += 1
             ticker_momentum_scores.append((ticker, momentum_score, reason))
             logger.info(
-                f"{ticker} passed all filters: momentum={momentum_score:.2f}%, {filter_reason}"
+                f"{ticker} passed all filters: momentum={momentum_score:.2f}%"
             )
 
-        # Batch write all inactive ticker reasons
-        if inactive_ticker_logs:
-            logger.debug(f"Logging {len(inactive_ticker_logs)} inactive tickers to DynamoDB")
-
-            async def log_one(log_data):
-                try:
-                    result = await DynamoDBClient.log_inactive_ticker_reason(**log_data)
-                    if not result:
-                        logger.debug(f"Failed to log inactive ticker {log_data.get('ticker')}")
-                    return result
-                except Exception as e:
-                    logger.error(f"Error logging inactive ticker {log_data.get('ticker')}: {str(e)}")
-                    return False
-
-            batch_size = 20
-            for i in range(0, len(inactive_ticker_logs), batch_size):
-                batch = inactive_ticker_logs[i : i + batch_size]
-                results = await asyncio.gather(
-                    *[log_one(log_data) for log_data in batch], return_exceptions=True
-                )
-                successful = sum(1 for r in results if r is True)
-                logger.debug(f"Batch {i//batch_size + 1}: {successful}/{len(batch)} inactive tickers logged successfully")
+        # Batch write all rejection records using repository
+        if rejection_collector.has_records():
+            logger.debug(f"Writing {rejection_collector.count()} rejection records to DynamoDB")
+            
+            repository = InactiveTickerRepository()
+            records = rejection_collector.get_records()
+            
+            try:
+                success = await repository.batch_write_rejections(records)
+                if success:
+                    logger.info(f"Successfully wrote {len(records)} rejection records")
+                else:
+                    logger.warning(f"Some rejection records failed to write")
+            except Exception as e:
+                logger.error(f"Error writing rejection records: {str(e)}")
 
         logger.info(
             f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers "
@@ -859,6 +742,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
             ticker = trade.get("ticker")
             enter_price = trade.get("enter_price")
             action = trade.get("action")
+            
+            # Convert Decimal to float if needed (DynamoDB returns Decimal)
+            if enter_price is not None:
+                enter_price = float(enter_price)
 
             if not ticker or enter_price is None or enter_price <= 0:
                 continue
@@ -906,6 +793,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         original_action = lowest_trade.get("action")
         enter_price = lowest_trade.get("enter_price")
+        
+        # Convert Decimal to float if needed (DynamoDB returns Decimal)
+        if enter_price is not None:
+            enter_price = float(enter_price)
 
         if original_action == "buy_to_open":
             exit_action = "sell_to_close"
@@ -1225,6 +1116,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
             ticker = trade.get("ticker")
             original_action = trade.get("action")
             enter_price = trade.get("enter_price")
+            
+            # Convert Decimal to float if needed (DynamoDB returns Decimal)
+            if enter_price is not None:
+                enter_price = float(enter_price)
+            
             # Default to 4% trailing stop if not set
             trailing_stop = float(trade.get("trailing_stop", cls.trailing_stop_percent))
             if trailing_stop <= 0 or trailing_stop > 10:  # Sanity check

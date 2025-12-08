@@ -279,14 +279,24 @@ class ThresholdAdjustmentService:
             thresholds["max_momentum_threshold"] = getattr(
                 indicator_cls, "max_momentum_threshold", None
             )
-            thresholds["min_adx_threshold"] = indicator_cls.min_adx_threshold
-            thresholds["rsi_oversold_for_long"] = indicator_cls.rsi_oversold_for_long
-            thresholds["rsi_overbought_for_short"] = (
-                indicator_cls.rsi_overbought_for_short
+            thresholds["min_adx_threshold"] = getattr(
+                indicator_cls, "min_adx_threshold", None
             )
-            thresholds["min_daily_volume"] = indicator_cls.min_daily_volume
-            thresholds["stop_loss_threshold"] = indicator_cls.stop_loss_threshold
-            thresholds["trailing_stop_percent"] = indicator_cls.trailing_stop_percent
+            thresholds["rsi_oversold_for_long"] = getattr(
+                indicator_cls, "rsi_oversold_for_long", None
+            )
+            thresholds["rsi_overbought_for_short"] = getattr(
+                indicator_cls, "rsi_overbought_for_short", None
+            )
+            thresholds["min_daily_volume"] = getattr(
+                indicator_cls, "min_daily_volume", None
+            )
+            thresholds["stop_loss_threshold"] = getattr(
+                indicator_cls, "stop_loss_threshold", None
+            )
+            thresholds["trailing_stop_percent"] = getattr(
+                indicator_cls, "trailing_stop_percent", None
+            )
 
         # Deep Analyzer thresholds
         if hasattr(indicator_cls, "min_entry_score"):
