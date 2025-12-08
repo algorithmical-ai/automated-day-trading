@@ -1459,16 +1459,8 @@ class MarketDataService:
                     "error": True,
                 }
 
-            technical_analysis = market_data.get("technical_analysis", {})
-            if not technical_analysis:
-                return {
-                    "exit_decision": False,
-                    "reason": f"No technical analysis available for {ticker}",
-                    "error": True,
-                }
-
             # Convert to TechnicalIndicators object
-            indicators = dict_to_technical_indicators(technical_analysis)
+            indicators = dict_to_technical_indicators(market_data)
             if indicators is None:
                 return {
                     "exit_decision": False,
