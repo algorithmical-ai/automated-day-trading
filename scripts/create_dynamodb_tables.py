@@ -88,11 +88,11 @@ def main():
         table_name='InactiveTickersForDayTrading',
         key_schema=[
             {'AttributeName': 'ticker', 'KeyType': 'HASH'},  # Partition key
-            {'AttributeName': 'timestamp', 'KeyType': 'RANGE'}  # Sort key
+            {'AttributeName': 'indicator', 'KeyType': 'RANGE'}  # Sort key
         ],
         attribute_definitions=[
             {'AttributeName': 'ticker', 'AttributeType': 'S'},
-            {'AttributeName': 'timestamp', 'AttributeType': 'S'}
+            {'AttributeName': 'indicator', 'AttributeType': 'S'}
         ]
     ):
         tables_created += 1

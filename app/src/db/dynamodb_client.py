@@ -711,8 +711,8 @@ class DynamoDBClient:
         
         item = {
             'ticker': ticker,
-            'timestamp': timestamp,
             'indicator': indicator,
+            'timestamp': timestamp,
             'reason_not_to_enter_long': reason_not_to_enter_long,
             'reason_not_to_enter_short': reason_not_to_enter_short,
             'technical_indicators': technical_indicators or {}
@@ -721,6 +721,37 @@ class DynamoDBClient:
         return await instance.put_item(
             table_name='InactiveTickersForDayTrading',
             item=item
+        )
+    
+    @classmethod
+    async def log_inactive_ticker_reason(
+        cls,
+        ticker: str,
+        indicator: str,
+        reason_not_to_enter_long: str,
+        reason_not_to_enter_short: str,
+        technical_indicators: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Alias for log_inactive_ticker for backward compatibility.
+        Log an inactive ticker (evaluated but not traded) to InactiveTickersForDayTrading table.
+        
+        Args:
+            ticker: Stock ticker symbol
+            indicator: Trading indicator name
+            reason_not_to_enter_long: Reason for not entering long position
+            reason_not_to_enter_short: Reason for not entering short position
+            technical_indicators: Technical indicators at evaluation time
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        return await cls.log_inactive_ticker(
+            ticker=ticker,
+            indicator=indicator,
+            reason_not_to_enter_long=reason_not_to_enter_long,
+            reason_not_to_enter_short=reason_not_to_enter_short,
+            technical_indicators=technical_indicators
         )
     
     @classmethod
@@ -746,7 +777,8 @@ class DynamoDBClient:
         cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=minutes_window)
         cutoff_timestamp = cutoff_time.isoformat()
         
-        # Scan table with filter for indicator and timestamp (using expression attribute names for reserved keywords)
+        # Query table by indicator (sort key) with timestamp filter
+        # Since indicator is the sort key, we need to scan and filter
         inactive_tickers = await instance.scan(
             table_name='InactiveTickersForDayTrading',
             filter_expression='#ind = :indicator AND #ts >= :cutoff',
