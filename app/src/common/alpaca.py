@@ -394,7 +394,7 @@ class AlpacaClient:
 
                     except asyncio.TimeoutError:
                         if attempt < max_retries - 1:
-                            logger.warning(
+                            logger.debug(
                                 f"Timeout getting bars for {ticker} from Alpaca API "
                                 f"(attempt {attempt + 1}/{max_retries}), retrying..."
                             )

@@ -9,12 +9,13 @@ ENV/
 .venv
 *.env
 .env
+trading-log-monitor/
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 .DS_Store
-
+.hypothesis
 # Virtual environment
 venv/
