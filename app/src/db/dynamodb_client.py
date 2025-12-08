@@ -557,13 +557,16 @@ class DynamoDBClient:
         """
         instance = cls._get_instance()
         
+        # Convert technical_indicators to JSON string to avoid DynamoDB type issues
+        tech_indicators_json = json.dumps(technical_indicators_for_enter or {}, default=str)
+        
         item = {
             'ticker': ticker,
             'action': action,
             'indicator': indicator,
             'enter_price': enter_price,
             'enter_reason': enter_reason,
-            'technical_indicators_for_enter': technical_indicators_for_enter or {},
+            'technical_indicators_for_enter': tech_indicators_json,
             'dynamic_stop_loss': dynamic_stop_loss or 0.0,
             'trailing_stop': 0.0,  # Will be updated when activated
             'peak_profit_percent': 0.0,
@@ -660,6 +663,10 @@ class DynamoDBClient:
         """
         instance = cls._get_instance()
         
+        # Convert technical_indicators to JSON strings to avoid DynamoDB type issues
+        tech_indicators_enter_json = json.dumps(technical_indicators_for_enter or {}, default=str)
+        tech_indicators_exit_json = json.dumps(technical_indicators_for_exit or {}, default=str)
+        
         item = {
             'date': date,
             'ticker_indicator': f"{ticker}#{indicator}",  # Sort key
@@ -673,8 +680,8 @@ class DynamoDBClient:
             'exit_timestamp': exit_timestamp,
             'exit_reason': exit_reason,
             'profit_or_loss': profit_or_loss,
-            'technical_indicators_for_enter': technical_indicators_for_enter or {},
-            'technical_indicators_for_exit': technical_indicators_for_exit or {}
+            'technical_indicators_for_enter': tech_indicators_enter_json,
+            'technical_indicators_for_exit': tech_indicators_exit_json
         }
         
         return await instance.put_item(
