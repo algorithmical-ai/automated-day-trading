@@ -188,13 +188,13 @@ async def mcp_endpoint(request):
             )
 
         request_data = json.loads(body)
-        logger.info(
+        logger.debug(
             f"Received MCP request: method={request_data.get('method')}, id={request_data.get('id')}"
         )
 
         # Process the request
         response = await mcp_server.handle_request(request_data)
-        logger.info(f"Processed request, response id={response.get('id')}")
+        logger.debug(f"Processed request, response id={response.get('id')}")
 
         # Return JSON-RPC response
         return JSONResponse(
