@@ -5,9 +5,31 @@ Provides async operations for data persistence with error handling and logging.
 import os
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
+from decimal import Decimal
 import aioboto3
 from botocore.exceptions import ClientError, BotoCoreError
 from loguru import logger
+
+
+def _convert_floats_to_decimals(obj: Any) -> Any:
+    """
+    Recursively convert all float values to Decimal for DynamoDB compatibility.
+    DynamoDB doesn't support native Python float types.
+    
+    Args:
+        obj: Object to convert (can be dict, list, float, or any other type)
+        
+    Returns:
+        Object with all floats converted to Decimals
+    """
+    if isinstance(obj, dict):
+        return {k: _convert_floats_to_decimals(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_floats_to_decimals(item) for item in obj]
+    elif isinstance(obj, float):
+        return Decimal(str(obj))
+    else:
+        return obj
 
 
 class DynamoDBClient:
@@ -709,13 +731,16 @@ class DynamoDBClient:
         
         timestamp = datetime.now(timezone.utc).isoformat()
         
+        # Convert technical_indicators to use Decimals instead of floats
+        tech_indicators = _convert_floats_to_decimals(technical_indicators or {})
+        
         item = {
             'ticker': ticker,
             'indicator': indicator,
             'timestamp': timestamp,
             'reason_not_to_enter_long': reason_not_to_enter_long,
             'reason_not_to_enter_short': reason_not_to_enter_short,
-            'technical_indicators': technical_indicators or {}
+            'technical_indicators': tech_indicators
         }
         
         return await instance.put_item(
