@@ -112,6 +112,17 @@ class MomentumIndicator(BaseTradingIndicator):
         15  # Exit positions 15 minutes before market close
     )
 
+    # Profit-taking exit configuration (fixes for premature exits)
+    min_profit_for_profit_taking_exit: float = (
+        0.5  # Minimum 0.5% profit required before profit-taking exits can trigger
+    )
+    dip_rise_threshold_percent: float = (
+        1.0  # 1.0% dip/rise threshold for profit-taking exits (was 0.5% - too tight)
+    )
+    min_holding_seconds_for_profit_taking: int = (
+        60  # 60 seconds minimum hold time before profit-taking exits can trigger
+    )
+
     @classmethod
     def indicator_name(cls) -> str:
         return "Momentum Trading"
@@ -157,6 +168,139 @@ class MomentumIndicator(BaseTradingIndicator):
         current_hour = current_time_est.hour
         # Use > instead of >= to allow entries until 3:59 PM ET
         return current_hour > cls.max_entry_hour_et
+
+    @classmethod
+    def _filter_bars_after_entry(
+        cls,
+        bars: List[Dict[str, Any]],
+        created_at: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter bars to only include those with timestamps after trade entry.
+        
+        Args:
+            bars: List of bar dictionaries with 't' (timestamp) and 'c' (close) keys
+            created_at: ISO timestamp string when trade was created
+            
+        Returns:
+            List of bars with timestamps after created_at
+        """
+        if not bars or not created_at:
+            return []
+        
+        try:
+            # Parse the entry timestamp
+            entry_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=timezone.utc)
+            
+            filtered_bars = []
+            for bar in bars:
+                if not isinstance(bar, dict):
+                    continue
+                
+                bar_timestamp_str = bar.get("t")
+                if not bar_timestamp_str:
+                    continue
+                
+                try:
+                    # Parse bar timestamp
+                    if isinstance(bar_timestamp_str, str):
+                        bar_time = datetime.fromisoformat(bar_timestamp_str.replace("Z", "+00:00"))
+                        if bar_time.tzinfo is None:
+                            bar_time = bar_time.replace(tzinfo=timezone.utc)
+                    else:
+                        continue
+                    
+                    # Only include bars AFTER entry time
+                    if bar_time > entry_time:
+                        filtered_bars.append(bar)
+                except (ValueError, TypeError):
+                    continue
+            
+            return filtered_bars
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Error parsing entry timestamp '{created_at}': {e}")
+            return []
+
+    @classmethod
+    def _should_trigger_profit_taking_exit(
+        cls,
+        profit_from_entry: float,
+        dip_or_rise_percent: float,
+        holding_seconds: float,
+        is_long: bool,
+    ) -> Tuple[bool, str]:
+        """
+        Determine if profit-taking exit should trigger.
+        
+        This method implements the fixed exit logic that prevents premature exits:
+        1. Requires positive profit (profit_from_entry > 0)
+        2. Requires minimum profit threshold (>= 0.5%)
+        3. Requires minimum holding time (>= 60 seconds)
+        4. Uses wider dip/rise threshold (1.0% instead of 0.5%)
+        
+        Args:
+            profit_from_entry: Current profit percentage from entry price
+            dip_or_rise_percent: Percentage dip from peak (long) or rise from bottom (short)
+                                 Should be positive for dip (long) and positive for rise (short)
+            holding_seconds: Seconds since trade entry
+            is_long: True for long trades, False for short trades
+            
+        Returns:
+            Tuple of (should_exit: bool, reason: str)
+        """
+        direction = "long" if is_long else "short"
+        exit_type = "dip from peak" if is_long else "rise from bottom"
+        
+        # Check 1: Must have positive profit
+        if profit_from_entry <= 0:
+            reason = (
+                f"Skipping {exit_type} exit for {direction}: "
+                f"profit {profit_from_entry:.2f}% is not positive (required > 0%)"
+            )
+            logger.debug(reason)
+            return False, reason
+        
+        # Check 2: Must meet minimum profit threshold
+        if profit_from_entry < cls.min_profit_for_profit_taking_exit:
+            reason = (
+                f"Skipping {exit_type} exit for {direction}: "
+                f"profit {profit_from_entry:.2f}% below minimum threshold "
+                f"{cls.min_profit_for_profit_taking_exit:.2f}%"
+            )
+            logger.debug(reason)
+            return False, reason
+        
+        # Check 3: Must meet minimum holding time
+        if holding_seconds < cls.min_holding_seconds_for_profit_taking:
+            reason = (
+                f"Skipping {exit_type} exit for {direction}: "
+                f"holding time {holding_seconds:.0f}s below minimum "
+                f"{cls.min_holding_seconds_for_profit_taking}s"
+            )
+            logger.debug(reason)
+            return False, reason
+        
+        # Check 4: Dip/rise must exceed threshold (1.0%)
+        if dip_or_rise_percent < cls.dip_rise_threshold_percent:
+            reason = (
+                f"Skipping {exit_type} exit for {direction}: "
+                f"{exit_type} {dip_or_rise_percent:.2f}% below threshold "
+                f"{cls.dip_rise_threshold_percent:.2f}%"
+            )
+            logger.debug(reason)
+            return False, reason
+        
+        # All checks passed - trigger exit
+        reason = (
+            f"💰 PROFIT EXIT ({direction}): {exit_type} {dip_or_rise_percent:.2f}% "
+            f"(threshold: {cls.dip_rise_threshold_percent:.2f}%), "
+            f"profit from entry: {profit_from_entry:.2f}%, "
+            f"held for {holding_seconds:.0f}s"
+        )
+        logger.info(reason)
+        return True, reason
 
     @classmethod
     def _calculate_atr_percent(cls, atr: float, current_price: float) -> float:
@@ -2009,6 +2153,7 @@ class MomentumIndicator(BaseTradingIndicator):
             bars_data_for_exit = await AlpacaClient.get_market_data(ticker, limit=50)
             
             # Track peak price (for long) and bottom price (for short) since entry
+            # FIXED: Only consider bars AFTER trade entry to avoid using pre-entry prices
             peak_price_since_entry = None
             bottom_price_since_entry = None
             
@@ -2016,48 +2161,79 @@ class MomentumIndicator(BaseTradingIndicator):
                 bars_dict = bars_data_for_exit.get("bars", {})
                 ticker_bars = bars_dict.get(ticker, [])
                 if ticker_bars:
-                    # Get all prices since entry to find peak/bottom
-                    prices_since_entry = [bar.get("c", 0.0) for bar in ticker_bars if bar.get("c", 0.0) > 0]
-                    if prices_since_entry:
-                        peak_price_since_entry = max(prices_since_entry)
-                        bottom_price_since_entry = min(prices_since_entry)
+                    # Filter bars to only include those AFTER trade entry
+                    filtered_bars = cls._filter_bars_after_entry(ticker_bars, created_at)
+                    
+                    if filtered_bars:
+                        # Get prices from filtered (post-entry) bars only
+                        prices_since_entry = [bar.get("c", 0.0) for bar in filtered_bars if bar.get("c", 0.0) > 0]
+                        if prices_since_entry:
+                            peak_price_since_entry = max(prices_since_entry)
+                            bottom_price_since_entry = min(prices_since_entry)
+                    else:
+                        # No post-entry bars yet - use entry price as initial peak/bottom
+                        peak_price_since_entry = float(enter_price)
+                        bottom_price_since_entry = float(enter_price)
+                        logger.debug(f"No post-entry bars for {ticker}, using entry price as initial peak/bottom")
+
+            # Calculate holding time for profit-taking exit checks
+            holding_seconds = 0.0
+            if created_at:
+                try:
+                    entry_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    if entry_time.tzinfo is None:
+                        entry_time = entry_time.replace(tzinfo=timezone.utc)
+                    holding_seconds = (datetime.now(timezone.utc) - entry_time).total_seconds()
+                except (ValueError, TypeError):
+                    holding_seconds = 0.0
 
             # PRIORITY 1: Exit on profitable trend reversal (BOOK PROFIT QUICKLY)
-            # This is the PRIMARY exit strategy - get in and out with profit
+            # FIXED: Now requires positive profit, minimum profit threshold, and minimum holding time
+            # This prevents premature exits on normal market noise
             if is_long:
                 # For LONG: Exit if price starts dipping from peak
-                # Strategy: Enter on upward momentum, exit as soon as it dips from peak
-                if peak_price_since_entry and peak_price_since_entry > float(enter_price):
-                    # We have a peak above entry price (we're in profit territory)
-                    # Check if current price is dipping from that peak
-                    dip_from_peak_percent = ((current_price - peak_price_since_entry) / peak_price_since_entry) * 100
+                if peak_price_since_entry and peak_price_since_entry > 0:
+                    # Calculate dip from peak (negative value means price dropped)
+                    dip_from_peak_percent = ((peak_price_since_entry - current_price) / peak_price_since_entry) * 100
+                    # Calculate profit from entry
+                    profit_from_entry = ((current_price - float(enter_price)) / float(enter_price)) * 100
                     
-                    # Exit if price has dipped by 0.5% or more from peak (slightly more lenient than penny stocks)
-                    if dip_from_peak_percent <= -0.5:
+                    # Use new helper method with all safety checks
+                    should_trigger, trigger_reason = cls._should_trigger_profit_taking_exit(
+                        profit_from_entry=profit_from_entry,
+                        dip_or_rise_percent=dip_from_peak_percent,
+                        holding_seconds=holding_seconds,
+                        is_long=True,
+                    )
+                    
+                    if should_trigger:
                         should_exit = True
-                        profit_from_entry = ((current_price - float(enter_price)) / float(enter_price)) * 100
                         exit_reason = (
                             f"Dip from peak (LONG): peak ${peak_price_since_entry:.4f} → current ${current_price:.4f} "
                             f"(dip: {dip_from_peak_percent:.2f}%, profit from entry: {profit_from_entry:.2f}%)"
                         )
-                        logger.info(f"💰 PROFIT EXIT for {ticker} - {exit_reason}")
             else:
                 # For SHORT: Exit if price starts rising from bottom
-                # Strategy: Enter on downward momentum, exit as soon as it rises from bottom
-                if bottom_price_since_entry and bottom_price_since_entry < float(enter_price):
-                    # We have a bottom below entry price (we're in profit territory)
-                    # Check if current price is rising from that bottom
+                if bottom_price_since_entry and bottom_price_since_entry > 0:
+                    # Calculate rise from bottom (positive value means price rose)
                     rise_from_bottom_percent = ((current_price - bottom_price_since_entry) / bottom_price_since_entry) * 100
+                    # Calculate profit from entry (for shorts, profit = entry - current)
+                    profit_from_entry = ((float(enter_price) - current_price) / float(enter_price)) * 100
                     
-                    # Exit if price has risen by 0.5% or more from bottom (slightly more lenient than penny stocks)
-                    if rise_from_bottom_percent >= 0.5:
+                    # Use new helper method with all safety checks
+                    should_trigger, trigger_reason = cls._should_trigger_profit_taking_exit(
+                        profit_from_entry=profit_from_entry,
+                        dip_or_rise_percent=rise_from_bottom_percent,
+                        holding_seconds=holding_seconds,
+                        is_long=False,
+                    )
+                    
+                    if should_trigger:
                         should_exit = True
-                        profit_from_entry = ((float(enter_price) - current_price) / float(enter_price)) * 100
                         exit_reason = (
                             f"Rise from bottom (SHORT): bottom ${bottom_price_since_entry:.4f} → current ${current_price:.4f} "
                             f"(rise: {rise_from_bottom_percent:.2f}%, profit from entry: {profit_from_entry:.2f}%)"
                         )
-                        logger.info(f"💰 PROFIT EXIT for {ticker} - {exit_reason}")
 
             # PRIORITY 2: Check stop loss (cut losses)
             if not should_exit and profit_percent < stop_loss_threshold:
