@@ -5,6 +5,7 @@ Uses LLM to analyze inactive tickers and dynamically adjust trading thresholds
 
 import asyncio
 import json
+import os
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import date
 from app.src.common.loguru_logger import logger
@@ -23,14 +24,23 @@ class ThresholdAdjustmentService:
     analysis_interval_seconds: int = 300  # Run every 5 minutes
 
     @classmethod
+    def is_enabled(cls) -> bool:
+        """Check if threshold adjustment service is enabled via environment variable"""
+        return os.getenv("ENABLE_THRESHOLD_ADJUSTMENT", "false").lower() == "true"
+
+    @classmethod
     async def start(cls):
         """Start the threshold adjustment service (runs the service loop)"""
+        if not cls.is_enabled():
+            logger.info("Threshold adjustment service is disabled (ENABLE_THRESHOLD_ADJUSTMENT=false)")
+            return
+
         if cls.running:
             logger.warning("Threshold adjustment service already running")
             return
 
         cls.running = True
-        logger.info("Threshold adjustment service started")
+        logger.info("Threshold adjustment service started (ENABLE_THRESHOLD_ADJUSTMENT=true)")
 
         # Run the service loop directly (will be awaited by asyncio.gather)
         await cls._run_service()

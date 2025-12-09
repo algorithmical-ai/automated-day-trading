@@ -77,13 +77,21 @@ async def main():
         # Using return_exceptions=True for error isolation (Requirement 1.2)
         logger.info("Starting concurrent service execution...")
         logger.info("  - Trading Service Coordinator")
-        logger.info("  - Threshold Adjustment Service")
         
         # Create service tasks
         tasks = [
             asyncio.create_task(TradingServiceCoordinator.run(), name="TradingCoordinator"),
-            asyncio.create_task(ThresholdAdjustmentService.start(), name="ThresholdAdjustment"),
         ]
+        
+        # Conditionally add Threshold Adjustment Service if enabled
+        if ThresholdAdjustmentService.is_enabled():
+            logger.info("  - Threshold Adjustment Service (enabled)")
+            tasks.append(
+                asyncio.create_task(ThresholdAdjustmentService.start(), name="ThresholdAdjustment")
+            )
+        else:
+            logger.info("  - Threshold Adjustment Service (disabled via ENABLE_THRESHOLD_ADJUSTMENT)")
+        
         
         # Wait for either all tasks to complete or shutdown signal
         done, pending = await asyncio.wait(
