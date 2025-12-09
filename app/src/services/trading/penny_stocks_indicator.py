@@ -342,16 +342,6 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # Use mid price
         current_price = (bid + ask) / 2.0
 
-        # Check bid-ask spread
-        spread = ask - bid
-        spread_percent = (spread / current_price) * 100 if current_price > 0 else 100
-        if spread_percent > cls.max_bid_ask_spread_percent:
-            return (
-                False,
-                f"Bid-ask spread too wide: {spread_percent:.2f}% > {cls.max_bid_ask_spread_percent}%",
-                None,
-            )
-
         # Check price range
         if current_price < cls.min_stock_price:
             return (
@@ -916,16 +906,6 @@ class PennyStocksIndicator(BaseTradingIndicator):
             )
             return False
 
-        # Check bid-ask spread before entry
-        mid_price = (bid + ask) / 2.0
-        spread = ask - bid
-        spread_percent = (spread / mid_price) * 100 if mid_price > 0 else 100
-        if spread_percent > cls.max_bid_ask_spread_percent:
-            logger.warning(
-                f"Skipping {ticker}: bid-ask spread too wide: {spread_percent:.2f}% > {cls.max_bid_ask_spread_percent}%"
-            )
-            return False
-
         is_long = action == "buy_to_open"
         enter_price = ask if is_long else bid
 
@@ -934,7 +914,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             return False
 
         logger.debug(
-            f"Entry price for {ticker}: ${enter_price:.4f} (bid=${bid:.4f}, ask=${ask:.4f}, spread={spread_percent:.2f}%)"
+            f"Entry price for {ticker}: ${enter_price:.4f} (bid=${bid:.4f}, ask=${ask:.4f})"
         )
 
         # Verify price is still in valid range
