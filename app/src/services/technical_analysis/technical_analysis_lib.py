@@ -182,7 +182,7 @@ class TechnicalAnalysisLib:
             "vwap": 0.0,
             "volume": 0.0,
             "close_price": 0.0,
-            "datetime_price": (("dummy", 0.0),),
+            "datetime_price": {},
         }
 
     @classmethod

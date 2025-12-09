@@ -831,6 +831,18 @@ class MomentumIndicator(BaseTradingIndicator):
                 except (ValueError, TypeError, KeyError, IndexError):
                     continue
         
+        # Handle tuple format (legacy or default indicators)
+        elif isinstance(datetime_price, tuple):
+            logger.debug(f"Processing datetime_price as tuple with {len(datetime_price)} entries")
+            for entry in datetime_price:
+                try:
+                    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                        price = entry[1]
+                        if price is not None and isinstance(price, (int, float)) and price > 0:
+                            prices.append(float(price))
+                except (ValueError, TypeError, IndexError):
+                    continue
+        
         # Handle unexpected format
         else:
             logger.warning(f"Unexpected datetime_price format: {type(datetime_price)}")
