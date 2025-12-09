@@ -584,7 +584,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             
             stats["passed"] += 1
             ticker_momentum_scores.append((ticker, momentum_score, reason))
-            logger.info(
+            logger.debug(
                 f"{ticker} passed all filters: momentum={momentum_score:.2f}%"
             )
 

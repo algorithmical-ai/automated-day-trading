@@ -26,7 +26,8 @@ def _convert_floats_to_decimals(obj: Any) -> Any:
     """
     if isinstance(obj, dict):
         return {k: _convert_floats_to_decimals(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
+    elif isinstance(obj, (list, tuple)):
+        # Convert both lists and tuples, but return as list for DynamoDB compatibility
         return [_convert_floats_to_decimals(item) for item in obj]
     elif isinstance(obj, float):
         return Decimal(str(obj))
