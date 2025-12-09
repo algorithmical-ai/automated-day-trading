@@ -1133,7 +1133,6 @@ class PennyStocksIndicator(BaseTradingIndicator):
             if trailing_stop <= 0 or trailing_stop > 10:  # Sanity check
                 trailing_stop = cls.trailing_stop_percent
             peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
-            current_profit_percent = float(trade.get("current_profit_percent", 0.0))
 
             if not ticker or enter_price is None or enter_price <= 0:
                 logger.warning(f"Invalid penny stocks trade data: {trade}")
@@ -1269,14 +1268,13 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 cls._losing_tickers_today.add(ticker)
 
             if not should_exit:
-                # Update peak profit and current profit in database
+                # Update peak profit in database
                 new_peak = max(peak_profit_percent, profit_percent)
                 await DynamoDBClient.update_momentum_trade_trailing_stop(
                     ticker=ticker,
                     indicator=cls.indicator_name(),
                     trailing_stop=trailing_stop,
                     peak_profit_percent=new_peak,
-                    current_profit_percent=profit_percent,
                     skipped_exit_reason=f"Trade profitable: {profit_percent:.2f}%",
                 )
                 continue
