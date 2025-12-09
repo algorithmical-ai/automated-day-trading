@@ -34,6 +34,17 @@ def _convert_floats_to_decimals(obj: Any) -> Any:
         return obj
 
 
+def _get_est_timestamp() -> str:
+    """
+    Get current timestamp in EST (Eastern Standard Time) timezone.
+    
+    Returns:
+        ISO format timestamp string in EST
+    """
+    est_tz = ZoneInfo('America/New_York')
+    return datetime.now(est_tz).isoformat()
+
+
 class DynamoDBClient:
     """
     Async DynamoDB client with comprehensive error handling.
@@ -575,7 +586,7 @@ class DynamoDBClient:
             'dynamic_stop_loss': dynamic_stop_loss or 0.0,
             'trailing_stop': 0.0,  # Will be updated when activated
             'peak_profit_percent': 0.0,
-            'created_at': datetime.now(timezone.utc).isoformat()
+            'created_at': _get_est_timestamp()
         }
         
         if entry_score is not None:
@@ -655,11 +666,12 @@ class DynamoDBClient:
         return await instance.update_item(
             table_name='ActiveTickersForAutomatedDayTrader',
             key={'ticker': ticker},
-            update_expression='SET trailing_stop = :ts, peak_profit_percent = :pp, skipped_exit_reason = :ser',
+            update_expression='SET trailing_stop = :ts, peak_profit_percent = :pp, skipped_exit_reason = :ser, updated_at = :ua',
             expression_attribute_values={
                 ':ts': trailing_stop,
                 ':pp': peak_profit_percent,
                 ':ser': skipped_exit_reason,
+                ':ua': _get_est_timestamp(),
             }
         )
     
