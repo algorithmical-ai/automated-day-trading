@@ -860,9 +860,11 @@ class MomentumIndicator(BaseTradingIndicator):
         trend_percent = (recent_trend / early_avg) * 100 if early_avg > 0 else 0
         momentum_score = (0.7 * change_percent) + (0.3 * trend_percent)
 
-        reason = f"Momentum: {change_percent:.2f}% change, {trend_percent:.2f}% trend (early_avg: {early_avg:.2f}, recent_avg: {recent_avg:.2f}, n={n})"
+        reason = f"Momentum: {change_percent:.2f}% change, {trend_percent:.2f}% trend (early_avg: {early_avg:.2f}, recent_avg: {recent_avg:.2f}, n={n}, early_prices_count={len(early_prices)}, recent_prices_count={len(recent_prices)})"
         
         logger.debug(f"Momentum calculation: {reason}")
+        logger.debug(f"Early prices sample: {early_prices[:3] if len(early_prices) > 0 else 'empty'}")
+        logger.debug(f"Recent prices sample: {recent_prices[-3:] if len(recent_prices) > 0 else 'empty'}")
 
         return momentum_score, reason
 
