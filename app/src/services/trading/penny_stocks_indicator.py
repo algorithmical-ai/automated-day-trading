@@ -1,9 +1,18 @@
 """
 Penny Stocks Trading Indicator
 Trades stocks valued less than $5 USD using momentum-based entry and exit
+
+IMPROVED ALGORITHM (Dec 2024):
+- Accounts for bid-ask spread in breakeven calculations
+- Uses ATR-based stop losses with sensible bounds (-1.5% to -4%)
+- Tiered trailing stops that tighten as profit grows
+- 60-second minimum holding period (up from 15s)
+- Consecutive check requirement before stop loss exit
+- Better momentum confirmation for entries
 """
 
 import asyncio
+from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any, Optional
 
 from app.src.common.loguru_logger import logger
@@ -24,6 +33,15 @@ from app.src.services.trading.validation import (
     RejectionCollector,
     InactiveTickerRepository
 )
+from app.src.services.trading.penny_stock_utils import (
+    SpreadCalculator,
+    ATRCalculator,
+    TieredTrailingStop,
+    MomentumConfirmation,
+    ExitDecisionEngine,
+    ExitDecision,
+    DailyPerformanceMetrics,
+)
 
 
 class PennyStocksIndicator(BaseTradingIndicator):
@@ -40,37 +58,49 @@ class PennyStocksIndicator(BaseTradingIndicator):
     - Max 30 trades per day
     """
 
-    # Configuration - HIGHLY SELECTIVE PENNY STOCK TRADING
+    # Configuration - IMPROVED PENNY STOCK TRADING (Dec 2024)
     max_stock_price: float = 5.0  # Only trade stocks < $5
     min_stock_price: float = 0.01  # Minimum stock price (avoid extreme penny stocks)
-    trailing_stop_percent: float = 0.5  # 0.5% trailing stop (TIGHT - exit quickly)
-    profit_threshold: float = 0.5  # Exit at 0.5% profit (QUICK CASH IN)
-    immediate_loss_exit_threshold: float = (
-        -0.25
-    )  # Exit immediately on -0.25% loss (CUT LOSSES FAST)
+    
+    # IMPROVED: Wider stops and longer holding period
+    trailing_stop_percent: float = 0.5  # Base trailing stop (used by tiered system)
+    profit_threshold: float = 1.0  # Exit at 1% profit (INCREASED from 0.5%)
+    immediate_loss_exit_threshold: float = -3.0  # Emergency stop at -3% (INCREASED from -0.25%)
+    default_atr_stop_percent: float = -2.0  # Default ATR-based stop loss
+    
     top_k: int = 2  # Top K tickers to select
-    min_momentum_threshold: float = 1.5  # Minimum 1.5% momentum to enter (per requirements)
-    max_momentum_threshold: float = 15.0  # Maximum 15% momentum (per requirements)
-    exceptional_momentum_threshold: float = (
-        8.0  # Exceptional momentum to trigger preemption
-    )
-    min_volume: int = 500  # Minimum daily volume (increased for liquidity)
+    min_momentum_threshold: float = 1.5  # Minimum 1.5% momentum to enter
+    max_momentum_threshold: float = 15.0  # Maximum 15% momentum
+    exceptional_momentum_threshold: float = 8.0  # Exceptional momentum for preemption
+    
+    min_volume: int = 500  # Minimum daily volume
     min_avg_volume: int = 1000  # Minimum average daily volume
-    max_price_discrepancy_percent: float = (
-        10.0  # Max % difference between quote and close price
-    )
-    max_bid_ask_spread_percent: float = 2.0  # Max bid-ask spread as % of price
-    entry_cycle_seconds: int = 1  # Check for entries every 1 second (VERY FAST)
-    exit_cycle_seconds: int = 1  # Check exits every 1 second (VERY FAST)
-    max_active_trades: int = 10  # Increased for more concurrent trades
-    max_daily_trades: int = 30  # Increased to 30 for quick profit trades
-    min_holding_period_seconds: int = (
-        15  # Minimum 15 seconds to avoid garbage trades (trend needs time to develop)
-    )
+    max_price_discrepancy_percent: float = 10.0  # Max % difference between quote and close
+    max_bid_ask_spread_percent: float = 3.0  # INCREASED: Max bid-ask spread (was 2.0%)
+    
+    entry_cycle_seconds: int = 1  # Check for entries every 1 second
+    exit_cycle_seconds: int = 1  # Check exits every 1 second
+    max_active_trades: int = 10  # Max concurrent trades
+    max_daily_trades: int = 30  # Max trades per day
+    
+    # IMPROVED: Longer holding period to let trades develop
+    min_holding_period_seconds: int = 60  # INCREASED from 15 to 60 seconds
     recent_bars_for_trend: int = 5  # Use last 5 bars to determine trend
+    
+    # ATR configuration for volatility-based stops
+    atr_period: int = 14  # Period for ATR calculation
+    atr_multiplier: float = 1.5  # ATR multiplier for stop loss
+    atr_stop_min: float = -1.5  # Minimum stop loss (closest to 0)
+    atr_stop_max: float = -4.0  # Maximum stop loss (furthest from 0)
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
+    
+    # Exit decision engine instance (shared across exit cycles)
+    _exit_engine: Optional[ExitDecisionEngine] = None
+    
+    # Daily performance metrics
+    _daily_metrics: Optional[DailyPerformanceMetrics] = None
 
     @classmethod
     def indicator_name(cls) -> str:
@@ -874,7 +904,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
         daily_limit_reached: bool,
         is_golden: bool,
     ) -> bool:
-        """Process entry for a single ticker"""
+        """Process entry for a single ticker with improved validation."""
         if not cls.running:
             return False
 
@@ -905,7 +935,6 @@ class PennyStocksIndicator(BaseTradingIndicator):
                         f"Still at max capacity ({active_count}/{cls.max_active_trades}) after preemption for {ticker}. "
                         f"This may indicate a race condition or concurrent entry."
                     )
-                    # Still proceed with entry attempt - _enter_trade will handle duplicates
             else:
                 logger.info(
                     f"At max capacity ({active_count}/{cls.max_active_trades}), "
@@ -933,6 +962,14 @@ class PennyStocksIndicator(BaseTradingIndicator):
             )
             return False
 
+        # IMPROVED: Calculate and validate bid-ask spread
+        spread_percent = SpreadCalculator.calculate_spread_percent(bid, ask)
+        if spread_percent > cls.max_bid_ask_spread_percent:
+            logger.info(
+                f"Skipping {ticker}: bid-ask spread {spread_percent:.2f}% > max {cls.max_bid_ask_spread_percent}%"
+            )
+            return False
+
         is_long = action == "buy_to_open"
         enter_price = ask if is_long else bid
 
@@ -941,7 +978,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             return False
 
         logger.debug(
-            f"Entry price for {ticker}: ${enter_price:.4f} (bid=${bid:.4f}, ask=${ask:.4f})"
+            f"Entry price for {ticker}: ${enter_price:.4f} (bid=${bid:.4f}, ask=${ask:.4f}, spread={spread_percent:.2f}%)"
         )
 
         # Verify price is still in valid range
@@ -956,44 +993,71 @@ class PennyStocksIndicator(BaseTradingIndicator):
             )
             return False
 
-        # Validate entry price matches latest bar close price
+        # Get bars data for validation and technical indicators
         bars_data = market_data_dict.get(ticker)
+        ticker_bars = []
         if bars_data:
             bars_dict = bars_data.get("bars", {})
             ticker_bars = bars_dict.get(ticker, [])
-            if ticker_bars:
-                latest_bar = ticker_bars[-1]
-                close_price = latest_bar.get("c", 0.0)
-                if close_price > 0:
-                    price_discrepancy = (
-                        abs(enter_price - close_price) / close_price * 100
+
+        # Validate entry price matches latest bar close price
+        if ticker_bars:
+            latest_bar = ticker_bars[-1]
+            close_price = latest_bar.get("c", 0.0)
+            if close_price > 0:
+                price_discrepancy = (
+                    abs(enter_price - close_price) / close_price * 100
+                )
+                if price_discrepancy > cls.max_price_discrepancy_percent:
+                    logger.warning(
+                        f"Skipping {ticker}: entry price ${enter_price:.4f} differs from close ${close_price:.4f} "
+                        f"by {price_discrepancy:.2f}% (max: {cls.max_price_discrepancy_percent}%)"
                     )
-                    if price_discrepancy > cls.max_price_discrepancy_percent:
-                        logger.warning(
-                            f"Skipping {ticker}: entry price ${enter_price:.4f} differs from close ${close_price:.4f} "
-                            f"by {price_discrepancy:.2f}% (max: {cls.max_price_discrepancy_percent}%)"
-                        )
-                        return False
+                    return False
+
+        # IMPROVED: Check momentum confirmation (3/5 bars in trend + last bar confirms)
+        if ticker_bars:
+            is_confirmed, confirm_reason = MomentumConfirmation.is_momentum_confirmed(
+                ticker_bars, is_long
+            )
+            if not is_confirmed:
+                logger.info(
+                    f"Skipping {ticker}: momentum not confirmed - {confirm_reason}"
+                )
+                return False
+            logger.debug(f"{ticker} momentum confirmed: {confirm_reason}")
+
+        # IMPROVED: Calculate breakeven price accounting for spread
+        breakeven_price = SpreadCalculator.calculate_breakeven_price(
+            enter_price, spread_percent, is_long
+        )
+
+        # IMPROVED: Calculate ATR-based stop loss
+        atr = ATRCalculator.calculate_atr(ticker_bars, period=cls.atr_period) if ticker_bars else None
+        atr_stop_percent = ATRCalculator.calculate_stop_loss_percent(
+            atr, enter_price, cls.atr_multiplier, cls.atr_stop_min, cls.atr_stop_max
+        )
 
         # Prepare entry data
         direction = "upward" if is_long else "downward"
         ranked_reason = f"{reason} (ranked #{rank} {direction} momentum)"
 
-        # Get bars data for technical indicators
-        bars_data = market_data_dict.get(ticker)
+        # Build technical indicators
         technical_indicators = {}
-        if bars_data:
-            bars_dict = bars_data.get("bars", {})
-            ticker_bars = bars_dict.get(ticker, [])
-            if ticker_bars:
-                latest_bar = ticker_bars[-1]
-                technical_indicators = {
-                    "close_price": latest_bar.get("c", 0.0),
-                    "volume": latest_bar.get("v", 0),
-                    "high": latest_bar.get("h", 0.0),
-                    "low": latest_bar.get("l", 0.0),
-                    "open": latest_bar.get("o", 0.0),
-                }
+        if ticker_bars:
+            latest_bar = ticker_bars[-1]
+            technical_indicators = {
+                "close_price": latest_bar.get("c", 0.0),
+                "volume": latest_bar.get("v", 0),
+                "high": latest_bar.get("h", 0.0),
+                "low": latest_bar.get("l", 0.0),
+                "open": latest_bar.get("o", 0.0),
+                # IMPROVED: Store spread and ATR info for exit logic
+                "spread_percent": spread_percent,
+                "breakeven_price": breakeven_price,
+                "atr_stop_percent": atr_stop_percent,
+                "atr": atr if atr else 0.0,
+            }
 
         await send_signal_to_webhook(
             ticker=ticker,
@@ -1004,14 +1068,14 @@ class PennyStocksIndicator(BaseTradingIndicator):
             technical_indicators=technical_indicators,
         )
 
-        # Enter trade with tight 0.5% trailing stop (AGGRESSIVE)
+        # IMPROVED: Enter trade with ATR-based stop loss instead of fixed tight stop
         entry_success = await cls._enter_trade(
             ticker=ticker,
             action=action,
             enter_price=enter_price,
             enter_reason=ranked_reason,
             technical_indicators=technical_indicators,
-            dynamic_stop_loss=-cls.trailing_stop_percent,  # 0.5% stop loss (tight)
+            dynamic_stop_loss=atr_stop_percent,  # Use ATR-based stop
         )
 
         if not entry_success:
@@ -1066,7 +1130,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
     @classmethod
     @measure_latency
     async def _run_exit_cycle(cls):
-        """Execute a single penny stocks exit monitoring cycle"""
+        """
+        IMPROVED exit monitoring cycle using ExitDecisionEngine.
+        
+        Key improvements:
+        - Uses breakeven price accounting for bid-ask spread
+        - ATR-based stop losses with sensible bounds
+        - Tiered trailing stops that tighten as profit grows
+        - 60-second minimum holding period (only emergency exits during this time)
+        - Consecutive check requirement before stop loss exit
+        - Tracks spread-induced vs genuine losses
+        """
         if not await AlpacaClient.is_market_open():
             logger.debug("Market is closed, skipping penny stocks exit logic")
             await asyncio.sleep(cls.exit_cycle_seconds)
@@ -1078,45 +1152,24 @@ class PennyStocksIndicator(BaseTradingIndicator):
             await asyncio.sleep(cls.exit_cycle_seconds)
             return
 
+        # Initialize exit engine and daily metrics if needed
+        if cls._exit_engine is None:
+            cls._exit_engine = ExitDecisionEngine()
+        if cls._daily_metrics is None:
+            cls._daily_metrics = DailyPerformanceMetrics()
+        
+        # Check if we need to reset daily metrics
+        today = datetime.now().strftime("%Y-%m-%d")
+        if cls._daily_metrics.date != today:
+            logger.info(f"📊 End of day metrics: {cls._daily_metrics.to_dict()}")
+            cls._daily_metrics.reset()
+
         active_count = len(active_trades)
         logger.info(
             f"Monitoring {active_count}/{cls.max_active_trades} active penny stocks trades"
         )
 
-        # Filter trades that haven't passed minimum holding period
-        trades_to_process = []
         for trade in active_trades:
-            created_at = trade.get("created_at")
-            if created_at:
-                try:
-                    from datetime import datetime, timezone
-
-                    enter_time = datetime.fromisoformat(
-                        created_at.replace("Z", "+00:00")
-                    )
-                    if enter_time.tzinfo is None:
-                        enter_time = enter_time.replace(tzinfo=timezone.utc)
-                    current_time = datetime.now(timezone.utc)
-                    holding_period_seconds = (current_time - enter_time).total_seconds()
-
-                    if holding_period_seconds < cls.min_holding_period_seconds:
-                        ticker = trade.get("ticker")
-                        logger.debug(
-                            f"Skipping {ticker}: holding period {holding_period_seconds:.1f}s < "
-                            f"minimum {cls.min_holding_period_seconds}s"
-                        )
-                        continue
-                except Exception as e:
-                    logger.debug(f"Error checking holding period: {str(e)}")
-                    # Continue on error
-            trades_to_process.append(trade)
-
-        if not trades_to_process:
-            logger.debug("No trades passed minimum holding period")
-            await asyncio.sleep(cls.exit_cycle_seconds)
-            return
-
-        for trade in trades_to_process:
             if not cls.running:
                 break
 
@@ -1128,200 +1181,130 @@ class PennyStocksIndicator(BaseTradingIndicator):
             if enter_price is not None:
                 enter_price = float(enter_price)
             
-            # Default to 4% trailing stop if not set
-            trailing_stop = float(trade.get("trailing_stop", cls.trailing_stop_percent))
-            if trailing_stop <= 0 or trailing_stop > 10:  # Sanity check
-                trailing_stop = cls.trailing_stop_percent
             peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
 
             if not ticker or enter_price is None or enter_price <= 0:
                 logger.warning(f"Invalid penny stocks trade data: {trade}")
                 continue
 
+            # Get technical indicators from entry (contains spread and ATR info)
+            tech_indicators_enter = trade.get("technical_indicators_for_enter", {})
+            spread_percent = float(tech_indicators_enter.get("spread_percent", 1.0))  # Default 1%
+            breakeven_price = float(tech_indicators_enter.get("breakeven_price", enter_price))
+            atr_stop_percent = float(tech_indicators_enter.get("atr_stop_percent", cls.default_atr_stop_percent))
+
+            # Calculate holding period
+            holding_seconds = 0.0
+            created_at = trade.get("created_at")
+            if created_at:
+                try:
+                    enter_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    if enter_time.tzinfo is None:
+                        enter_time = enter_time.replace(tzinfo=timezone.utc)
+                    current_time = datetime.now(timezone.utc)
+                    holding_seconds = (current_time - enter_time).total_seconds()
+                except Exception as e:
+                    logger.debug(f"Error calculating holding period: {str(e)}")
+
             # Get current price using Alpaca API
             current_price = await cls._get_current_price(ticker, original_action)
             if current_price is None or current_price <= 0:
-                logger.warning(
-                    f"Failed to get quote for {ticker} - will retry in next cycle"
-                )
+                logger.warning(f"Failed to get quote for {ticker} - will retry in next cycle")
                 continue
 
-            logger.debug(f"Current price for {ticker}: ${current_price:.4f}")
-
-            # Get latest bars for trend check (simple - no complex technical analysis)
-            bars_data = await AlpacaClient.get_market_data(
-                ticker, limit=cls.recent_bars_for_trend + 5
-            )
-            technical_indicators = {}
-            if bars_data:
-                bars_dict = bars_data.get("bars", {})
-                ticker_bars = bars_dict.get(ticker, [])
-                if ticker_bars:
-                    latest_bar = ticker_bars[-1]
-                    # Simple indicators - just price and volume
-                    technical_indicators = {
-                        "close_price": latest_bar.get("c", 0.0),
-                        "volume": latest_bar.get("v", 0),
-                    }
-
-            profit_percent = cls._calculate_profit_percent(
-                enter_price, current_price, original_action
-            )
-
-            should_exit = False
-            exit_reason = None
             is_long = original_action == "buy_to_open"
 
-            # Get recent bars for peak/bottom tracking
-            bars_data_for_exit = await AlpacaClient.get_market_data(
-                ticker, limit=cls.recent_bars_for_trend + 10
-            )
-            
-            # Track peak price (for long) and bottom price (for short) since entry
-            peak_price_since_entry = None
-            bottom_price_since_entry = None
-            
-            if bars_data_for_exit:
-                bars_dict = bars_data_for_exit.get("bars", {})
-                ticker_bars = bars_dict.get(ticker, [])
-                if ticker_bars:
-                    # Get all prices since entry to find peak/bottom
-                    prices_since_entry = [bar.get("c", 0.0) for bar in ticker_bars if bar.get("c", 0.0) > 0]
-                    if prices_since_entry:
-                        peak_price_since_entry = max(prices_since_entry)
-                        bottom_price_since_entry = min(prices_since_entry)
-
-            # PRIORITY 1: Exit on profitable trend reversal (BOOK PROFIT QUICKLY)
-            # This is the PRIMARY exit strategy - get in and out with profit
+            # Track peak price for trailing stop
             if is_long:
-                # For LONG: Exit if price starts dipping from peak
-                # Strategy: Enter on upward momentum, exit as soon as it dips from peak
-                if peak_price_since_entry and peak_price_since_entry > enter_price:
-                    # We have a peak above entry price (we're in profit territory)
-                    # Check if current price is dipping from that peak
-                    dip_from_peak_percent = ((current_price - peak_price_since_entry) / peak_price_since_entry) * 100
-                    
-                    # Exit if price has dipped by 0.3% or more from peak
-                    if dip_from_peak_percent <= -0.3:
-                        should_exit = True
-                        profit_from_entry = ((current_price - enter_price) / enter_price) * 100
-                        exit_reason = (
-                            f"Dip from peak (LONG): peak ${peak_price_since_entry:.4f} → current ${current_price:.4f} "
-                            f"(dip: {dip_from_peak_percent:.2f}%, profit from entry: {profit_from_entry:.2f}%)"
-                        )
-                        logger.info(f"💰 PROFIT EXIT for {ticker} - {exit_reason}")
+                peak_price = max(enter_price, current_price, peak_profit_percent * enter_price / 100 + enter_price if peak_profit_percent > 0 else enter_price)
             else:
-                # For SHORT: Exit if price starts rising from bottom
-                # Strategy: Enter on downward momentum, exit as soon as it rises from bottom
-                if bottom_price_since_entry and bottom_price_since_entry < enter_price:
-                    # We have a bottom below entry price (we're in profit territory)
-                    # Check if current price is rising from that bottom
-                    rise_from_bottom_percent = ((current_price - bottom_price_since_entry) / bottom_price_since_entry) * 100
-                    
-                    # Exit if price has risen by 0.3% or more from bottom
-                    if rise_from_bottom_percent >= 0.3:
-                        should_exit = True
-                        profit_from_entry = ((enter_price - current_price) / enter_price) * 100
-                        exit_reason = (
-                            f"Rise from bottom (SHORT): bottom ${bottom_price_since_entry:.4f} → current ${current_price:.4f} "
-                            f"(rise: {rise_from_bottom_percent:.2f}%, profit from entry: {profit_from_entry:.2f}%)"
-                        )
-                        logger.info(f"💰 PROFIT EXIT for {ticker} - {exit_reason}")
+                # For shorts, "peak" is actually the lowest price (best for shorts)
+                peak_price = min(enter_price, current_price, enter_price - peak_profit_percent * enter_price / 100 if peak_profit_percent > 0 else enter_price)
 
-            # PRIORITY 2: Exit if trade becomes unprofitable (CUT LOSSES)
-            if not should_exit:
-                if is_long:
-                    # For long: exit if current_price < enter_price (unprofitable)
-                    if current_price < enter_price:
-                        should_exit = True
-                        exit_reason = (
-                            f"Unprofitable exit (LONG): current ${current_price:.4f} < enter ${enter_price:.4f} "
-                            f"(loss: {profit_percent:.2f}%)"
-                        )
-                        logger.warning(
-                            f"🚨 LOSS EXIT for {ticker} LONG - unprofitable: {profit_percent:.2f}%"
-                        )
-                        cls._losing_tickers_today.add(ticker)
-                else:
-                    # For short: exit if current_price > enter_price (unprofitable)
-                    if current_price > enter_price:
-                        should_exit = True
-                        exit_reason = (
-                            f"Unprofitable exit (SHORT): current ${current_price:.4f} > enter ${enter_price:.4f} "
-                            f"(loss: {profit_percent:.2f}%)"
-                        )
-                        logger.warning(
-                            f"🚨 LOSS EXIT for {ticker} SHORT - unprofitable: {profit_percent:.2f}%"
-                        )
-                        cls._losing_tickers_today.add(ticker)
+            # Use ExitDecisionEngine for exit decision
+            exit_decision: ExitDecision = cls._exit_engine.evaluate_exit(
+                ticker=ticker,
+                entry_price=enter_price,
+                breakeven_price=breakeven_price,
+                current_price=current_price,
+                peak_price=peak_price,
+                atr_stop_percent=atr_stop_percent,
+                holding_seconds=holding_seconds,
+                is_long=is_long,
+                spread_percent=spread_percent
+            )
 
-            # PRIORITY 3: Exit on significant loss (SAFETY NET)
-            if not should_exit and profit_percent < cls.immediate_loss_exit_threshold:
-                should_exit = True
-                exit_reason = (
-                    f"Significant loss exit: {profit_percent:.2f}% loss "
-                    f"(below {cls.immediate_loss_exit_threshold:.2f}% threshold)"
-                )
-                logger.warning(
-                    f"🚨 LOSS EXIT for {ticker} - loss: {profit_percent:.2f}%"
-                )
-                cls._losing_tickers_today.add(ticker)
+            # Calculate current profit for logging and tracking
+            profit_percent = cls._calculate_profit_percent(enter_price, current_price, original_action)
 
-            if not should_exit:
+            if not exit_decision.should_exit:
                 # Update peak profit in database
                 new_peak = max(peak_profit_percent, profit_percent)
                 await DynamoDBClient.update_momentum_trade_trailing_stop(
                     ticker=ticker,
                     indicator=cls.indicator_name(),
-                    trailing_stop=trailing_stop,
+                    trailing_stop=cls.trailing_stop_percent,
                     peak_profit_percent=new_peak,
-                    skipped_exit_reason=f"Trade profitable: {profit_percent:.2f}%",
+                    skipped_exit_reason=exit_decision.reason,
                 )
+                logger.debug(f"{ticker}: {exit_decision.reason} (profit: {profit_percent:.2f}%)")
                 continue
 
-            if should_exit:
-                logger.info(
-                    f"Exit signal for {ticker} "
-                    f"(enter: {enter_price}, current: {current_price}, "
-                    f"profit: {profit_percent:.2f}%)"
+            # Exit triggered
+            exit_emoji = "💰" if profit_percent >= 0 else "🚨"
+            logger.info(
+                f"{exit_emoji} Exit signal for {ticker}: {exit_decision.reason} "
+                f"(enter: ${enter_price:.4f}, current: ${current_price:.4f}, profit: {profit_percent:.2f}%)"
+            )
+
+            # Get latest quote right before exit
+            exit_price = await cls._get_current_price(ticker, original_action)
+            if exit_price is None or exit_price <= 0:
+                exit_price = current_price
+                logger.warning(f"Failed to get exit quote for {ticker}, using current price ${current_price:.4f}")
+
+            # Calculate final profit
+            final_profit_percent = cls._calculate_profit_percent(enter_price, exit_price, original_action)
+
+            # Record metrics
+            cls._daily_metrics.record_trade(final_profit_percent, exit_decision.is_spread_induced)
+
+            # If trade ended in loss, mark ticker as losing for today
+            if final_profit_percent < 0:
+                cls._losing_tickers_today.add(ticker)
+                loss_type = "spread-induced" if exit_decision.is_spread_induced else "price movement"
+                logger.warning(
+                    f"📛 Marked {ticker} as losing ticker ({loss_type} loss: {final_profit_percent:.2f}%) - "
+                    f"excluded from MAB selection for rest of day"
                 )
 
-                # Get latest quote right before exit
-                exit_price = await cls._get_current_price(ticker, original_action)
-                if exit_price is None or exit_price <= 0:
-                    exit_price = current_price  # Fallback
-                    logger.warning(
-                        f"Failed to get exit quote for {ticker}, using current price ${current_price:.4f}"
-                    )
-                else:
-                    logger.debug(f"Exit price for {ticker}: ${exit_price:.4f}")
+            # Get technical indicators for exit
+            bars_data = await AlpacaClient.get_market_data(ticker, limit=cls.recent_bars_for_trend + 5)
+            technical_indicators_exit = {}
+            if bars_data:
+                bars_dict = bars_data.get("bars", {})
+                ticker_bars = bars_dict.get(ticker, [])
+                if ticker_bars:
+                    latest_bar = ticker_bars[-1]
+                    technical_indicators_exit = {
+                        "close_price": latest_bar.get("c", 0.0),
+                        "volume": latest_bar.get("v", 0),
+                        "exit_type": exit_decision.exit_type,
+                        "is_spread_induced": exit_decision.is_spread_induced,
+                        "holding_seconds": holding_seconds,
+                    }
 
-                # Get technical indicators for enter (from trade data)
-                technical_indicators_enter = trade.get(
-                    "technical_indicators_for_enter", {}
-                )
+            # Reset exit engine state for this ticker
+            cls._exit_engine.reset_ticker(ticker)
 
-                # Record trade outcome for MAB
-                final_profit_percent = cls._calculate_profit_percent(
-                    enter_price, exit_price, original_action
-                )
-
-                # If trade ended in loss, mark ticker as losing for today
-                if final_profit_percent < 0:
-                    cls._losing_tickers_today.add(ticker)
-                    logger.warning(
-                        f"📛 Marked {ticker} as losing ticker (final profit: {final_profit_percent:.2f}%) - "
-                        f"excluded from MAB selection for rest of day"
-                    )
-
-                await cls._exit_trade(
-                    ticker=ticker,
-                    original_action=original_action,
-                    enter_price=enter_price,
-                    exit_price=exit_price,
-                    exit_reason=exit_reason,
-                    technical_indicators_enter=technical_indicators_enter,
-                    technical_indicators_exit=technical_indicators,
-                )
+            await cls._exit_trade(
+                ticker=ticker,
+                original_action=original_action,
+                enter_price=enter_price,
+                exit_price=exit_price,
+                exit_reason=exit_decision.reason,
+                technical_indicators_enter=tech_indicators_enter,
+                technical_indicators_exit=technical_indicators_exit,
+            )
 
         await asyncio.sleep(cls.exit_cycle_seconds)
