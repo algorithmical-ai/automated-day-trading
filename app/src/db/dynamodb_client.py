@@ -447,13 +447,17 @@ class DynamoDBClient:
             True if successful, False otherwise
         """
         try:
+            # Convert floats to Decimals for DynamoDB compatibility
+            converted_key = _convert_floats_to_decimals(key)
+            converted_values = _convert_floats_to_decimals(expression_attribute_values)
+            
             async with self.session.resource('dynamodb') as dynamodb:
                 table = await dynamodb.Table(table_name)
                 
                 update_params = {
-                    'Key': key,
+                    'Key': converted_key,
                     'UpdateExpression': update_expression,
-                    'ExpressionAttributeValues': expression_attribute_values
+                    'ExpressionAttributeValues': converted_values
                 }
                 
                 if expression_attribute_names:
