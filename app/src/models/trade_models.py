@@ -102,16 +102,25 @@ class ThresholdAdjustmentEvent:
 @dataclass
 class MABStats:
     """Represents multi-armed bandit statistics for ticker selection."""
-    indicator_ticker: str  # "indicator#ticker"
+    indicator_ticker: str  # "indicator#ticker" (kept for backward compatibility)
     successes: int
     failures: int
     total_trades: int
     last_updated: str  # ISO timestamp in UTC
     excluded_until: Optional[str] = None  # ISO timestamp for temporary exclusion
+    ticker: Optional[str] = None  # DynamoDB partition key
+    indicator: Optional[str] = None  # DynamoDB sort key
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for DynamoDB storage."""
-        return asdict(self)
+        data = asdict(self)
+        # Ensure ticker and indicator are set from indicator_ticker if not already set
+        if self.ticker is None and self.indicator_ticker:
+            parts = self.indicator_ticker.split('#')
+            if len(parts) == 2:
+                data['indicator'] = parts[0]
+                data['ticker'] = parts[1]
+        return data
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'MABStats':

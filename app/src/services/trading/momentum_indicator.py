@@ -1523,10 +1523,12 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"Failed quality filters: {stats['failed_quality_filters']}"
             )
 
+        # Separate upward and downward momentum
+        # Note: tickers with score == 0 are treated as upward (neutral momentum)
         upward_tickers = [
             (t, score, reason)
             for t, score, reason in ticker_momentum_scores
-            if score > 0
+            if score >= 0
         ]
         downward_tickers = [
             (t, score, reason)
@@ -1591,6 +1593,50 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"⚠️ MAB service returned zero downward tickers despite {len(downward_tickers)} candidates passing filters. "
                 f"Top 3 candidates: {[(t, f'{s:.2f}%') for t, s, _ in downward_tickers[:3]]}"
             )
+
+        # Log MAB-rejected tickers (passed validation but not selected by MAB)
+        selected_tickers_list = [t[0] for t in top_upward] + [t[0] for t in top_downward]
+        
+        # Get rejection reasons for all rejected tickers
+        all_candidates = upward_tickers + downward_tickers
+        rejected_info = await MABService.get_rejected_tickers_with_reasons(
+            indicator=cls.indicator_name(),
+            ticker_candidates=all_candidates,
+            selected_tickers=selected_tickers_list
+        )
+        
+        if rejected_info:
+            logger.debug(f"Logging {len(rejected_info)} tickers rejected by MAB to InactiveTickersForDayTrading")
+            for ticker, rejection_data in rejected_info.items():
+                try:
+                    market_data_response = market_data_dict.get(ticker)
+                    technical_indicators = {}
+                    if market_data_response:
+                        technical_indicators = market_data_response.get("technical_analysis", {})
+                        technical_indicators["momentum_score"] = rejection_data.get('momentum_score', 0.0)
+                    
+                    reason_long = rejection_data.get('reason_long', '')
+                    reason_short = rejection_data.get('reason_short', '')
+                    
+                    # Ensure at least one reason is populated
+                    if not reason_long and not reason_short:
+                        logger.warning(f"No rejection reason for {ticker}, skipping MAB rejection log")
+                        continue
+                    
+                    result = await DynamoDBClient.log_inactive_ticker(
+                        ticker=ticker,
+                        indicator=cls.indicator_name(),
+                        reason_not_to_enter_long=reason_long,
+                        reason_not_to_enter_short=reason_short,
+                        technical_indicators=technical_indicators
+                    )
+                    
+                    if not result:
+                        logger.warning(f"Failed to log MAB rejection for {ticker} to InactiveTickersForDayTrading")
+                    else:
+                        logger.debug(f"Logged MAB rejection for {ticker}: long={bool(reason_long)}, short={bool(reason_short)}")
+                except Exception as e:
+                    logger.warning(f"Error logging MAB rejection for {ticker}: {str(e)}")
 
         # Process long entries
         for rank, (ticker, momentum_score, reason) in enumerate(top_upward, start=1):

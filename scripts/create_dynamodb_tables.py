@@ -118,14 +118,16 @@ def main():
     else:
         tables_failed += 1
     
-    # 5. MABStats
+    # 5. MABForDayTradingService
     if create_table_if_not_exists(
-        table_name='MABStats',
+        table_name='MABForDayTradingService',
         key_schema=[
-            {'AttributeName': 'indicator_ticker', 'KeyType': 'HASH'}  # Partition key
+            {'AttributeName': 'ticker', 'KeyType': 'HASH'},  # Partition key
+            {'AttributeName': 'indicator', 'KeyType': 'RANGE'}  # Sort key
         ],
         attribute_definitions=[
-            {'AttributeName': 'indicator_ticker', 'AttributeType': 'S'}
+            {'AttributeName': 'ticker', 'AttributeType': 'S'},
+            {'AttributeName': 'indicator', 'AttributeType': 'S'}
         ]
     ):
         tables_created += 1

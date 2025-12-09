@@ -25,7 +25,7 @@ class MABService:
     """
     
     # Table name for MAB statistics
-    MAB_STATS_TABLE = "MABStats"
+    MAB_STATS_TABLE = "MABForDayTradingService"
     
     # Singleton instance
     _instance: Optional['MABService'] = None
@@ -60,16 +60,14 @@ class MABService:
         Returns:
             Dictionary with statistics or None if not found
         """
-        indicator_ticker = f"{indicator}#{ticker}"
-        
         stats = await self.dynamodb_client.get_item(
             table_name=self.MAB_STATS_TABLE,
-            key={"indicator_ticker": indicator_ticker}
+            key={"ticker": ticker, "indicator": indicator}
         )
         
         if stats:
             logger.debug(
-                f"Retrieved MAB stats for {indicator_ticker}: "
+                f"Retrieved MAB stats for {indicator}#{ticker}: "
                 f"successes={stats.get('successes', 0)}, "
                 f"failures={stats.get('failures', 0)}, "
                 f"total={stats.get('total_trades', 0)}"
@@ -89,8 +87,6 @@ class MABService:
         Returns:
             True if update successful, False otherwise
         """
-        indicator_ticker = f"{indicator}#{ticker}"
-        
         # Get current stats or initialize new ones
         current_stats = await self.get_stats(indicator, ticker)
         
@@ -109,7 +105,7 @@ class MABService:
             # Update in DynamoDB
             result = await self.dynamodb_client.update_item(
                 table_name=self.MAB_STATS_TABLE,
-                key={"indicator_ticker": indicator_ticker},
+                key={"ticker": ticker, "indicator": indicator},
                 update_expression="SET successes = :s, failures = :f, total_trades = :t, last_updated = :lu",
                 expression_attribute_values={
                     ":s": successes,
@@ -121,12 +117,14 @@ class MABService:
         else:
             # Create new stats
             stats = MABStats(
-                indicator_ticker=indicator_ticker,
+                indicator_ticker=f"{indicator}#{ticker}",
                 successes=1 if success else 0,
                 failures=0 if success else 1,
                 total_trades=1,
                 last_updated=datetime.now(timezone.utc).isoformat(),
-                excluded_until=None
+                excluded_until=None,
+                ticker=ticker,
+                indicator=indicator
             )
             
             result = await self.dynamodb_client.put_item(
@@ -136,11 +134,11 @@ class MABService:
         
         if result:
             logger.info(
-                f"Updated MAB stats for {indicator_ticker}: "
+                f"Updated MAB stats for {indicator}#{ticker}: "
                 f"success={success}, new_total={total_trades if current_stats else 1}"
             )
         else:
-            logger.error(f"Failed to update MAB stats for {indicator_ticker}")
+            logger.error(f"Failed to update MAB stats for {indicator}#{ticker}")
         
         return result
     
@@ -163,8 +161,6 @@ class MABService:
         Returns:
             True if exclusion successful, False otherwise
         """
-        indicator_ticker = f"{indicator}#{ticker}"
-        
         # Calculate exclusion end time
         from datetime import timedelta
         excluded_until = (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat()
@@ -176,7 +172,7 @@ class MABService:
             # Update existing stats with exclusion
             result = await self.dynamodb_client.update_item(
                 table_name=self.MAB_STATS_TABLE,
-                key={"indicator_ticker": indicator_ticker},
+                key={"ticker": ticker, "indicator": indicator},
                 update_expression="SET excluded_until = :eu, last_updated = :lu",
                 expression_attribute_values={
                     ":eu": excluded_until,
@@ -186,12 +182,14 @@ class MABService:
         else:
             # Create new stats with exclusion
             stats = MABStats(
-                indicator_ticker=indicator_ticker,
+                indicator_ticker=f"{indicator}#{ticker}",
                 successes=0,
                 failures=0,
                 total_trades=0,
                 last_updated=datetime.now(timezone.utc).isoformat(),
-                excluded_until=excluded_until
+                excluded_until=excluded_until,
+                ticker=ticker,
+                indicator=indicator
             )
             
             result = await self.dynamodb_client.put_item(
@@ -201,10 +199,10 @@ class MABService:
         
         if result:
             logger.info(
-                f"Excluded {indicator_ticker} from MAB selection until {excluded_until}"
+                f"Excluded {indicator}#{ticker} from MAB selection until {excluded_until}"
             )
         else:
-            logger.error(f"Failed to exclude {indicator_ticker} from MAB selection")
+            logger.error(f"Failed to exclude {indicator}#{ticker} from MAB selection")
         
         return result
     
@@ -226,6 +224,50 @@ class MABService:
         now = datetime.now(timezone.utc)
         
         return now < excluded_until
+    
+    @classmethod
+    def get_rejection_reason(
+        cls,
+        stats: Optional[Dict[str, Any]],
+        ticker: str
+    ) -> str:
+        """
+        Generate a human-readable rejection reason for a ticker.
+        
+        Args:
+            stats: MAB statistics for the ticker (or None for new tickers)
+            ticker: Stock ticker symbol
+            
+        Returns:
+            Rejection reason string with format:
+            "MAB rejected: {reason} (successes: X, failures: Y, total: Z)"
+        """
+        if stats is None:
+            # New ticker - should not be rejected, but if called, explain it's new
+            return f"MAB: New ticker - explored by Thompson Sampling (successes: 0, failures: 0, total: 0)"
+        
+        successes = stats.get('successes', 0)
+        failures = stats.get('failures', 0)
+        total_trades = stats.get('total_trades', 0)
+        excluded_until = stats.get('excluded_until')
+        
+        # Check if ticker is excluded
+        if excluded_until:
+            try:
+                excluded_until_dt = datetime.fromisoformat(excluded_until.replace('Z', '+00:00'))
+                now = datetime.now(timezone.utc)
+                if now < excluded_until_dt:
+                    return f"MAB rejected: Excluded until {excluded_until} (successes: {successes}, failures: {failures}, total: {total_trades})"
+            except (ValueError, TypeError):
+                pass
+        
+        # Calculate success rate
+        if total_trades > 0:
+            success_rate = (successes / total_trades) * 100
+            return f"MAB rejected: Low historical success rate ({success_rate:.1f}%) (successes: {successes}, failures: {failures}, total: {total_trades})"
+        else:
+            # No trades yet but not excluded - shouldn't happen, but handle gracefully
+            return f"MAB rejected: Insufficient trading history (successes: {successes}, failures: {failures}, total: {total_trades})"
     
     def thompson_sampling(self, stats_list: List[Dict[str, Any]]) -> List[int]:
         """
@@ -398,6 +440,64 @@ class MABService:
         return selected_tuples
     
     @classmethod
+    async def get_rejected_tickers_with_reasons(
+        cls,
+        indicator: str,
+        ticker_candidates: List[Tuple[str, float, str]],
+        selected_tickers: List[str]
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Get rejection reasons for tickers that passed validation but were rejected by MAB.
+        
+        Args:
+            indicator: Trading indicator name
+            ticker_candidates: List of (ticker, momentum_score, reason) tuples that passed validation
+            selected_tickers: List of ticker symbols selected by MAB
+            
+        Returns:
+            Dictionary mapping ticker -> {
+                'reason_long': rejection reason for long (empty if selected or not applicable),
+                'reason_short': rejection reason for short (empty if selected or not applicable),
+                'momentum_score': momentum score
+            }
+        """
+        instance = cls._get_instance()
+        rejected_info = {}
+        
+        # Create set of selected tickers for fast lookup
+        selected_set = set(selected_tickers)
+        
+        # Process each candidate
+        for ticker, momentum_score, _ in ticker_candidates:
+            # Skip if selected
+            if ticker in selected_set:
+                continue
+            
+            # Get MAB stats for this ticker
+            stats = await instance.get_stats(indicator, ticker)
+            
+            # Determine if this is a long or short candidate
+            is_long = momentum_score > 0
+            is_short = momentum_score < 0
+            
+            # Generate rejection reasons
+            if stats is None:
+                # New ticker - explored by Thompson Sampling
+                # Log as MAB rejection with "explored" reason
+                rejection_reason = f"MAB: New ticker - explored by Thompson Sampling (successes: 0, failures: 0, total: 0)"
+            else:
+                # Existing ticker with stats
+                rejection_reason = cls.get_rejection_reason(stats, ticker)
+            
+            rejected_info[ticker] = {
+                'reason_long': rejection_reason if is_long else '',
+                'reason_short': rejection_reason if is_short else '',
+                'momentum_score': momentum_score
+            }
+        
+        return rejected_info
+    
+    @classmethod
     async def record_trade_outcome(
         cls,
         indicator: str,
@@ -464,18 +564,19 @@ class MABService:
         # Scan for all tickers with this indicator that have exclusions
         all_stats = await instance.dynamodb_client.scan(
             table_name=cls.MAB_STATS_TABLE,
-            filter_expression='begins_with(indicator_ticker, :indicator)',
-            expression_attribute_values={':indicator': f"{indicator}#"}
+            filter_expression='#ind = :indicator AND attribute_exists(excluded_until)',
+            expression_attribute_names={'#ind': 'indicator'},
+            expression_attribute_values={':indicator': indicator}
         )
         
         # Clear exclusions for all tickers
         cleared_count = 0
         for stats in all_stats:
             if stats.get('excluded_until'):
-                indicator_ticker = stats['indicator_ticker']
+                ticker = stats.get('ticker')
                 await instance.dynamodb_client.update_item(
                     table_name=cls.MAB_STATS_TABLE,
-                    key={'indicator_ticker': indicator_ticker},
+                    key={'ticker': ticker, 'indicator': indicator},
                     update_expression='REMOVE excluded_until SET last_updated = :lu',
                     expression_attribute_values={
                         ':lu': datetime.now(timezone.utc).isoformat()
