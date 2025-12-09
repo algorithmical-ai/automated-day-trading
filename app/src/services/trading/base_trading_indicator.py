@@ -13,7 +13,7 @@ from app.src.common.alpaca import AlpacaClient
 from app.src.common.loguru_logger import logger
 from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
 from app.src.services.candidate_generator.alpaca_screener import AlpacaScreenerService
-from app.src.db.dynamodb_client import DynamoDBClient
+from app.src.db.dynamodb_client import DynamoDBClient, _get_est_timestamp
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
 
@@ -364,9 +364,9 @@ class BaseTradingIndicator(ABC):
 
             enter_reason = trade_data.get("enter_reason", "") if trade_data else ""
             enter_timestamp = (
-                trade_data.get("created_at", datetime.now(timezone.utc).isoformat())
+                trade_data.get("created_at", _get_est_timestamp())
                 if trade_data
-                else datetime.now(timezone.utc).isoformat()
+                else _get_est_timestamp()
             )
 
             if not technical_indicators_enter and trade_data:
@@ -376,7 +376,7 @@ class BaseTradingIndicator(ABC):
 
             # Add completed trade
             current_date = date.today().isoformat()
-            exit_timestamp = datetime.now(timezone.utc).isoformat()
+            exit_timestamp = _get_est_timestamp()
 
             await DynamoDBClient.add_completed_trade(
                 date=current_date,
