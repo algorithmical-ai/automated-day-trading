@@ -17,7 +17,6 @@ from app.src.services.trading.validation import (
     TrendAnalyzer,
     QuoteData,
     DataQualityRule,
-    LiquidityRule,
     TrendDirectionRule,
     ContinuationRule,
     PriceExtremeRule,
@@ -262,7 +261,6 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # Create validation rules
         rules = [
             DataQualityRule(required_bars=cls.recent_bars_for_trend),
-            LiquidityRule(max_spread_percent=cls.max_bid_ask_spread_percent),
             TrendDirectionRule(),
             ContinuationRule(min_continuation=0.7),
             PriceExtremeRule(extreme_threshold_percent=1.0),
