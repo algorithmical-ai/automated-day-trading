@@ -101,14 +101,29 @@ class DynamoDBClient:
             return True
             
         except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            
+            # ResourceNotFoundException means the table doesn't exist
+            if error_code == 'ResourceNotFoundException':
+                logger.warning(
+                    f"DynamoDB table not found: {table_name}. Table may not be created yet.",
+                    extra={
+                        "operation": "put_item",
+                        "table": table_name,
+                        "status": "table_not_found"
+                    }
+                )
+                return False
+            
             logger.error(
-                f"DynamoDB ClientError in put_item: {e.response['Error']['Message']}",
+                f"DynamoDB ClientError in put_item: {error_message}",
                 extra={
                     "operation": "put_item",
                     "table": table_name,
                     "status": "failed",
-                    "error_code": e.response['Error']['Code'],
-                    "error_message": e.response['Error']['Message']
+                    "error_code": error_code,
+                    "error_message": error_message
                 }
             )
             return False
@@ -168,14 +183,29 @@ class DynamoDBClient:
             return item
             
         except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            
+            # ResourceNotFoundException means the table doesn't exist - return None gracefully
+            if error_code == 'ResourceNotFoundException':
+                logger.debug(
+                    f"DynamoDB table not found: {table_name}",
+                    extra={
+                        "operation": "get_item",
+                        "table": table_name,
+                        "status": "table_not_found"
+                    }
+                )
+                return None
+            
             logger.error(
-                f"DynamoDB ClientError in get_item: {e.response['Error']['Message']}",
+                f"DynamoDB ClientError in get_item: {error_message}",
                 extra={
                     "operation": "get_item",
                     "table": table_name,
                     "status": "failed",
-                    "error_code": e.response['Error']['Code'],
-                    "error_message": e.response['Error']['Message']
+                    "error_code": error_code,
+                    "error_message": error_message
                 }
             )
             return None
