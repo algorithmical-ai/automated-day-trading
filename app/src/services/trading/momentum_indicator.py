@@ -1280,10 +1280,18 @@ class MomentumIndicator(BaseTradingIndicator):
             technical_analysis = market_data_response if isinstance(market_data_response, dict) else {}
 
             # Use datetime_price for momentum calculation
-            datetime_price_for_momentum = technical_analysis.get("datetime_price", [])
-            if not datetime_price_for_momentum:
+            datetime_price_for_momentum = technical_analysis.get("datetime_price", {})
+            
+            # Check if datetime_price is empty (dict or list)
+            is_empty = (
+                (isinstance(datetime_price_for_momentum, dict) and len(datetime_price_for_momentum) == 0) or
+                (isinstance(datetime_price_for_momentum, list) and len(datetime_price_for_momentum) == 0) or
+                (not datetime_price_for_momentum and datetime_price_for_momentum is not None)
+            )
+            
+            if is_empty:
                 stats["no_datetime_price"] += 1
-                logger.debug(f"No datetime_price data for {ticker}")
+                logger.debug(f"No datetime_price data for {ticker} (type: {type(datetime_price_for_momentum).__name__}, len: {len(datetime_price_for_momentum) if hasattr(datetime_price_for_momentum, '__len__') else 'N/A'})")
                 inactive_ticker_logs.append(
                     {
                         "ticker": ticker,
@@ -1295,7 +1303,7 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 continue
             else:
-                logger.debug(f"Using MCP datetime_price for {ticker} momentum")
+                logger.debug(f"Using MCP datetime_price for {ticker} momentum (type: {type(datetime_price_for_momentum).__name__}, len: {len(datetime_price_for_momentum) if hasattr(datetime_price_for_momentum, '__len__') else 'N/A'})")
 
             momentum_score, reason = cls._calculate_momentum(
                 datetime_price_for_momentum
