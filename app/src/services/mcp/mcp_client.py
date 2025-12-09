@@ -328,6 +328,30 @@ class MCPClient:
             return None
 
     @classmethod
+    async def calculate_technical_indicators(cls, ticker: str) -> Optional[Dict[str, Any]]:
+        """
+        Calculate all technical indicators for a ticker using TA-Lib.
+        
+        Args:
+            ticker: Stock ticker symbol (e.g., "AAPL", "TSLA")
+            
+        Returns:
+            Dict containing technical indicators or None if failed
+        """
+        params = {"ticker": ticker}
+        result = await cls._call_mcp_tool("calculate_technical_indicators", params)
+        
+        # Ensure result is a dict, not a JSON string
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.error(f"Failed to parse calculate_technical_indicators response as JSON: {e}")
+                return None
+        
+        return result
+
+    @classmethod
     async def get_quote(cls, ticker: str) -> Optional[Dict[str, Any]]:
         """Get quote for a ticker"""
         params = {"ticker": ticker}

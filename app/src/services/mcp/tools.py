@@ -127,6 +127,12 @@ async def enter(ticker: str, action: str) -> dict[str, Any]:
         if enter_trade_result is None:
             raise ValueError(f"No enter trade result available for {ticker}")
 
+        # Remove datetime_price from indicators in the response (used internally only)
+        if "analysis" in enter_trade_result and "indicators" in enter_trade_result["analysis"]:
+            indicators = enter_trade_result["analysis"]["indicators"]
+            if isinstance(indicators, dict) and "datetime_price" in indicators:
+                indicators.pop("datetime_price")
+
         return enter_trade_result
     except ValueError as e:
         logger.error(
@@ -183,6 +189,12 @@ async def exit(ticker: str, enter_price: float, action: str) -> dict[str, Any]:
         )
         if exit_trade_result is None:
             raise ValueError(f"No exit trade result available for {ticker}")
+
+        # Remove datetime_price from indicators in the response (used internally only)
+        if "indicators" in exit_trade_result:
+            indicators = exit_trade_result["indicators"]
+            if isinstance(indicators, dict) and "datetime_price" in indicators:
+                indicators.pop("datetime_price")
 
         return exit_trade_result
     except ValueError as e:
@@ -242,8 +254,11 @@ async def get_quote(ticker: str) -> dict[str, Any]:
         ticker: Stock ticker symbol (e.g., "AAPL", "TSLA")
 
     Returns:
-        Dict containing quote data
+        Dict containing flattened quote data with timestamp converted to EST
     """
+    from datetime import datetime
+    import pytz
+    
     ticker = ticker.upper().strip()
 
     invalid_tickers = {"PENDING", "N/A", "NULL", "NONE", ""}
@@ -266,10 +281,30 @@ async def get_quote(ticker: str) -> dict[str, Any]:
                 "message": f"No quote data available for {ticker}",
             }
 
+        # Flatten the nested structure: extract quote data from nested dict
+        # Original: {"quote": {"quotes": {ticker: {...}}}}
+        # Target: {"success": true, "ticker": ticker, "quote": {...}}
+        nested_quotes = quote_response.get("quote", {}).get("quotes", {})
+        quote_data = nested_quotes.get(ticker, {})
+        
+        # Convert timestamp from GMT to EST if present
+        if "t" in quote_data and quote_data["t"]:
+            try:
+                # Parse the ISO 8601 timestamp (GMT/UTC)
+                gmt_time = datetime.fromisoformat(quote_data["t"].replace("Z", "+00:00"))
+                # Convert to EST (US/Eastern timezone)
+                est_tz = pytz.timezone("US/Eastern")
+                est_time = gmt_time.astimezone(est_tz)
+                # Format back to ISO 8601 string with timezone
+                quote_data["t"] = est_time.isoformat()
+            except (ValueError, AttributeError) as e:
+                logger.warning(f"Failed to convert timestamp to EST for {ticker}: {e}")
+                # Keep original timestamp if conversion fails
+
         return {
             "success": True,
             "ticker": ticker,
-            "quote": quote_response,
+            "quote": quote_data,
         }
     except Exception as e:
         logger.error(f"Error getting quote for {ticker}: {str(e)}", exc_info=True)
@@ -316,10 +351,15 @@ async def get_market_data(ticker: str, limit: int = 200) -> dict[str, Any]:
                 "message": f"No market data available for {ticker}",
             }
 
+        # bars_data contains {"bars": {...}, "bars_est": {...}}
+        # Extract the EST-converted bars array for the ticker
+        bars_est_dict = bars_data.get("bars_est", {})
+        ticker_bars_est = bars_est_dict.get(ticker, [])
+
         return {
             "success": True,
             "ticker": ticker,
-            "bars": bars_data,
+            "bars": ticker_bars_est,
         }
     except Exception as e:
         logger.error(
