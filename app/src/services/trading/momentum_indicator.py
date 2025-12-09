@@ -1,6 +1,13 @@
 """
 Momentum Trading Indicator
 Uses price momentum to identify entry and exit signals
+
+IMPROVED ALGORITHM (Dec 2024):
+- Accounts for bid-ask spread in breakeven calculations
+- Uses ExitDecisionEngine for consistent exit logic
+- 60-second minimum holding period
+- Consecutive check requirement before stop loss exit
+- Tiered trailing stops that tighten as profit grows
 """
 
 import asyncio
@@ -26,10 +33,18 @@ from app.src.services.trading.trading_config import (
     TRAILING_STOP_SHORT_MULTIPLIER,
     MAX_TRAILING_STOP_SHORT,
 )
+from app.src.services.trading.penny_stock_utils import (
+    SpreadCalculator,
+    ATRCalculator,
+    TieredTrailingStop,
+    ExitDecisionEngine,
+    ExitDecision,
+    DailyPerformanceMetrics,
+)
 
 
 class MomentumIndicator(BaseTradingIndicator):
-    """Momentum-based trading indicator"""
+    """Momentum-based trading indicator with improved exit logic (Dec 2024)"""
 
     # Momentum-specific configuration
     profit_threshold: float = 1.5
@@ -48,6 +63,15 @@ class MomentumIndicator(BaseTradingIndicator):
     trailing_stop_short_multiplier: float = 1.5  # Wider trailing stop for shorts (3-4%)
     min_adx_threshold: float = 20.0
     rsi_min_for_long: float = 45.0  # Not oversold (avoiding catching falling knives)
+    
+    # IMPROVED: Max bid-ask spread for entry (reject high spread tickers)
+    max_bid_ask_spread_percent: float = 3.0  # INCREASED from 2.0% to 3.0%
+    
+    # Exit decision engine instance (shared across exit cycles)
+    _exit_engine: Optional[ExitDecisionEngine] = None
+    
+    # Daily performance metrics
+    _daily_metrics: Optional[DailyPerformanceMetrics] = None
     rsi_max_for_long: float = 70.0  # Not overbought (avoiding tops)
     rsi_min_for_short: float = (
         50.0  # Minimum RSI to short (avoid oversold bounces, allow shorting stocks with negative momentum)
@@ -58,11 +82,12 @@ class MomentumIndicator(BaseTradingIndicator):
         0.5  # Activate trailing stop after +0.5% profit (tiered system)
     )
     max_entry_hour_et: int = 15  # No entries after 3:00 PM ET (15:00)
+    # IMPROVED: Longer holding periods to let trades develop
     min_holding_period_seconds: int = (
-        30  # Minimum 30 seconds before allowing exit (reduced for quick penny stock exits, was 60)
+        60  # INCREASED from 30 to 60 seconds - give trades room to breathe
     )
     min_holding_period_penny_stocks_seconds: int = (
-        15  # Minimum 15 seconds for penny stocks - allow very quick exits to bank on volatility
+        60  # INCREASED from 15 to 60 seconds - same as regular stocks now
     )
 
     # Volatility and low-priced stock filters
@@ -76,7 +101,7 @@ class MomentumIndicator(BaseTradingIndicator):
         5.0  # Maximum ATR% to allow entry (5% = very volatile)
     )
     max_volatility_for_low_price: float = 50.0  # Allow high volatility for penny stocks - we bank on it! (was 4.0)
-    max_bid_ask_spread_percent: float = 2.0  # Maximum bid-ask spread % for entry
+    # NOTE: max_bid_ask_spread_percent is defined above (3.0%) - removed duplicate here
     trailing_stop_penny_stock_multiplier: float = (
         1.5  # Wider trailing stop for penny stocks (legacy, now overridden)
     )
@@ -1299,13 +1324,21 @@ class MomentumIndicator(BaseTradingIndicator):
 
         logger.debug(f"Entry price for {ticker}: ${enter_price:.4f}")
 
-        # Check bid-ask spread
-        spread_acceptable, _, spread_reason = await cls._check_bid_ask_spread(
-            ticker, enter_price
-        )
-        if not spread_acceptable:
-            logger.info(f"Skipping {ticker}: {spread_reason}")
+        # Check bid-ask spread using SpreadCalculator
+        bid = ticker_quote.get("bp", 0.0)
+        ask = ticker_quote.get("ap", 0.0)
+        spread_percent = SpreadCalculator.calculate_spread_percent(bid, ask)
+        
+        if spread_percent > cls.max_bid_ask_spread_percent:
+            logger.info(
+                f"Skipping {ticker}: bid-ask spread {spread_percent:.2f}% > max {cls.max_bid_ask_spread_percent}%"
+            )
             return False
+
+        # IMPROVED: Calculate breakeven price accounting for spread
+        breakeven_price = SpreadCalculator.calculate_breakeven_price(
+            enter_price, spread_percent, is_long
+        )
 
         # Prepare entry data
         direction = "upward" if is_long else "downward"
@@ -1317,6 +1350,10 @@ class MomentumIndicator(BaseTradingIndicator):
         technical_indicators_for_enter = {
             k: v for k, v in technical_indicators.items() if k != "datetime_price"
         }
+        
+        # IMPROVED: Store spread and breakeven info for exit logic
+        technical_indicators_for_enter["spread_percent"] = spread_percent
+        technical_indicators_for_enter["breakeven_price"] = breakeven_price
 
         await send_signal_to_webhook(
             ticker=ticker,
@@ -2236,16 +2273,40 @@ class MomentumIndicator(BaseTradingIndicator):
                         )
 
             # PRIORITY 2: Check stop loss (cut losses)
+            # IMPROVED: Require consecutive checks before triggering stop loss
+            # This prevents premature exits on momentary price dips
             if not should_exit and profit_percent < stop_loss_threshold:
-                should_exit = True
-                exit_reason = (
-                    f"Stop loss triggered: {profit_percent:.2f}% "
-                    f"(below {stop_loss_threshold:.2f}% stop loss threshold"
-                    f"{' (dynamic)' if dynamic_stop_loss is not None else ''})"
-                )
-                logger.info(
-                    f"Exit signal for {ticker} - stop loss: {profit_percent:.2f}%"
-                )
+                # Initialize exit engine if needed
+                if cls._exit_engine is None:
+                    cls._exit_engine = ExitDecisionEngine()
+                
+                # Track consecutive loss checks
+                consecutive_checks = cls._exit_engine.consecutive_loss_checks.get(ticker, 0) + 1
+                cls._exit_engine.consecutive_loss_checks[ticker] = consecutive_checks
+                
+                # IMPROVED: Require 2 consecutive checks before stop loss exit
+                if consecutive_checks >= 2:
+                    should_exit = True
+                    exit_reason = (
+                        f"Stop loss triggered: {profit_percent:.2f}% "
+                        f"(below {stop_loss_threshold:.2f}% stop loss threshold"
+                        f"{' (dynamic)' if dynamic_stop_loss is not None else ''}, "
+                        f"confirmed after {consecutive_checks} consecutive checks)"
+                    )
+                    logger.info(
+                        f"Exit signal for {ticker} - stop loss: {profit_percent:.2f}%"
+                    )
+                    # Reset counter after exit
+                    cls._exit_engine.consecutive_loss_checks[ticker] = 0
+                else:
+                    logger.debug(
+                        f"Stop loss warning for {ticker}: {profit_percent:.2f}% "
+                        f"(check {consecutive_checks}/2, waiting for confirmation)"
+                    )
+            elif profit_percent >= stop_loss_threshold:
+                # Reset consecutive loss counter if not in loss territory
+                if cls._exit_engine is not None and ticker in cls._exit_engine.consecutive_loss_checks:
+                    cls._exit_engine.consecutive_loss_checks[ticker] = 0
 
             # PRIORITY 3: Force exit before market close ONLY if trade is profitable
             # Hold losing trades until next day (unless stop loss is hit)
@@ -2374,6 +2435,40 @@ class MomentumIndicator(BaseTradingIndicator):
                         for k, v in technical_indicators_for_exit.items()
                         if k != "datetime_price"
                     }
+                
+                # IMPROVED: Add exit metadata
+                technical_indicators_for_exit["holding_seconds"] = holding_seconds
+                
+                # Calculate final profit for metrics
+                final_profit_percent = cls._calculate_profit_percent(
+                    enter_price, exit_price, original_action
+                )
+                
+                # IMPROVED: Track daily performance metrics
+                if cls._daily_metrics is None:
+                    cls._daily_metrics = DailyPerformanceMetrics()
+                
+                # Check if we need to reset daily metrics
+                today = datetime.now().strftime("%Y-%m-%d")
+                if cls._daily_metrics.date != today:
+                    logger.info(f"📊 End of day metrics: {cls._daily_metrics.to_dict()}")
+                    cls._daily_metrics.reset()
+                
+                # Determine if loss was spread-induced
+                spread_percent = float(technical_indicators_for_enter.get("spread_percent", 1.0)) if technical_indicators_for_enter else 1.0
+                is_spread_induced = final_profit_percent < 0 and abs(final_profit_percent) <= spread_percent * 1.5
+                
+                cls._daily_metrics.record_trade(final_profit_percent, is_spread_induced)
+                
+                if is_spread_induced:
+                    logger.warning(
+                        f"📛 Spread-induced loss for {ticker}: {final_profit_percent:.2f}% "
+                        f"(spread was {spread_percent:.2f}%)"
+                    )
+                
+                # Reset consecutive loss counter for this ticker
+                if cls._exit_engine is not None:
+                    cls._exit_engine.reset_ticker(ticker)
 
                 await cls._exit_trade(
                     ticker=ticker,
