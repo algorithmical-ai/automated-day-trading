@@ -1475,7 +1475,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
             stats["passed"] += 1
             ticker_momentum_scores.append((ticker, momentum_score, reason))
-            logger.info(
+            logger.debug(
                 f"{ticker} passed all filters: momentum={momentum_score:.2f}%, "
                 f"{filter_reason}"
             )
@@ -1554,11 +1554,11 @@ class MomentumIndicator(BaseTradingIndicator):
         
         # Log selected tickers for visibility
         if top_upward:
-            logger.info(
+            logger.debug(
                 f"Selected upward tickers: {[(t, f'{s:.2f}%', r[:50]) for t, s, r in top_upward]}"
             )
         if top_downward:
-            logger.info(
+            logger.debug(
                 f"Selected downward tickers: {[(t, f'{s:.2f}%', r[:50]) for t, s, r in top_downward]}"
             )
 
@@ -1659,7 +1659,7 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"Daily trades: {cls.daily_trades_count}/{cls.max_daily_trades}"
             )
         else:
-            logger.info(
+            logger.debug(
                 f"Entry cycle completed: {total_entries_attempted} trade entries attempted "
                 f"({len(top_upward)} long, {len(top_downward)} short)"
             )
@@ -1909,7 +1909,7 @@ class MomentumIndicator(BaseTradingIndicator):
         # Check if we need to force close positions before market close
         is_near_close = cls._is_near_market_close()
         if is_near_close:
-            logger.info(
+            logger.debug(
                 f"Near market close - forcing exit of all {active_count} active positions "
                 f"({cls.minutes_before_close_to_exit} minutes before close)"
             )
@@ -2038,7 +2038,7 @@ class MomentumIndicator(BaseTradingIndicator):
                         f"Force exit for {ticker} before market close: {exit_reason}"
                     )
                 else:
-                    logger.info(
+                    logger.debug(
                         f"Holding {ticker} at end of day (current loss: {profit_percent:.2f}%) - "
                         f"will exit when profitable or stop loss triggered"
                     )

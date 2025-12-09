@@ -598,7 +598,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             try:
                 success = await repository.batch_write_rejections(records)
                 if success:
-                    logger.info(f"Successfully wrote {len(records)} rejection records")
+                    logger.debug(f"Successfully wrote {len(records)} rejection records")
                 else:
                     logger.warning(f"Some rejection records failed to write")
             except Exception as e:
@@ -642,39 +642,16 @@ class PennyStocksIndicator(BaseTradingIndicator):
                         }
                     }
 
-        # Filter out losing tickers from MAB candidates
-        upward_tickers_filtered = [
-            (t, s, r)
-            for t, s, r in upward_tickers
-            if t not in cls._losing_tickers_today
-        ]
-        downward_tickers_filtered = [
-            (t, s, r)
-            for t, s, r in downward_tickers
-            if t not in cls._losing_tickers_today
-        ]
-
-        if len(upward_tickers) != len(upward_tickers_filtered) or len(
-            downward_tickers
-        ) != len(downward_tickers_filtered):
-            excluded_count = (len(upward_tickers) - len(upward_tickers_filtered)) + (
-                len(downward_tickers) - len(downward_tickers_filtered)
-            )
-            logger.info(
-                f"Excluded {excluded_count} losing tickers from MAB selection "
-                f"(upward: {len(upward_tickers_filtered)}/{len(upward_tickers)}, "
-                f"downward: {len(downward_tickers_filtered)}/{len(downward_tickers)})"
-            )
-
+        # Use MAB to select top tickers (don't filter out losing tickers - allow re-entry with good momentum)
         top_upward = await MABService.select_tickers_with_mab(
             cls.indicator_name(),
-            ticker_candidates=upward_tickers_filtered,
+            ticker_candidates=upward_tickers,
             market_data_dict=market_data_for_mab,
             top_k=cls.top_k,
         )
         top_downward = await MABService.select_tickers_with_mab(
             cls.indicator_name(),
-            ticker_candidates=downward_tickers_filtered,
+            ticker_candidates=downward_tickers,
             market_data_dict=market_data_for_mab,
             top_k=cls.top_k,
         )
