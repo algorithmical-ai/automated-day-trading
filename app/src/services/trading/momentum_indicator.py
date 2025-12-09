@@ -803,6 +803,8 @@ class MomentumIndicator(BaseTradingIndicator):
                 prices = [price for _, price in timestamp_price_pairs]
                 
                 logger.debug(f"Extracted {len(prices)} valid prices from dictionary in chronological order")
+                if prices:
+                    logger.debug(f"Price range: {min(prices):.4f} to {max(prices):.4f}")
                 
             except Exception as e:
                 logger.warning(f"Error processing datetime_price dictionary: {e}")
@@ -834,6 +836,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
         # Check if we have enough data
         if len(prices) < 3:
+            logger.debug(f"Insufficient price data: only {len(prices)} prices available (need at least 3)")
             return 0.0, "Insufficient price data"
 
         # Calculate momentum using early vs recent average comparison
@@ -857,7 +860,9 @@ class MomentumIndicator(BaseTradingIndicator):
         trend_percent = (recent_trend / early_avg) * 100 if early_avg > 0 else 0
         momentum_score = (0.7 * change_percent) + (0.3 * trend_percent)
 
-        reason = f"Momentum: {change_percent:.2f}% change, {trend_percent:.2f}% trend (early_avg: {early_avg:.2f}, recent_avg: {recent_avg:.2f})"
+        reason = f"Momentum: {change_percent:.2f}% change, {trend_percent:.2f}% trend (early_avg: {early_avg:.2f}, recent_avg: {recent_avg:.2f}, n={n})"
+        
+        logger.debug(f"Momentum calculation: {reason}")
 
         return momentum_score, reason
 
