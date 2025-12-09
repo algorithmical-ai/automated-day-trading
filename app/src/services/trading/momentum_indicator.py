@@ -762,6 +762,8 @@ class MomentumIndicator(BaseTradingIndicator):
         Returns:
             Tuple of (momentum_score, reason_string)
         """
+        logger.debug(f"_calculate_momentum called with type: {type(datetime_price).__name__}, empty: {not datetime_price}")
+        
         if not datetime_price:
             return 0.0, "Insufficient price data"
 
