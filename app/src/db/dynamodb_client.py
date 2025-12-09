@@ -625,6 +625,41 @@ class DynamoDBClient:
         )
     
     @classmethod
+    async def update_momentum_trade_trailing_stop(
+        cls,
+        ticker: str,
+        indicator: str,
+        trailing_stop: float,
+        peak_profit_percent: float,
+        skipped_exit_reason: str,
+    ) -> bool:
+        """
+        Update trailing stop and peak profit for an active momentum trade.
+        
+        Args:
+            ticker: Stock ticker symbol
+            indicator: Trading indicator name
+            trailing_stop: Trailing stop percentage
+            peak_profit_percent: Peak profit percentage since entry
+            skipped_exit_reason: Reason why exit was skipped
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        instance = cls._get_instance()
+        
+        return await instance.update_item(
+            table_name='ActiveTickersForAutomatedDayTrader',
+            key={'ticker': ticker},
+            update_expression='SET trailing_stop = :ts, peak_profit_percent = :pp, skipped_exit_reason = :ser',
+            expression_attribute_values={
+                ':ts': trailing_stop,
+                ':pp': peak_profit_percent,
+                ':ser': skipped_exit_reason,
+            }
+        )
+    
+    @classmethod
     async def add_completed_trade(
         cls,
         date: str,
