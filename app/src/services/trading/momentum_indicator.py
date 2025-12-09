@@ -751,31 +751,92 @@ class MomentumIndicator(BaseTradingIndicator):
             return False, "No clear downtrend structure"
 
     @classmethod
-    def _calculate_momentum(cls, datetime_price: List[Any]) -> Tuple[float, str]:
-        """Calculate price momentum score from datetime_price array"""
-        if not datetime_price or len(datetime_price) < 3:
+    def _calculate_momentum(cls, datetime_price: Any) -> Tuple[float, str]:
+        """
+        Calculate price momentum score from datetime_price.
+        
+        Args:
+            datetime_price: Either a dict mapping timestamp strings to prices,
+                          or a list of entries (legacy format)
+        
+        Returns:
+            Tuple of (momentum_score, reason_string)
+        """
+        if not datetime_price:
             return 0.0, "Insufficient price data"
 
         prices = []
-        for entry in datetime_price:
+        
+        # Handle dictionary format (current format from TechnicalAnalysisLib)
+        if isinstance(datetime_price, dict):
+            logger.debug(f"Processing datetime_price as dictionary with {len(datetime_price)} entries")
             try:
-                if isinstance(entry, list):
-                    if len(entry) >= 2:
-                        prices.append(float(entry[1]))
-                elif isinstance(entry, dict):
-                    price = (
-                        entry.get("price")
-                        or entry.get("close")
-                        or entry.get("close_price")
-                    )
-                    if price is not None:
-                        prices.append(float(price))
-            except (ValueError, TypeError, KeyError, IndexError):
-                continue
+                # Extract (timestamp, price) pairs and sort by timestamp
+                timestamp_price_pairs = []
+                for timestamp_str, price in datetime_price.items():
+                    try:
+                        # Parse ISO timestamp
+                        from datetime import datetime
+                        if isinstance(timestamp_str, str):
+                            # Handle various timestamp formats
+                            if timestamp_str.endswith('Z'):
+                                dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                            else:
+                                dt = datetime.fromisoformat(timestamp_str)
+                        else:
+                            logger.debug(f"Skipping non-string timestamp key: {type(timestamp_str)}")
+                            continue
+                        
+                        # Validate price
+                        if price is not None and isinstance(price, (int, float)) and price > 0:
+                            timestamp_price_pairs.append((dt, float(price)))
+                        else:
+                            logger.debug(f"Skipping invalid price: {price}")
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"Skipping invalid timestamp/price pair: {timestamp_str}={price}, error: {e}")
+                        continue
+                
+                # Sort by timestamp (chronological order)
+                timestamp_price_pairs.sort(key=lambda x: x[0])
+                
+                # Extract prices in chronological order
+                prices = [price for _, price in timestamp_price_pairs]
+                
+                logger.debug(f"Extracted {len(prices)} valid prices from dictionary in chronological order")
+                
+            except Exception as e:
+                logger.warning(f"Error processing datetime_price dictionary: {e}")
+                return 0.0, f"Error processing datetime_price dictionary: {str(e)}"
+        
+        # Handle list format (legacy format)
+        elif isinstance(datetime_price, list):
+            logger.debug(f"Processing datetime_price as list with {len(datetime_price)} entries")
+            for entry in datetime_price:
+                try:
+                    if isinstance(entry, list):
+                        if len(entry) >= 2:
+                            prices.append(float(entry[1]))
+                    elif isinstance(entry, dict):
+                        price = (
+                            entry.get("price")
+                            or entry.get("close")
+                            or entry.get("close_price")
+                        )
+                        if price is not None:
+                            prices.append(float(price))
+                except (ValueError, TypeError, KeyError, IndexError):
+                    continue
+        
+        # Handle unexpected format
+        else:
+            logger.warning(f"Unexpected datetime_price format: {type(datetime_price)}")
+            return 0.0, f"Invalid datetime_price format: {type(datetime_price).__name__}"
 
+        # Check if we have enough data
         if len(prices) < 3:
             return 0.0, "Insufficient price data"
 
+        # Calculate momentum using early vs recent average comparison
         n = len(prices)
         early_count = max(1, n // 3)
         recent_count = max(1, n // 3)
