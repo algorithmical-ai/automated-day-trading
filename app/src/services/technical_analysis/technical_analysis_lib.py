@@ -438,8 +438,8 @@ class TechnicalAnalysisLib:
             # Volume
             volume_val = volume[-1] if len(volume) > 0 else 0.0
 
-            # Extract datetime and price for datetime_price tuple from original prices DataFrame
-            datetime_price: tuple = (("dummy", 0.0),)  # Default
+            # Extract datetime and price for datetime_price dict from original prices DataFrame
+            datetime_price: dict = {}  # Default
             if "timestamp" in prices.columns and "price" in prices.columns:
                 datetime_price_df = prices[["timestamp", "price"]].copy()
                 # Ensure timestamp is datetime type
@@ -451,14 +451,13 @@ class TechnicalAnalysisLib:
                     )
 
                 # Timestamps are already in EST from get_market_data(), no conversion needed
-                datetime_price_list = []
+                datetime_price = {}
                 for ts, price in datetime_price_df.itertuples(index=False, name=None):
                     if hasattr(ts, "isoformat"):
                         ts_str = ts.isoformat()
                     else:
                         ts_str = str(ts)
-                    datetime_price_list.append((ts_str, float(price)))
-                datetime_price = tuple(datetime_price_list)
+                    datetime_price[ts_str] = float(price)
 
             # Return all as dict to include additional
             return {

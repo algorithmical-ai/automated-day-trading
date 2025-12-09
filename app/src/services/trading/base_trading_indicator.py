@@ -24,7 +24,7 @@ class BaseTradingIndicator(ABC):
     # Class-level configuration
     running: bool = True
     max_active_trades: int = 5
-    max_daily_trades: int = 5
+    max_daily_trades: int = 20
     ticker_cooldown_minutes: int = 60
     entry_cycle_seconds: int = 5
     exit_cycle_seconds: int = 5
