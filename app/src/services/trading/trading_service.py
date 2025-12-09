@@ -46,8 +46,8 @@ class TradingServiceCoordinator:
         
         enable_momentum = os.getenv("ENABLE_MOMENTUM_INDICATOR", "true").lower() == "true"
         enable_penny_stocks = os.getenv("ENABLE_PENNY_STOCKS_INDICATOR", "true").lower() == "true"
-        enable_deep_analyzer = os.getenv("ENABLE_DEEP_ANALYZER_INDICATOR", "true").lower() == "false"
-        enable_uw_enhanced = os.getenv("ENABLE_UW_ENHANCED_INDICATOR", "true").lower() == "false"
+        enable_deep_analyzer = os.getenv("ENABLE_DEEP_ANALYZER_INDICATOR", "true").lower() == "true"
+        enable_uw_enhanced = os.getenv("ENABLE_UW_ENHANCED_INDICATOR", "true").lower() == "true"
 
         # Configure enabled indicators
         if enable_momentum:
