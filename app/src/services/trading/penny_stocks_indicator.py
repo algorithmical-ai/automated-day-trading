@@ -63,14 +63,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
     default_atr_stop_percent: float = -2.0  # Default ATR-based stop loss
     
     top_k: int = 2  # Top K tickers to select
-    min_momentum_threshold: float = 1.5  # Minimum 1.5% momentum to enter
+    min_momentum_threshold: float = 3.0  # Minimum 3% momentum to enter (INCREASED from 1.5%)
     max_momentum_threshold: float = 15.0  # Maximum 15% momentum
-    exceptional_momentum_threshold: float = 3.0  # Exceptional momentum for preemption (lowered from 8.0%)
+    exceptional_momentum_threshold: float = 8.0  # Exceptional momentum for preemption (REVERTED to 8.0%)
     
     min_volume: int = 500  # Minimum daily volume
     min_avg_volume: int = 1000  # Minimum average daily volume
-    max_price_discrepancy_percent: float = 10.0  # Max % difference between quote and close
-    max_bid_ask_spread_percent: float = 3.0  # INCREASED: Max bid-ask spread (was 2.0%)
+    max_price_discrepancy_percent: float = 5.0  # Max % difference between quote and close (TIGHTENED from 10%)
+    max_bid_ask_spread_percent: float = 2.0  # Max bid-ask spread (TIGHTENED from 3.0%)
+    
+    # SAFETY: Disable shorting for penny stocks - too risky (can spike 100%+ in minutes)
+    allow_short_positions: bool = False
     
     entry_cycle_seconds: int = 1  # Check for entries every 1 second
     exit_cycle_seconds: int = 1  # Check exits every 1 second
@@ -672,19 +675,19 @@ class PennyStocksIndicator(BaseTradingIndicator):
         )
 
         # Separate upward and downward momentum
-        # SIMPLIFIED: Trust Alpaca's gainer signal - any positive momentum = long, negative = short
-        # We removed the MomentumConfirmation check, so we can be more lenient here
-        MIN_MOMENTUM_FOR_ENTRY = 0.01  # Very low threshold - trust Alpaca's screening
+        # RESTORED: Require minimum momentum threshold to filter out weak signals
+        # The 0.01% threshold was too permissive and led to many losing trades
+        MIN_MOMENTUM_FOR_ENTRY = cls.min_momentum_threshold  # Use class config (3.0%)
         
         upward_tickers = [
             (t, score, reason)
             for t, score, reason in ticker_momentum_scores
-            if score > MIN_MOMENTUM_FOR_ENTRY  # Any positive momentum = potential long
+            if score >= MIN_MOMENTUM_FOR_ENTRY  # Require meaningful upward momentum
         ]
         downward_tickers = [
             (t, score, reason)
             for t, score, reason in ticker_momentum_scores
-            if score < -MIN_MOMENTUM_FOR_ENTRY  # Any negative momentum = potential short
+            if score <= -MIN_MOMENTUM_FOR_ENTRY  # Require meaningful downward momentum
         ]
         
         logger.info(
@@ -884,41 +887,43 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 is_golden=False,
             )
 
-        # Process short entries
-        for rank, (ticker, momentum_score, reason) in enumerate(top_downward, start=1):
-            if not cls.running:
-                break
+        # Process short entries (if enabled)
+        # SAFETY: Shorting penny stocks is extremely risky - they can spike 100%+ in minutes
+        if cls.allow_short_positions:
+            for rank, (ticker, momentum_score, reason) in enumerate(top_downward, start=1):
+                if not cls.running:
+                    break
 
-            await cls._process_ticker_entry(
-                ticker=ticker,
-                momentum_score=momentum_score,
-                reason=reason,
-                rank=rank,
-                action="sell_to_open",
-                market_data_dict=market_data_dict,
-                daily_limit_reached=daily_limit_reached,
-                is_golden=False,
-            )
+                await cls._process_ticker_entry(
+                    ticker=ticker,
+                    momentum_score=momentum_score,
+                    reason=reason,
+                    rank=rank,
+                    action="sell_to_open",
+                    market_data_dict=market_data_dict,
+                    daily_limit_reached=daily_limit_reached,
+                    is_golden=False,
+                )
+        else:
+            if top_downward:
+                logger.info(
+                    f"⚠️ Skipping {len(top_downward)} short entries - shorting disabled for penny stocks (too risky)"
+                )
 
         await asyncio.sleep(cls.entry_cycle_seconds)
 
     @classmethod
-    async def _find_worst_performing_trade(
+    async def _find_lowest_profitable_trade(
         cls, active_trades: List[Dict[str, Any]]
     ) -> Optional[Tuple[Dict[str, Any], float]]:
         """
-        Find the worst performing trade from active trades for preemption.
+        Find the lowest profitable trade from active trades for preemption.
         
-        IMPROVED: Now considers ALL trades, not just profitable ones.
-        When we have exceptional momentum opportunity, we should be willing to
-        exit even losing trades to make room for better opportunities.
-        
-        Priority for preemption:
-        1. Trades with smallest profit (or largest loss)
-        2. Older trades (longer holding time = less likely to recover)
+        CONSERVATIVE: Only preempt trades that are already profitable.
+        This ensures we lock in gains rather than locking in losses.
         """
-        worst_profit = None
-        worst_trade = None
+        lowest_profit = None
+        lowest_trade = None
 
         for trade in active_trades:
             ticker = trade.get("ticker")
@@ -941,13 +946,15 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 enter_price, current_price, action
             )
 
-            # Find the trade with the worst (lowest) profit - could be negative
-            if worst_profit is None or profit_percent < worst_profit:
-                worst_profit = profit_percent
-                worst_trade = trade
+            # Only consider profitable trades for preemption (>= 0.5% profit)
+            # This ensures we don't lock in losses
+            if profit_percent >= 0.5:
+                if lowest_profit is None or profit_percent < lowest_profit:
+                    lowest_profit = profit_percent
+                    lowest_trade = trade
 
-        if worst_trade and worst_profit is not None:
-            return (worst_trade, worst_profit)
+        if lowest_trade and lowest_profit is not None:
+            return (lowest_trade, lowest_profit)
         return None
 
     @classmethod
@@ -955,36 +962,31 @@ class PennyStocksIndicator(BaseTradingIndicator):
         cls, new_ticker: str, new_momentum_score: float
     ) -> bool:
         """
-        Preempt the worst performing trade to make room for exceptional momentum trade.
+        Preempt the lowest profitable trade to make room for exceptional momentum trade.
         
-        IMPROVED: Now preempts ANY trade (including losing ones) when we have
-        exceptional momentum opportunity. The philosophy is:
-        - If we have a 10%+ momentum opportunity, it's better to cut a -2% loser
-          and enter the new trade than to hold the loser hoping it recovers.
-        - Penny stocks are volatile - exceptional momentum signals are rare and valuable.
+        CONSERVATIVE: Only preempt trades that are already profitable (>= 0.5%).
+        This ensures we lock in gains rather than locking in losses.
         """
         active_trades = await cls._get_active_trades()
 
         if len(active_trades) < cls.max_active_trades:
             return False
 
-        result = await cls._find_worst_performing_trade(active_trades)
+        result = await cls._find_lowest_profitable_trade(active_trades)
         if not result:
-            logger.debug("No trades available to preempt")
+            logger.debug("No profitable trades to preempt (all trades are losing or below 0.5%)")
             return False
 
-        worst_trade, worst_profit = result
-        ticker_to_exit = worst_trade.get("ticker")
+        lowest_trade, lowest_profit = result
+        ticker_to_exit = lowest_trade.get("ticker")
 
-        # Log the preemption decision
-        profit_emoji = "💰" if worst_profit >= 0 else "📉"
         logger.info(
-            f"Preempting {ticker_to_exit} {profit_emoji} (profit: {worst_profit:.2f}%) "
+            f"Preempting {ticker_to_exit} 💰 (profit: {lowest_profit:.2f}%) "
             f"to make room for {new_ticker} (momentum: {new_momentum_score:.2f}%)"
         )
 
-        original_action = worst_trade.get("action")
-        enter_price = worst_trade.get("enter_price")
+        original_action = lowest_trade.get("action")
+        enter_price = lowest_trade.get("enter_price")
         
         # Convert Decimal to float if needed (DynamoDB returns Decimal)
         if enter_price is not None:
@@ -1019,9 +1021,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
             )
             return False
 
-        reason = f"Preempted for exceptional trade: {worst_profit:.2f}% profit"
+        reason = f"Preempted for exceptional trade: {lowest_profit:.2f}% profit"
 
-        technical_indicators_for_enter = worst_trade.get(
+        technical_indicators_for_enter = lowest_trade.get(
             "technical_indicators_for_enter"
         )
 
@@ -1193,11 +1195,22 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     )
                     return False
 
-        # REMOVED: MomentumConfirmation check was too restrictive for penny stocks
-        # Alpaca's gainers/most_actives ARE the momentum signal - we trust it
-        # The old check required 3/5 bars in trend direction which filtered out
-        # many valid opportunities where Alpaca identified momentum but bars were choppy
-        logger.debug(f"{ticker} proceeding with entry (trusting Alpaca gainer signal)")
+        # RESTORED: Momentum confirmation check - verify trend is continuing
+        # Without this, we were entering trades that immediately reversed
+        from app.src.services.trading.penny_stock_utils import MomentumConfirmation
+        
+        is_confirmed, confirm_reason = MomentumConfirmation.is_momentum_confirmed(
+            ticker_bars, is_long
+        )
+        if not is_confirmed:
+            logger.info(f"Skipping {ticker}: momentum not confirmed - {confirm_reason}")
+            await cls._log_selected_ticker_entry_failure(
+                ticker, momentum_score, action,
+                f"Momentum not confirmed: {confirm_reason}"
+            )
+            return False
+        
+        logger.debug(f"{ticker} momentum confirmed: {confirm_reason}")
 
         # IMPROVED: Calculate breakeven price accounting for spread
         breakeven_price = SpreadCalculator.calculate_breakeven_price(
