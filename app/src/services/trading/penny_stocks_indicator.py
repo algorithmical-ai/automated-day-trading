@@ -1425,7 +1425,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 continue
 
             # Get technical indicators from entry (contains spread and ATR info)
+            # Handle case where tech_indicators might be a JSON string instead of dict
             tech_indicators_enter = trade.get("technical_indicators_for_enter", {})
+            if isinstance(tech_indicators_enter, str):
+                try:
+                    import json
+                    tech_indicators_enter = json.loads(tech_indicators_enter)
+                except (json.JSONDecodeError, TypeError):
+                    tech_indicators_enter = {}
+            if not isinstance(tech_indicators_enter, dict):
+                tech_indicators_enter = {}
+            
             spread_percent = float(tech_indicators_enter.get("spread_percent", 1.0))  # Default 1%
             breakeven_price = float(tech_indicators_enter.get("breakeven_price", enter_price))
             atr_stop_percent = float(tech_indicators_enter.get("atr_stop_percent", cls.default_atr_stop_percent))
