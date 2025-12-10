@@ -25,11 +25,6 @@ from app.src.services.trading.base_trading_indicator import BaseTradingIndicator
 from app.src.services.trading.validation import (
     TrendAnalyzer,
     QuoteData,
-    DataQualityRule,
-    TrendDirectionRule,
-    ContinuationRule,
-    PriceExtremeRule,
-    MomentumThresholdRule,
     RejectionCollector,
     InactiveTickerRepository
 )
@@ -37,7 +32,6 @@ from app.src.services.trading.penny_stock_utils import (
     SpreadCalculator,
     ATRCalculator,
     TieredTrailingStop,
-    MomentumConfirmation,
     ExitDecisionEngine,
     ExitDecision,
     DailyPerformanceMetrics,
@@ -274,7 +268,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
         collector: RejectionCollector
     ) -> bool:
         """
-        Validate ticker using the validation pipeline.
+        Validate ticker using SIMPLIFIED validation for penny stocks.
+        
+        PHILOSOPHY: Alpaca's gainers/most_actives ARE the momentum signal.
+        We trust that signal and only do minimal validation:
+        1. Have at least 3 bars (minimal data quality)
+        2. Valid bid/ask spread (can actually trade)
+        
+        We DON'T over-filter with:
+        - Complex momentum thresholds (Alpaca already screened for momentum)
+        - Continuation scores (too restrictive for volatile penny stocks)
+        - Price extreme rules (penny stocks are volatile by nature)
         
         Args:
             ticker: Stock ticker symbol
@@ -283,42 +287,52 @@ class PennyStocksIndicator(BaseTradingIndicator):
             collector: RejectionCollector to accumulate rejections
             
         Returns:
-            True if ticker passes all validation rules, False otherwise
+            True if ticker passes validation, False otherwise
         """
-        # Calculate trend metrics
+        # Calculate trend metrics for logging purposes
         trend_metrics = TrendAnalyzer.calculate_trend_metrics(bars)
         
-        # Create validation rules
-        rules = [
-            DataQualityRule(required_bars=cls.recent_bars_for_trend),
-            TrendDirectionRule(),
-            ContinuationRule(min_continuation=0.7),
-            PriceExtremeRule(extreme_threshold_percent=1.0),
-            MomentumThresholdRule(
-                min_momentum=cls.min_momentum_threshold,
-                max_momentum=cls.max_momentum_threshold
+        # SIMPLIFIED VALIDATION - Only essential checks
+        
+        # 1. Minimal data quality - need at least 3 bars to calculate any trend
+        MIN_BARS_REQUIRED = 3
+        if not bars or len(bars) < MIN_BARS_REQUIRED:
+            reason = f"Insufficient bars data (need {MIN_BARS_REQUIRED}, got {len(bars) if bars else 0})"
+            collector.add_rejection(
+                ticker=ticker,
+                indicator=cls.indicator_name(),
+                reason_long=reason,
+                reason_short=reason,
+                technical_indicators=trend_metrics.to_dict() if trend_metrics else None
             )
-        ]
+            return False
         
-        # Apply validation rules sequentially (early termination on first failure)
-        for rule in rules:
-            result = rule.validate(ticker, trend_metrics, quote_data, bars)
-            
-            if not result.passed:
-                # Add rejection to collector
-                technical_indicators = trend_metrics.to_dict() if trend_metrics else None
-                
-                collector.add_rejection(
-                    ticker=ticker,
-                    indicator=cls.indicator_name(),
-                    reason_long=result.reason_long,
-                    reason_short=result.reason_short,
-                    technical_indicators=technical_indicators
-                )
-                
-                return False
+        # 2. Valid bid/ask - must be able to actually trade
+        if quote_data.bid <= 0 or quote_data.ask <= 0:
+            reason = f"Invalid bid/ask: bid={quote_data.bid}, ask={quote_data.ask}"
+            collector.add_rejection(
+                ticker=ticker,
+                indicator=cls.indicator_name(),
+                reason_long=reason,
+                reason_short=reason,
+                technical_indicators=trend_metrics.to_dict() if trend_metrics else None
+            )
+            return False
         
-        # All rules passed
+        # 3. Spread check - but be lenient for penny stocks (they're volatile)
+        MAX_SPREAD_FOR_PENNY = 5.0  # Allow up to 5% spread for penny stocks
+        if quote_data.spread_percent > MAX_SPREAD_FOR_PENNY:
+            reason = f"Bid-ask spread too wide: {quote_data.spread_percent:.2f}% > {MAX_SPREAD_FOR_PENNY}%"
+            collector.add_rejection(
+                ticker=ticker,
+                indicator=cls.indicator_name(),
+                reason_long=reason,
+                reason_short=reason,
+                technical_indicators=trend_metrics.to_dict() if trend_metrics else None
+            )
+            return False
+        
+        # PASSED - Trust Alpaca's gainer/most_active signal
         return True
 
     @classmethod
@@ -612,12 +626,20 @@ class PennyStocksIndicator(BaseTradingIndicator):
             momentum_score = trend_metrics.momentum_score
             reason = trend_metrics.reason
             
-            # FIXED: Skip tickers with zero momentum (no clear trend direction)
-            # These would fail MomentumConfirmation later anyway
-            if momentum_score == 0.0:
-                stats["low_momentum"] += 1
-                logger.debug(f"{ticker} has zero momentum, skipping (no clear trend)")
-                continue
+            # SIMPLIFIED: Accept any momentum - Alpaca already screened these as gainers/most_actives
+            # Even if our calculated momentum is 0, Alpaca identified this as a mover
+            # Use a small positive/negative value if momentum is exactly 0 to indicate direction
+            if momentum_score == 0.0 and ticker_bars:
+                # Determine direction from price change
+                first_price = ticker_bars[0].get("c", 0)
+                last_price = ticker_bars[-1].get("c", 0)
+                if first_price > 0 and last_price > 0:
+                    price_change = ((last_price - first_price) / first_price) * 100
+                    momentum_score = price_change if price_change != 0 else 0.1  # Default to slight positive
+                    reason = f"Price change: {price_change:.2f}% (Alpaca gainer signal)"
+                else:
+                    momentum_score = 0.1  # Default to slight positive for Alpaca gainers
+                    reason = "Alpaca gainer signal (insufficient price data for momentum calc)"
             
             stats["passed"] += 1
             ticker_momentum_scores.append((ticker, momentum_score, reason))
@@ -650,32 +672,25 @@ class PennyStocksIndicator(BaseTradingIndicator):
         )
 
         # Separate upward and downward momentum
-        # FIXED: Exclude tickers with zero or near-zero momentum (no clear trend)
-        # These tickers pass initial validation but have no directional momentum,
-        # causing MomentumConfirmation to fail later with "Only X/3 bars in trend direction"
-        MIN_MOMENTUM_FOR_ENTRY = 0.5  # Require at least 0.5% momentum to have a clear direction
+        # SIMPLIFIED: Trust Alpaca's gainer signal - any positive momentum = long, negative = short
+        # We removed the MomentumConfirmation check, so we can be more lenient here
+        MIN_MOMENTUM_FOR_ENTRY = 0.01  # Very low threshold - trust Alpaca's screening
         
         upward_tickers = [
             (t, score, reason)
             for t, score, reason in ticker_momentum_scores
-            if score >= MIN_MOMENTUM_FOR_ENTRY  # Positive momentum only (exclude 0 and near-zero)
+            if score > MIN_MOMENTUM_FOR_ENTRY  # Any positive momentum = potential long
         ]
         downward_tickers = [
             (t, score, reason)
             for t, score, reason in ticker_momentum_scores
-            if score <= -MIN_MOMENTUM_FOR_ENTRY  # Negative momentum only (exclude 0 and near-zero)
+            if score < -MIN_MOMENTUM_FOR_ENTRY  # Any negative momentum = potential short
         ]
         
-        # Log tickers excluded due to zero/weak momentum
-        zero_momentum_tickers = [
-            t for t, score, _ in ticker_momentum_scores 
-            if abs(score) < MIN_MOMENTUM_FOR_ENTRY
-        ]
-        if zero_momentum_tickers:
-            logger.debug(
-                f"Excluded {len(zero_momentum_tickers)} tickers with zero/weak momentum: "
-                f"{zero_momentum_tickers[:5]}{'...' if len(zero_momentum_tickers) > 5 else ''}"
-            )
+        logger.info(
+            f"Momentum split: {len(upward_tickers)} upward, {len(downward_tickers)} downward "
+            f"(from {len(ticker_momentum_scores)} total candidates)"
+        )
 
         # Use MAB to select top tickers
         # For penny stocks, we'll use a simplified market data dict
@@ -1158,21 +1173,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     )
                     return False
 
-        # IMPROVED: Check momentum confirmation (3/5 bars in trend + last bar confirms)
-        if ticker_bars:
-            is_confirmed, confirm_reason = MomentumConfirmation.is_momentum_confirmed(
-                ticker_bars, is_long
-            )
-            if not is_confirmed:
-                logger.info(
-                    f"Skipping {ticker}: momentum not confirmed - {confirm_reason}"
-                )
-                await cls._log_selected_ticker_entry_failure(
-                    ticker, momentum_score, action, 
-                    f"Momentum not confirmed: {confirm_reason}"
-                )
-                return False
-            logger.debug(f"{ticker} momentum confirmed: {confirm_reason}")
+        # REMOVED: MomentumConfirmation check was too restrictive for penny stocks
+        # Alpaca's gainers/most_actives ARE the momentum signal - we trust it
+        # The old check required 3/5 bars in trend direction which filtered out
+        # many valid opportunities where Alpaca identified momentum but bars were choppy
+        logger.debug(f"{ticker} proceeding with entry (trusting Alpaca gainer signal)")
 
         # IMPROVED: Calculate breakeven price accounting for spread
         breakeven_price = SpreadCalculator.calculate_breakeven_price(
