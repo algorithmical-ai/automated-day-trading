@@ -2455,7 +2455,15 @@ class MomentumIndicator(BaseTradingIndicator):
                     cls._daily_metrics.reset()
                 
                 # Determine if loss was spread-induced
-                spread_percent = float(technical_indicators_for_enter.get("spread_percent", 1.0)) if technical_indicators_for_enter else 1.0
+                # Handle case where technical_indicators_for_enter might be a string or dict
+                if isinstance(technical_indicators_for_enter, str):
+                    import json
+                    try:
+                        technical_indicators_for_enter = json.loads(technical_indicators_for_enter)
+                    except (json.JSONDecodeError, TypeError):
+                        technical_indicators_for_enter = {}
+                
+                spread_percent = float(technical_indicators_for_enter.get("spread_percent", 1.0)) if isinstance(technical_indicators_for_enter, dict) else 1.0
                 is_spread_induced = final_profit_percent < 0 and abs(final_profit_percent) <= spread_percent * 1.5
                 
                 cls._daily_metrics.record_trade(final_profit_percent, is_spread_induced)
