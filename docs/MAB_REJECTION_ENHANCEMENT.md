@@ -4,7 +4,13 @@ This document explains how to enhance the `InactiveTickersForDayTrading` table w
 
 ## Problem Statement
 
-The `InactiveTickersForDayTrading` table contains records of tickers that were evaluated but not traded. However, many records have empty `reason_not_to_enter_long` and `reason_not_to_enter_short` fields, making it difficult to understand why certain tickers were not selected for trading.
+The `InactiveTickersForDayTrading` table contains records of tickers that were evaluated but not traded. However, many records have empty `reason_not_to_enter_long` and `reason_not_to_enter_short` fields, creating confusion about whether tickers were:
+
+1. **Rejected by MAB** (not selected for trading) - BAD outcome
+2. **Selected by MAB** but failed entry validation - NEEDS INVESTIGATION  
+3. **Successfully traded** (should appear in ActiveTickers) - GOOD outcome
+
+This ambiguity makes it difficult to analyze MAB performance and debug trading issues.
 
 ## Solution Overview
 
@@ -12,7 +18,17 @@ The MAB Rejection Enhancement system provides:
 
 1. **Historical Enhancement**: Backfill empty rejection reasons in existing records
 2. **Real-time Enhancement**: Ensure new records always have populated rejection reasons
-3. **Comprehensive Reporting**: Generate enhanced CSV exports for analysis
+3. **Comprehensive Logging**: Log ALL ticker outcomes with clear categorization
+4. **Enhanced Reporting**: Generate detailed CSV exports for analysis
+
+### Comprehensive Ticker Outcome Logging
+
+The enhanced system now logs **every ticker** with clear outcome categories:
+
+- ❌ **MAB Rejected**: Passed validation but not selected by MAB
+- ✅ **MAB Selected**: Chosen by MAB for trading attempt  
+- ⚠️ **Selected but Failed Entry**: Chosen by MAB but failed entry validation
+- 🚀 **Successfully Traded**: Entered active trade (appears in ActiveTickers)
 
 ## Key Components
 
@@ -34,14 +50,33 @@ The penny stocks indicator has been enhanced to automatically populate rejection
 
 ## Types of Rejection Reasons
 
-### MAB-Based Rejections
+### MAB Rejection Reasons (❌ Not Selected)
 
-When MAB statistics are available:
+When tickers pass validation but MAB doesn't select them:
 
 ```
 MAB rejected: Low historical success rate (30.0%) (successes: 3, failures: 7, total: 10)
 MAB rejected: Excluded until 2024-12-10T15:30:00-05:00 (successes: 0, failures: 3, total: 3)
 MAB: New ticker - not selected by Thompson Sampling (successes: 0, failures: 0, total: 0)
+```
+
+### MAB Selection Reasons (✅ Selected)
+
+When tickers are chosen by MAB for trading:
+
+```
+✅ Selected by MAB for long entry - ranked in top 2 (success rate: 75.0%, momentum: 3.2%)
+✅ Selected by MAB for short entry - ranked in top 2 (new ticker, momentum: -2.8%)
+```
+
+### Entry Failure Reasons (⚠️ Selected but Failed)
+
+When MAB-selected tickers fail entry validation:
+
+```
+⚠️ Selected by MAB for long entry (momentum: 4.1%) but failed validation: Bid-ask spread too wide: 5.2% > max 3.0%
+⚠️ Selected by MAB for long entry (momentum: 2.9%) but failed validation: At max capacity (10/10), momentum 2.9% < exceptional threshold 8.0%
+⚠️ Selected by MAB for long entry (momentum: 3.5%) but failed validation: Momentum not confirmed: only 2/5 bars in trend
 ```
 
 ### Generic Rejections

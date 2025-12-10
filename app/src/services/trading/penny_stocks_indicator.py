@@ -765,6 +765,72 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 except Exception as e:
                     logger.warning(f"Error logging MAB rejection for {ticker}: {str(e)}")
 
+        # Log MAB-selected tickers with positive selection reasons
+        # This ensures we know which tickers were chosen by MAB (even if they later fail entry validation)
+        logger.debug(f"Logging {len(selected_tickers_list)} tickers selected by MAB to InactiveTickersForDayTrading")
+        for selected_ticker in selected_tickers_list:
+            try:
+                # Find the ticker in the original candidates to get momentum score
+                ticker_data = None
+                for ticker, momentum_score, reason in all_candidates:
+                    if ticker == selected_ticker:
+                        ticker_data = (ticker, momentum_score, reason)
+                        break
+                
+                if not ticker_data:
+                    continue
+                
+                ticker, momentum_score, reason = ticker_data
+                
+                # Get technical indicators
+                bars_data = market_data_dict.get(ticker)
+                technical_indicators = {}
+                if bars_data:
+                    bars_dict = bars_data.get("bars", {})
+                    ticker_bars = bars_dict.get(ticker, [])
+                    if ticker_bars:
+                        latest_bar = ticker_bars[-1]
+                        technical_indicators = {
+                            "close_price": latest_bar.get("c", 0.0),
+                            "volume": latest_bar.get("v", 0),
+                            "momentum_score": momentum_score,
+                        }
+                
+                # Create positive selection reason
+                is_long = momentum_score >= 0
+                direction = "long" if is_long else "short"
+                
+                # Get MAB stats to show why this ticker was selected
+                mab_stats = await MABService._get_instance().get_stats(cls.indicator_name(), ticker)
+                if mab_stats:
+                    successes = mab_stats.get('successes', 0)
+                    failures = mab_stats.get('failures', 0)
+                    total = mab_stats.get('total_trades', 0)
+                    success_rate = (successes / total * 100) if total > 0 else 0
+                    selection_reason = f"✅ Selected by MAB for {direction} entry - ranked in top {cls.top_k} (success rate: {success_rate:.1f}%, momentum: {momentum_score:.2f}%)"
+                else:
+                    selection_reason = f"✅ Selected by MAB for {direction} entry - ranked in top {cls.top_k} (new ticker, momentum: {momentum_score:.2f}%)"
+                
+                # Log with positive reason in the appropriate direction
+                reason_long = selection_reason if is_long else ""
+                reason_short = selection_reason if not is_long else ""
+                
+                result = await DynamoDBClient.log_inactive_ticker(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    reason_not_to_enter_long=reason_long,
+                    reason_not_to_enter_short=reason_short,
+                    technical_indicators=technical_indicators
+                )
+                
+                if result:
+                    logger.debug(f"Logged MAB selection for {ticker}: {direction} - {selection_reason[:50]}...")
+                else:
+                    logger.warning(f"Failed to log MAB selection for {ticker}")
+                    
+            except Exception as e:
+                logger.warning(f"Error logging MAB selection for {selected_ticker}: {str(e)}")
+
         # Process long entries
         for rank, (ticker, momentum_score, reason) in enumerate(top_upward, start=1):
             if not cls.running:
@@ -947,6 +1013,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 )
                 if not preempted:
                     logger.info(f"Could not preempt for {ticker}, skipping entry")
+                    await cls._log_selected_ticker_entry_failure(
+                        ticker, momentum_score, action, 
+                        f"Could not preempt existing trade for exceptional momentum {momentum_score:.2f}%"
+                    )
                     return False
 
                 # Re-check after preemption
@@ -963,12 +1033,19 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     f"skipping {ticker} (momentum: {momentum_score:.2f} < "
                     f"exceptional threshold: {cls.exceptional_momentum_threshold})"
                 )
+                await cls._log_selected_ticker_entry_failure(
+                    ticker, momentum_score, action, 
+                    f"At max capacity ({active_count}/{cls.max_active_trades}), momentum {momentum_score:.2f}% < exceptional threshold {cls.exceptional_momentum_threshold}%"
+                )
                 return False
 
         # Get entry price using Alpaca API
         quote_response = await AlpacaClient.quote(ticker)
         if not quote_response:
             logger.warning(f"Failed to get quote for {ticker}, skipping")
+            await cls._log_selected_ticker_entry_failure(
+                ticker, momentum_score, action, "Failed to get quote data"
+            )
             return False
 
         quote_data = quote_response.get("quote", {})
@@ -982,6 +1059,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
             logger.warning(
                 f"Invalid bid/ask for {ticker}: bid={bid}, ask={ask}, skipping"
             )
+            await cls._log_selected_ticker_entry_failure(
+                ticker, momentum_score, action, f"Invalid bid/ask: bid={bid}, ask={ask}"
+            )
             return False
 
         # IMPROVED: Calculate and validate bid-ask spread
@@ -990,6 +1070,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
             logger.info(
                 f"Skipping {ticker}: bid-ask spread {spread_percent:.2f}% > max {cls.max_bid_ask_spread_percent}%"
             )
+            await cls._log_selected_ticker_entry_failure(
+                ticker, momentum_score, action, 
+                f"Bid-ask spread too wide: {spread_percent:.2f}% > max {cls.max_bid_ask_spread_percent}%"
+            )
             return False
 
         is_long = action == "buy_to_open"
@@ -997,6 +1081,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         if enter_price <= 0:
             logger.warning(f"Invalid entry price for {ticker}, skipping")
+            await cls._log_selected_ticker_entry_failure(
+                ticker, momentum_score, action, f"Invalid entry price: ${enter_price:.4f}"
+            )
             return False
 
         logger.debug(
@@ -1008,10 +1095,18 @@ class PennyStocksIndicator(BaseTradingIndicator):
             logger.info(
                 f"Skipping {ticker}: entry price ${enter_price:.2f} < ${cls.min_stock_price:.2f}"
             )
+            await cls._log_selected_ticker_entry_failure(
+                ticker, momentum_score, action, 
+                f"Entry price too low: ${enter_price:.2f} < ${cls.min_stock_price:.2f}"
+            )
             return False
         if enter_price >= cls.max_stock_price:
             logger.info(
                 f"Skipping {ticker}: entry price ${enter_price:.2f} >= ${cls.max_stock_price:.2f}"
+            )
+            await cls._log_selected_ticker_entry_failure(
+                ticker, momentum_score, action, 
+                f"Entry price too high: ${enter_price:.2f} >= ${cls.max_stock_price:.2f}"
             )
             return False
 
@@ -1035,6 +1130,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                         f"Skipping {ticker}: entry price ${enter_price:.4f} differs from close ${close_price:.4f} "
                         f"by {price_discrepancy:.2f}% (max: {cls.max_price_discrepancy_percent}%)"
                     )
+                    await cls._log_selected_ticker_entry_failure(
+                        ticker, momentum_score, action, 
+                        f"Price discrepancy too large: quote=${enter_price:.4f} vs close=${close_price:.4f} ({price_discrepancy:.2f}%)"
+                    )
                     return False
 
         # IMPROVED: Check momentum confirmation (3/5 bars in trend + last bar confirms)
@@ -1045,6 +1144,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
             if not is_confirmed:
                 logger.info(
                     f"Skipping {ticker}: momentum not confirmed - {confirm_reason}"
+                )
+                await cls._log_selected_ticker_entry_failure(
+                    ticker, momentum_score, action, 
+                    f"Momentum not confirmed: {confirm_reason}"
                 )
                 return False
             logger.debug(f"{ticker} momentum confirmed: {confirm_reason}")
@@ -1102,6 +1205,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         if not entry_success:
             logger.error(f"Failed to enter trade for {ticker}")
+            await cls._log_selected_ticker_entry_failure(
+                ticker, momentum_score, action, 
+                "Failed to enter trade (database or API error)"
+            )
             return False
 
         # Update trailing stop to 0.5% after entry (TIGHT for quick exits)
@@ -1120,6 +1227,54 @@ class PennyStocksIndicator(BaseTradingIndicator):
         )
 
         return True
+
+    @classmethod
+    async def _log_selected_ticker_entry_failure(
+        cls,
+        ticker: str,
+        momentum_score: float,
+        action: str,
+        failure_reason: str
+    ) -> None:
+        """
+        Log when a MAB-selected ticker fails to enter a trade.
+        
+        This provides transparency about why selected tickers didn't result in trades.
+        """
+        try:
+            is_long = action == "buy_to_open"
+            direction = "long" if is_long else "short"
+            
+            # Create a comprehensive failure reason that shows the ticker was selected but failed entry
+            full_reason = f"⚠️ Selected by MAB for {direction} entry (momentum: {momentum_score:.2f}%) but failed validation: {failure_reason}"
+            
+            # Get technical indicators if available
+            technical_indicators = {
+                "momentum_score": momentum_score,
+                "selected_by_mab": True,
+                "entry_failure": True,
+                "failure_reason": failure_reason
+            }
+            
+            # Log with failure reason in the appropriate direction
+            reason_long = full_reason if is_long else ""
+            reason_short = full_reason if not is_long else ""
+            
+            result = await DynamoDBClient.log_inactive_ticker(
+                ticker=ticker,
+                indicator=cls.indicator_name(),
+                reason_not_to_enter_long=reason_long,
+                reason_not_to_enter_short=reason_short,
+                technical_indicators=technical_indicators
+            )
+            
+            if result:
+                logger.debug(f"Logged entry failure for MAB-selected {ticker}: {failure_reason}")
+            else:
+                logger.warning(f"Failed to log entry failure for {ticker}")
+                
+        except Exception as e:
+            logger.warning(f"Error logging entry failure for {ticker}: {str(e)}")
 
     @classmethod
     async def exit_service(cls):
