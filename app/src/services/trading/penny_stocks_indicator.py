@@ -65,7 +65,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
     top_k: int = 2  # Top K tickers to select
     min_momentum_threshold: float = 1.5  # Minimum 1.5% momentum to enter
     max_momentum_threshold: float = 15.0  # Maximum 15% momentum
-    exceptional_momentum_threshold: float = 8.0  # Exceptional momentum for preemption
+    exceptional_momentum_threshold: float = 3.0  # Exceptional momentum for preemption (lowered from 8.0%)
     
     min_volume: int = 500  # Minimum daily volume
     min_avg_volume: int = 1000  # Minimum average daily volume
@@ -903,12 +903,22 @@ class PennyStocksIndicator(BaseTradingIndicator):
         await asyncio.sleep(cls.entry_cycle_seconds)
 
     @classmethod
-    async def _find_lowest_profitable_trade(
+    async def _find_worst_performing_trade(
         cls, active_trades: List[Dict[str, Any]]
     ) -> Optional[Tuple[Dict[str, Any], float]]:
-        """Find the lowest profitable trade from active trades"""
-        lowest_profit = None
-        lowest_trade = None
+        """
+        Find the worst performing trade from active trades for preemption.
+        
+        IMPROVED: Now considers ALL trades, not just profitable ones.
+        When we have exceptional momentum opportunity, we should be willing to
+        exit even losing trades to make room for better opportunities.
+        
+        Priority for preemption:
+        1. Trades with smallest profit (or largest loss)
+        2. Older trades (longer holding time = less likely to recover)
+        """
+        worst_profit = None
+        worst_trade = None
 
         for trade in active_trades:
             ticker = trade.get("ticker")
@@ -931,40 +941,50 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 enter_price, current_price, action
             )
 
-            if profit_percent >= cls.profit_threshold:
-                if lowest_profit is None or profit_percent < lowest_profit:
-                    lowest_profit = profit_percent
-                    lowest_trade = trade
+            # Find the trade with the worst (lowest) profit - could be negative
+            if worst_profit is None or profit_percent < worst_profit:
+                worst_profit = profit_percent
+                worst_trade = trade
 
-        if lowest_trade and lowest_profit is not None:
-            return (lowest_trade, lowest_profit)
+        if worst_trade and worst_profit is not None:
+            return (worst_trade, worst_profit)
         return None
 
     @classmethod
     async def _preempt_low_profit_trade(
         cls, new_ticker: str, new_momentum_score: float
     ) -> bool:
-        """Preempt a low profitable trade to make room for exceptional trade"""
+        """
+        Preempt the worst performing trade to make room for exceptional momentum trade.
+        
+        IMPROVED: Now preempts ANY trade (including losing ones) when we have
+        exceptional momentum opportunity. The philosophy is:
+        - If we have a 10%+ momentum opportunity, it's better to cut a -2% loser
+          and enter the new trade than to hold the loser hoping it recovers.
+        - Penny stocks are volatile - exceptional momentum signals are rare and valuable.
+        """
         active_trades = await cls._get_active_trades()
 
         if len(active_trades) < cls.max_active_trades:
             return False
 
-        result = await cls._find_lowest_profitable_trade(active_trades)
+        result = await cls._find_worst_performing_trade(active_trades)
         if not result:
-            logger.debug("No profitable trades to preempt")
+            logger.debug("No trades available to preempt")
             return False
 
-        lowest_trade, lowest_profit = result
-        ticker_to_exit = lowest_trade.get("ticker")
+        worst_trade, worst_profit = result
+        ticker_to_exit = worst_trade.get("ticker")
 
+        # Log the preemption decision
+        profit_emoji = "💰" if worst_profit >= 0 else "📉"
         logger.info(
-            f"Preempting {ticker_to_exit} (profit: {lowest_profit:.2f}%) "
-            f"to make room for {new_ticker} (momentum: {new_momentum_score:.2f})"
+            f"Preempting {ticker_to_exit} {profit_emoji} (profit: {worst_profit:.2f}%) "
+            f"to make room for {new_ticker} (momentum: {new_momentum_score:.2f}%)"
         )
 
-        original_action = lowest_trade.get("action")
-        enter_price = lowest_trade.get("enter_price")
+        original_action = worst_trade.get("action")
+        enter_price = worst_trade.get("enter_price")
         
         # Convert Decimal to float if needed (DynamoDB returns Decimal)
         if enter_price is not None:
@@ -999,9 +1019,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
             )
             return False
 
-        reason = f"Preempted for exceptional trade: {lowest_profit:.2f}% profit"
+        reason = f"Preempted for exceptional trade: {worst_profit:.2f}% profit"
 
-        technical_indicators_for_enter = lowest_trade.get(
+        technical_indicators_for_enter = worst_trade.get(
             "technical_indicators_for_enter"
         )
 
