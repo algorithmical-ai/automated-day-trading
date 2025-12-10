@@ -52,43 +52,44 @@ class PennyStocksIndicator(BaseTradingIndicator):
     - Max 30 trades per day
     """
 
-    # Configuration - IMPROVED PENNY STOCK TRADING (Dec 2024)
+    # Configuration - CONSERVATIVE PENNY STOCK TRADING (Dec 2024)
+    # After massive losses, tightening all parameters significantly
     max_stock_price: float = 5.0  # Only trade stocks < $5
-    min_stock_price: float = 0.01  # Minimum stock price (avoid extreme penny stocks)
+    min_stock_price: float = 0.50  # INCREASED: Avoid ultra-low penny stocks (was 0.01)
     
-    # IMPROVED: Wider stops and longer holding period
+    # TIGHT STOPS - penny stocks are too volatile for wide stops
     trailing_stop_percent: float = 0.5  # Base trailing stop (used by tiered system)
-    profit_threshold: float = 1.0  # Exit at 1% profit (INCREASED from 0.5%)
-    immediate_loss_exit_threshold: float = -3.0  # Emergency stop at -3% (INCREASED from -0.25%)
-    default_atr_stop_percent: float = -2.0  # Default ATR-based stop loss
+    profit_threshold: float = 1.0  # Exit at 1% profit
+    immediate_loss_exit_threshold: float = -1.5  # TIGHTENED: Emergency stop at -1.5% (was -3.0%)
+    default_atr_stop_percent: float = -1.5  # TIGHTENED: Default ATR-based stop loss (was -2.0%)
     
-    top_k: int = 2  # Top K tickers to select
-    min_momentum_threshold: float = 3.0  # Minimum 3% momentum to enter (INCREASED from 1.5%)
+    top_k: int = 1  # REDUCED: Only top 1 ticker to reduce exposure (was 2)
+    min_momentum_threshold: float = 5.0  # INCREASED: Minimum 5% momentum to enter (was 3.0%)
     max_momentum_threshold: float = 15.0  # Maximum 15% momentum
-    exceptional_momentum_threshold: float = 8.0  # Exceptional momentum for preemption (REVERTED to 8.0%)
+    exceptional_momentum_threshold: float = 10.0  # INCREASED: Exceptional momentum for preemption (was 8.0%)
     
-    min_volume: int = 500  # Minimum daily volume
-    min_avg_volume: int = 1000  # Minimum average daily volume
-    max_price_discrepancy_percent: float = 5.0  # Max % difference between quote and close (TIGHTENED from 10%)
-    max_bid_ask_spread_percent: float = 2.0  # Max bid-ask spread (TIGHTENED from 3.0%)
+    min_volume: int = 1000  # INCREASED: Minimum daily volume (was 500)
+    min_avg_volume: int = 2000  # INCREASED: Minimum average daily volume (was 1000)
+    max_price_discrepancy_percent: float = 3.0  # TIGHTENED: Max % difference (was 5.0%)
+    max_bid_ask_spread_percent: float = 1.5  # TIGHTENED: Max bid-ask spread (was 2.0%)
     
     # SAFETY: Disable shorting for penny stocks - too risky (can spike 100%+ in minutes)
     allow_short_positions: bool = False
     
     entry_cycle_seconds: int = 1  # Check for entries every 1 second
     exit_cycle_seconds: int = 1  # Check exits every 1 second
-    max_active_trades: int = 10  # Max concurrent trades
-    max_daily_trades: int = 30  # Max trades per day
+    max_active_trades: int = 3  # REDUCED: Max concurrent trades (was 10) - less exposure
+    max_daily_trades: int = 10  # REDUCED: Max trades per day (was 30)
     
-    # IMPROVED: Longer holding period to let trades develop
-    min_holding_period_seconds: int = 60  # INCREASED from 15 to 60 seconds
+    # SHORTER holding period - exit faster on losses
+    min_holding_period_seconds: int = 15  # REDUCED: from 60 to 15 seconds - exit faster
     recent_bars_for_trend: int = 5  # Use last 5 bars to determine trend
     
-    # ATR configuration for volatility-based stops
+    # ATR configuration for volatility-based stops - TIGHTENED
     atr_period: int = 14  # Period for ATR calculation
-    atr_multiplier: float = 1.5  # ATR multiplier for stop loss
-    atr_stop_min: float = -1.5  # Minimum stop loss (closest to 0)
-    atr_stop_max: float = -4.0  # Maximum stop loss (furthest from 0)
+    atr_multiplier: float = 1.0  # REDUCED: ATR multiplier (was 1.5)
+    atr_stop_min: float = -1.0  # TIGHTENED: Minimum stop loss (was -1.5%)
+    atr_stop_max: float = -2.0  # TIGHTENED: Maximum stop loss (was -4.0%)
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today

@@ -270,9 +270,10 @@ class ExitDecision:
 class ExitDecisionEngine:
     """Centralized exit decision logic with priority-based evaluation."""
     
-    MIN_HOLDING_SECONDS = 60
-    EMERGENCY_STOP_PERCENT = -3.0
-    CONSECUTIVE_CHECKS_REQUIRED = 2
+    # TIGHTENED: Reduced holding period and emergency stop for faster exits
+    MIN_HOLDING_SECONDS = 15  # REDUCED from 60 - exit faster on losses
+    EMERGENCY_STOP_PERCENT = -1.5  # TIGHTENED from -3.0% - cut losses quickly
+    CONSECUTIVE_CHECKS_REQUIRED = 1  # REDUCED from 2 - exit immediately on stop
     
     def __init__(self):
         self.consecutive_loss_checks: Dict[str, int] = {}
