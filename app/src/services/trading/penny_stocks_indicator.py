@@ -612,6 +612,13 @@ class PennyStocksIndicator(BaseTradingIndicator):
             momentum_score = trend_metrics.momentum_score
             reason = trend_metrics.reason
             
+            # FIXED: Skip tickers with zero momentum (no clear trend direction)
+            # These would fail MomentumConfirmation later anyway
+            if momentum_score == 0.0:
+                stats["low_momentum"] += 1
+                logger.debug(f"{ticker} has zero momentum, skipping (no clear trend)")
+                continue
+            
             stats["passed"] += 1
             ticker_momentum_scores.append((ticker, momentum_score, reason))
             logger.debug(
@@ -643,17 +650,32 @@ class PennyStocksIndicator(BaseTradingIndicator):
         )
 
         # Separate upward and downward momentum
-        # Note: tickers with score == 0 are treated as upward (neutral momentum)
+        # FIXED: Exclude tickers with zero or near-zero momentum (no clear trend)
+        # These tickers pass initial validation but have no directional momentum,
+        # causing MomentumConfirmation to fail later with "Only X/3 bars in trend direction"
+        MIN_MOMENTUM_FOR_ENTRY = 0.5  # Require at least 0.5% momentum to have a clear direction
+        
         upward_tickers = [
             (t, score, reason)
             for t, score, reason in ticker_momentum_scores
-            if score >= 0
+            if score >= MIN_MOMENTUM_FOR_ENTRY  # Positive momentum only (exclude 0 and near-zero)
         ]
         downward_tickers = [
             (t, score, reason)
             for t, score, reason in ticker_momentum_scores
-            if score < 0
+            if score <= -MIN_MOMENTUM_FOR_ENTRY  # Negative momentum only (exclude 0 and near-zero)
         ]
+        
+        # Log tickers excluded due to zero/weak momentum
+        zero_momentum_tickers = [
+            t for t, score, _ in ticker_momentum_scores 
+            if abs(score) < MIN_MOMENTUM_FOR_ENTRY
+        ]
+        if zero_momentum_tickers:
+            logger.debug(
+                f"Excluded {len(zero_momentum_tickers)} tickers with zero/weak momentum: "
+                f"{zero_momentum_tickers[:5]}{'...' if len(zero_momentum_tickers) > 5 else ''}"
+            )
 
         # Use MAB to select top tickers
         # For penny stocks, we'll use a simplified market data dict
