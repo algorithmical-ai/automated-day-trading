@@ -723,9 +723,31 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     reason_long = rejection_data.get('reason_long', '')
                     reason_short = rejection_data.get('reason_short', '')
                     
+                    # Enhanced: If no MAB reasons, generate enhanced reasons using MAB rejection enhancer
+                    if not reason_long and not reason_short:
+                        logger.debug(f"No MAB rejection reason for {ticker}, generating enhanced reason")
+                        from app.src.services.mab.mab_rejection_enhancer import MABRejectionEnhancer
+                        
+                        enhanced_reasons = await MABRejectionEnhancer.enhance_real_time_record(
+                            ticker=ticker,
+                            indicator=cls.indicator_name(),
+                            technical_indicators=technical_indicators
+                        )
+                        
+                        reason_long = enhanced_reasons.get('reason_long', '')
+                        reason_short = enhanced_reasons.get('reason_short', '')
+                        
+                        if not reason_long and not reason_short:
+                            # Fallback: create a basic reason based on momentum
+                            momentum_score = rejection_data.get('momentum_score', 0.0)
+                            if momentum_score >= 0:
+                                reason_long = f"Not selected by MAB algorithm - ranked below top {cls.top_k} candidates (momentum: {momentum_score:.2f}%)"
+                            else:
+                                reason_short = f"Not selected by MAB algorithm - ranked below top {cls.top_k} candidates (momentum: {momentum_score:.2f}%)"
+                    
                     # Ensure at least one reason is populated
                     if not reason_long and not reason_short:
-                        logger.warning(f"No rejection reason for {ticker}, skipping MAB rejection log")
+                        logger.warning(f"Still no rejection reason for {ticker} after enhancement, skipping log")
                         continue
                     
                     result = await DynamoDBClient.log_inactive_ticker(

@@ -723,8 +723,10 @@ class MomentumIndicator(BaseTradingIndicator):
         """
         Check if the stock is likely to mean-revert soon.
         Reject entries at Bollinger Band extremes to avoid entering at peaks/troughs.
+        Also reject parabolic extensions (price far from EMAs).
         """
-        technical_analysis = market_data.get("technical_analysis", {})
+        # FIXED: market_data IS the technical analysis dict directly
+        technical_analysis = market_data if isinstance(market_data, dict) else {}
         bollinger = technical_analysis.get("bollinger", {})
         current_price = technical_analysis.get("close_price", 0.0)
 
@@ -754,6 +756,35 @@ class MomentumIndicator(BaseTradingIndicator):
                 return (
                     True,
                     f"Price at lower Bollinger ({position_in_band:.0%}), likely to revert",
+                )
+
+        # NEW: Check for parabolic extension from EMAs
+        # Reject if price is too far from moving averages (likely to snap back)
+        ema_fast = technical_analysis.get("ema_fast", 0.0)
+        ema_slow = technical_analysis.get("ema_slow", 0.0)
+        
+        if ema_fast > 0 and current_price > 0:
+            ema_deviation_percent = ((current_price - ema_fast) / ema_fast) * 100
+            
+            # For SHORTS: Reject if price is >10% ABOVE EMA (parabolic squeeze, will keep running)
+            if momentum_score < 0 and ema_deviation_percent > 10.0:
+                return (
+                    True,
+                    f"Parabolic extension for short: price ${current_price:.2f} is {ema_deviation_percent:.1f}% above EMA ${ema_fast:.2f} (squeeze in progress, don't short)",
+                )
+            
+            # For LONGS: Reject if price is >10% ABOVE EMA (chasing extended move)
+            if momentum_score > 0 and ema_deviation_percent > 10.0:
+                return (
+                    True,
+                    f"Extended move for long: price ${current_price:.2f} is {ema_deviation_percent:.1f}% above EMA ${ema_fast:.2f} (too extended, wait for pullback)",
+                )
+            
+            # For LONGS: Reject if price is >5% BELOW EMA (falling knife)
+            if momentum_score > 0 and ema_deviation_percent < -5.0:
+                return (
+                    True,
+                    f"Falling knife for long: price ${current_price:.2f} is {abs(ema_deviation_percent):.1f}% below EMA ${ema_fast:.2f} (wait for stabilization)",
                 )
 
         return False, "Not at Bollinger extremes"
@@ -829,6 +860,44 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"(volume: {volume:,}, SMA: {volume_sma:,})",
             )
 
+        # NEW: Validate indicator data quality - reject if data looks stale/broken
+        stoch_data = technical_analysis.get("stoch", {})
+        if isinstance(stoch_data, dict):
+            stoch_k = stoch_data.get("k", 50.0)
+            stoch_d = stoch_data.get("d", 50.0)
+        elif isinstance(stoch_data, (list, tuple)) and len(stoch_data) >= 2:
+            stoch_k = stoch_data[0] if stoch_data[0] is not None else 50.0
+            stoch_d = stoch_data[1] if stoch_data[1] is not None else 50.0
+        else:
+            stoch_k = 50.0
+            stoch_d = 50.0
+        
+        # Reject if stochastic is exactly 0 or 100 (likely broken data)
+        if stoch_k == 0 and stoch_d == 0:
+            return (
+                False,
+                f"Stochastic data appears broken (K={stoch_k}, D={stoch_d}) - skipping",
+            )
+        
+        # Reject if Bollinger bands are flat (no volatility data)
+        bollinger = technical_analysis.get("bollinger", {})
+        if isinstance(bollinger, dict):
+            bb_upper = bollinger.get("upper", 0)
+            bb_lower = bollinger.get("lower", 0)
+            bb_middle = bollinger.get("middle", 0)
+        elif isinstance(bollinger, (list, tuple)) and len(bollinger) >= 3:
+            bb_upper = bollinger[0] if bollinger[0] is not None else 0
+            bb_middle = bollinger[1] if bollinger[1] is not None else 0
+            bb_lower = bollinger[2] if bollinger[2] is not None else 0
+        else:
+            bb_upper = bb_lower = bb_middle = 0
+        
+        if bb_upper > 0 and bb_lower > 0 and abs(bb_upper - bb_lower) < 0.001:
+            return (
+                False,
+                f"Bollinger bands are flat (upper={bb_upper:.4f}, lower={bb_lower:.4f}) - insufficient volatility data",
+            )
+
         adx = technical_analysis.get("adx")
         if adx is None:
             return False, "Missing ADX data"
@@ -856,6 +925,14 @@ class MomentumIndicator(BaseTradingIndicator):
             return (
                 False,
                 f"RSI too low for short: {rsi:.2f} < {cls.rsi_min_for_short} (may be oversold, risk of bounce)",
+            )
+
+        # NEW: For shorts, reject if RSI is extremely overbought (>75) - parabolic squeeze in progress
+        # These stocks often keep running higher before reversing
+        if is_short and rsi > 75.0:
+            return (
+                False,
+                f"RSI too high for short: {rsi:.2f} > 75 (parabolic squeeze in progress, wait for exhaustion)",
             )
 
         # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
@@ -1323,6 +1400,20 @@ class MomentumIndicator(BaseTradingIndicator):
             return False
 
         logger.debug(f"Entry price for {ticker}: ${enter_price:.4f}")
+
+        # NEW: Validate entry price vs technical analysis close price
+        # Reject if there's significant divergence (stale data or bad quote)
+        ta_close_price = market_data_response.get("close_price", 0.0) if market_data_response else 0.0
+        if ta_close_price > 0 and enter_price > 0:
+            price_divergence_percent = abs((enter_price - ta_close_price) / ta_close_price) * 100
+            # Allow up to 5% divergence for penny stocks, 3% for regular stocks
+            max_divergence = 5.0 if enter_price < cls.max_stock_price_for_penny_treatment else 3.0
+            if price_divergence_percent > max_divergence:
+                logger.warning(
+                    f"Skipping {ticker}: entry price ${enter_price:.4f} diverges {price_divergence_percent:.1f}% "
+                    f"from TA close ${ta_close_price:.4f} (max allowed: {max_divergence}%) - possible stale data"
+                )
+                return False
 
         # Check bid-ask spread using SpreadCalculator
         bid = ticker_quote.get("bp", 0.0)
