@@ -9,8 +9,8 @@ to ensure consistency across all trading indicators.
 # ATR Multipliers (Standardized across all indicators)
 # =============================================================================
 
-# Stop Loss: 2.0x ATR (as recommended by judge review)
-ATR_STOP_LOSS_MULTIPLIER = 2.0
+# Stop Loss: 2.5x ATR (INCREASED from 2.0x - need more room for volatility)
+ATR_STOP_LOSS_MULTIPLIER = 2.5
 
 # Trailing Stop: 1.5x ATR (for dynamic trailing stops)
 ATR_TRAILING_STOP_MULTIPLIER = 1.5
