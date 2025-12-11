@@ -55,8 +55,8 @@ class MomentumIndicator(BaseTradingIndicator):
     min_daily_volume: int = 1000
     min_volume_ratio: float = 1.5  # Volume must be >1.5x SMA for entry
     stop_loss_threshold: float = (
-        -2.5
-    )  # Default, will be overridden by ATR-based calculation
+        -4.0
+    )  # WIDENED from -2.5% - give trades room to breathe, will be overridden by ATR-based calculation
     trailing_stop_percent: float = (
         2.5  # Base trailing stop, will be adjusted for shorts
     )
@@ -518,8 +518,8 @@ class MomentumIndicator(BaseTradingIndicator):
                     # Cap between -4.0% and -8.0% for penny stocks
                     dynamic_stop_loss = max(-8.0, min(-4.0, dynamic_stop_loss))
                 else:
-                    # Cap between -2.5% and -6.0% for regular stocks
-                    dynamic_stop_loss = max(-6.0, min(-2.5, dynamic_stop_loss))
+                    # Cap between -4.0% and -8.0% for regular stocks (WIDENED from -2.5%/-6.0%)
+                    dynamic_stop_loss = max(-8.0, min(-4.0, dynamic_stop_loss))
 
                 logger.info(
                     f"ATR-based stop loss (2x ATR) for {ticker}: {dynamic_stop_loss:.2f}% "
@@ -2483,8 +2483,8 @@ class MomentumIndicator(BaseTradingIndicator):
                         )
 
             # PRIORITY 2: Check stop loss (cut losses)
-            # IMPROVED: Require consecutive checks before triggering stop loss
-            # This prevents premature exits on momentary price dips
+            # PATIENT EXIT STRATEGY: Give trades time to recover before exiting
+            # Momentum stocks often dip before continuing - don't exit on noise
             if not should_exit and profit_percent < stop_loss_threshold:
                 # Initialize exit engine if needed
                 if cls._exit_engine is None:
@@ -2494,24 +2494,44 @@ class MomentumIndicator(BaseTradingIndicator):
                 consecutive_checks = cls._exit_engine.consecutive_loss_checks.get(ticker, 0) + 1
                 cls._exit_engine.consecutive_loss_checks[ticker] = consecutive_checks
                 
-                # IMPROVED: Require 2 consecutive checks before stop loss exit
-                if consecutive_checks >= 2:
+                # PATIENT: Require 12 consecutive checks (60 seconds at 5s intervals)
+                # This gives the trade a full minute to recover from a dip
+                # Only exit immediately on catastrophic loss (> 2x stop threshold)
+                CONSECUTIVE_CHECKS_REQUIRED = 12  # 60 seconds of confirmation
+                CATASTROPHIC_LOSS_MULTIPLIER = 2.0  # Exit immediately if loss > 2x threshold
+                
+                catastrophic_threshold = stop_loss_threshold * CATASTROPHIC_LOSS_MULTIPLIER
+                is_catastrophic = profit_percent < catastrophic_threshold
+                
+                if is_catastrophic:
+                    # Catastrophic loss - exit immediately
                     should_exit = True
+                    exit_reason = (
+                        f"CATASTROPHIC stop loss: {profit_percent:.2f}% "
+                        f"(below {catastrophic_threshold:.2f}% emergency threshold, "
+                        f"original stop: {stop_loss_threshold:.2f}%)"
+                    )
+                    logger.warning(f"🚨 Emergency exit for {ticker}: {exit_reason}")
+                    cls._exit_engine.consecutive_loss_checks[ticker] = 0
+                elif consecutive_checks >= CONSECUTIVE_CHECKS_REQUIRED:
+                    # Persistent loss after waiting - exit
+                    should_exit = True
+                    wait_seconds = consecutive_checks * cls.exit_cycle_seconds
                     exit_reason = (
                         f"Stop loss triggered: {profit_percent:.2f}% "
                         f"(below {stop_loss_threshold:.2f}% stop loss threshold"
                         f"{' (dynamic)' if dynamic_stop_loss is not None else ''}, "
-                        f"confirmed after {consecutive_checks} consecutive checks)"
+                        f"confirmed after {wait_seconds}s of waiting)"
                     )
-                    logger.info(
-                        f"Exit signal for {ticker} - stop loss: {profit_percent:.2f}%"
-                    )
-                    # Reset counter after exit
+                    logger.info(f"Exit signal for {ticker} - stop loss after patience: {profit_percent:.2f}%")
                     cls._exit_engine.consecutive_loss_checks[ticker] = 0
                 else:
+                    # Still waiting - log progress
+                    wait_seconds = consecutive_checks * cls.exit_cycle_seconds
+                    remaining_seconds = (CONSECUTIVE_CHECKS_REQUIRED - consecutive_checks) * cls.exit_cycle_seconds
                     logger.debug(
                         f"Stop loss warning for {ticker}: {profit_percent:.2f}% "
-                        f"(check {consecutive_checks}/2, waiting for confirmation)"
+                        f"(waited {wait_seconds}s, {remaining_seconds}s remaining before exit)"
                     )
             elif profit_percent >= stop_loss_threshold:
                 # Reset consecutive loss counter if not in loss territory
