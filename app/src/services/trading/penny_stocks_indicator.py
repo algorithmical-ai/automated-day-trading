@@ -42,54 +42,59 @@ class PennyStocksIndicator(BaseTradingIndicator):
     """
     Penny stocks trading indicator for stocks < $5 USD
 
-    TREND-FOLLOWING STRATEGY - Profit at any cost:
+    TREND-FOLLOWING STRATEGY - Ride volatility for quick profits:
     - Enter LONG only if last few bars show clear UPWARD trend
-    - Enter SHORT only if last few bars show clear DOWNWARD trend
+    - Enter SHORT only if last few bars show clear DOWNWARD trend (if enabled)
     - Hold LONG until dip from peak (trend reversal) - then exit immediately
     - Hold SHORT until rise from bottom (trend reversal) - then exit immediately
-    - Exit immediately if trade becomes unprofitable (enter_price > current_price for long, enter_price < current_price for short)
     - Losing tickers excluded from MAB for rest of day
-    - Max 30 trades per day
+    - No entries after 3:55 PM ET to avoid late-day chaos
     """
 
     # Configuration - CONSERVATIVE PENNY STOCK TRADING (Dec 2024)
-    # After massive losses, tightening all parameters significantly
+    # LESSON LEARNED: Penny stocks are extremely volatile, need MUCH wider stops
+    # Today's losses: 9/10 trades lost due to tight stops triggering on normal volatility
     max_stock_price: float = 5.0  # Only trade stocks < $5
-    min_stock_price: float = 0.50  # INCREASED: Avoid ultra-low penny stocks (was 0.01)
+    min_stock_price: float = 0.75  # INCREASED: Avoid ultra-low penny stocks (was 0.50)
     
-    # TIGHT STOPS - penny stocks are too volatile for wide stops
-    trailing_stop_percent: float = 0.5  # Base trailing stop (used by tiered system)
-    profit_threshold: float = 1.0  # Exit at 1% profit
-    immediate_loss_exit_threshold: float = -1.5  # TIGHTENED: Emergency stop at -1.5% (was -3.0%)
-    default_atr_stop_percent: float = -1.5  # TIGHTENED: Default ATR-based stop loss (was -2.0%)
+    # MUCH WIDER STOPS - penny stocks swing 3-5% routinely
+    trailing_stop_percent: float = 2.0  # WIDENED: Base trailing stop (was 1.0%)
+    profit_threshold: float = 2.5  # INCREASED: Exit at 2.5% profit (was 1.5%) - need bigger wins
+    immediate_loss_exit_threshold: float = -7.0  # WIDENED: Emergency stop at -7.0% (was -3.0%)
+    default_atr_stop_percent: float = -4.0  # WIDENED: Default ATR-based stop loss (was -2.5%)
     
-    top_k: int = 1  # REDUCED: Only top 1 ticker to reduce exposure (was 2)
-    min_momentum_threshold: float = 5.0  # INCREASED: Minimum 5% momentum to enter (was 3.0%)
-    max_momentum_threshold: float = 15.0  # Maximum 15% momentum
+    top_k: int = 1  # Only top 1 ticker to reduce exposure
+    min_momentum_threshold: float = 5.0  # INCREASED: Minimum 5% momentum (was 3.0% - too weak)
+    max_momentum_threshold: float = 20.0  # Maximum 20% momentum
     exceptional_momentum_threshold: float = 10.0  # INCREASED: Exceptional momentum for preemption (was 8.0%)
     
-    min_volume: int = 1000  # INCREASED: Minimum daily volume (was 500)
-    min_avg_volume: int = 2000  # INCREASED: Minimum average daily volume (was 1000)
-    max_price_discrepancy_percent: float = 3.0  # TIGHTENED: Max % difference (was 5.0%)
-    max_bid_ask_spread_percent: float = 1.5  # TIGHTENED: Max bid-ask spread (was 2.0%)
+    min_volume: int = 10000  # INCREASED: Minimum volume (was 5000) - need MORE liquidity
+    min_avg_volume: int = 10000  # INCREASED: Minimum average volume (was 5000)
+    max_price_discrepancy_percent: float = 2.0  # TIGHTENED: Max % difference (was 3.0%)
+    max_bid_ask_spread_percent: float = 0.75  # TIGHTENED: Max bid-ask spread (was 1.0%) - spread kills profits
+    
+    # Entry time restrictions - no late-day entries
+    max_entry_hour_et: int = 15  # No entries after 3:00 PM ET
+    max_entry_minute_et: int = 30  # EARLIER: No entries after 3:30 PM ET (was 3:55)
     
     # SAFETY: Disable shorting for penny stocks - too risky (can spike 100%+ in minutes)
     allow_short_positions: bool = False
     
     entry_cycle_seconds: int = 1  # Check for entries every 1 second
     exit_cycle_seconds: int = 1  # Check exits every 1 second
-    max_active_trades: int = 3  # REDUCED: Max concurrent trades (was 10) - less exposure
-    max_daily_trades: int = 10  # REDUCED: Max trades per day (was 30)
+    max_active_trades: int = 2  # REDUCED: Max concurrent trades (was 3) - less exposure
+    max_daily_trades: int = 8  # REDUCED: Max trades per day (was 10) - quality over quantity
     
-    # SHORTER holding period - exit faster on losses
-    min_holding_period_seconds: int = 15  # REDUCED: from 60 to 15 seconds - exit faster
+    # MUCH LONGER holding period - give trades time to develop
+    min_holding_period_seconds: int = 60  # INCREASED: from 30 to 60 seconds
+    min_holding_before_preempt_seconds: int = 120  # INCREASED: Don't preempt trades held < 2 min (was 60s)
     recent_bars_for_trend: int = 5  # Use last 5 bars to determine trend
     
-    # ATR configuration for volatility-based stops - TIGHTENED
+    # ATR configuration for volatility-based stops - MUCH WIDER for penny stocks
     atr_period: int = 14  # Period for ATR calculation
-    atr_multiplier: float = 1.0  # REDUCED: ATR multiplier (was 1.5)
-    atr_stop_min: float = -1.0  # TIGHTENED: Minimum stop loss (was -1.5%)
-    atr_stop_max: float = -2.0  # TIGHTENED: Maximum stop loss (was -4.0%)
+    atr_multiplier: float = 3.0  # INCREASED: ATR multiplier (was 2.0) - penny stocks need room
+    atr_stop_min: float = -3.0  # WIDENED: Minimum stop loss (was -2.0%) - FLOOR at 3%
+    atr_stop_max: float = -6.0  # WIDENED: Maximum stop loss (was -4.0%) - CAP at 6%
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
@@ -448,12 +453,52 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 await asyncio.sleep(1)  # Fast retry on error
 
     @classmethod
+    def _is_after_entry_cutoff(cls) -> bool:
+        """
+        Check if current time is after the entry cutoff time.
+        No new entries allowed after 3:55 PM ET to avoid late-day volatility
+        and ensure trades have time to develop before market close.
+        
+        Returns:
+            True if entries should be blocked, False if entries are allowed
+        """
+        import pytz
+        est_tz = pytz.timezone("America/New_York")
+        current_time_est = datetime.now(est_tz)
+        current_hour = current_time_est.hour
+        current_minute = current_time_est.minute
+        
+        # Block entries after max_entry_hour_et (e.g., after 3PM = hour 16+)
+        if current_hour > cls.max_entry_hour_et:
+            return True
+        
+        # Block entries in the last 5 minutes of the allowed hour (e.g., 3:55-3:59 PM)
+        if current_hour == cls.max_entry_hour_et and current_minute >= cls.max_entry_minute_et:
+            return True
+        
+        return False
+
+    @classmethod
     @measure_latency
     async def _run_entry_cycle(cls):
         """Execute a single penny stocks entry cycle"""
         logger.debug("Starting penny stocks entry cycle")
         if not await AlpacaClient.is_market_open():
             logger.debug("Market is closed, skipping penny stocks entry logic")
+            await asyncio.sleep(cls.entry_cycle_seconds)
+            return
+        
+        # Check entry cutoff time - no new entries after 3:55 PM ET
+        # This prevents late-day entries like ASST at 16:00 that don't have time to develop
+        if cls._is_after_entry_cutoff():
+            import pytz
+            est_tz = pytz.timezone("America/New_York")
+            current_time_est = datetime.now(est_tz)
+            logger.info(
+                f"⏰ Entry cutoff reached ({current_time_est.strftime('%H:%M')} ET >= "
+                f"{cls.max_entry_hour_et}:{cls.max_entry_minute_et:02d} ET). "
+                "No new penny stock entries allowed - focusing on exit management only."
+            )
             await asyncio.sleep(cls.entry_cycle_seconds)
             return
 
@@ -920,8 +965,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
         """
         Find the lowest profitable trade from active trades for preemption.
         
-        CONSERVATIVE: Only preempt trades that are already profitable.
-        This ensures we lock in gains rather than locking in losses.
+        CONSERVATIVE: Only preempt trades that:
+        1. Are already profitable (>= 0.5%)
+        2. Have been held for at least min_holding_before_preempt_seconds
+        
+        This ensures we lock in gains and don't preempt trades that just entered.
         """
         lowest_profit = None
         lowest_trade = None
@@ -930,10 +978,30 @@ class PennyStocksIndicator(BaseTradingIndicator):
             ticker = trade.get("ticker")
             enter_price = trade.get("enter_price")
             action = trade.get("action")
+            created_at = trade.get("created_at")
             
             # Convert Decimal to float if needed (DynamoDB returns Decimal)
             if enter_price is not None:
                 enter_price = float(enter_price)
+            
+            # Check minimum holding time before allowing preemption
+            # This prevents preempting trades that just entered (like DNN after 21 min is OK, but not after 22 sec)
+            if created_at:
+                try:
+                    enter_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    if enter_time.tzinfo is None:
+                        enter_time = enter_time.replace(tzinfo=timezone.utc)
+                    current_time = datetime.now(timezone.utc)
+                    holding_seconds = (current_time - enter_time).total_seconds()
+                    
+                    if holding_seconds < cls.min_holding_before_preempt_seconds:
+                        logger.debug(
+                            f"Skipping {ticker} for preemption: held only {holding_seconds:.0f}s "
+                            f"(need {cls.min_holding_before_preempt_seconds}s)"
+                        )
+                        continue
+                except Exception as e:
+                    logger.debug(f"Error calculating holding period for {ticker}: {str(e)}")
 
             if not ticker or enter_price is None or enter_price <= 0:
                 continue

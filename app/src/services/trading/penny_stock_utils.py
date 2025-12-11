@@ -61,7 +61,7 @@ class SpreadCalculator:
 class ATRCalculator:
     """Calculates Average True Range for volatility-based stop losses."""
     
-    DEFAULT_STOP_LOSS_PERCENT = -2.0
+    DEFAULT_STOP_LOSS_PERCENT = -4.0  # WIDENED from -2.0% - penny stocks need room
     
     @staticmethod
     def calculate_atr(bars: List[Dict[str, Any]], period: int = 14) -> Optional[float]:
@@ -106,9 +106,9 @@ class ATRCalculator:
         cls,
         atr: Optional[float],
         current_price: float,
-        multiplier: float = 1.5,
-        min_stop: float = -1.5,
-        max_stop: float = -4.0
+        multiplier: float = 3.0,  # INCREASED default from 1.5
+        min_stop: float = -3.0,   # WIDENED default from -1.5%
+        max_stop: float = -6.0    # WIDENED default from -4.0%
     ) -> float:
         """
         Calculate stop loss as percentage based on ATR.
@@ -116,12 +116,12 @@ class ATRCalculator:
         Args:
             atr: Average True Range value (None to use default)
             current_price: Current stock price
-            multiplier: ATR multiplier (default 1.5)
-            min_stop: Minimum stop loss percentage (closest to 0, default -1.5%)
-            max_stop: Maximum stop loss percentage (furthest from 0, default -4.0%)
+            multiplier: ATR multiplier (default 3.0 for penny stocks)
+            min_stop: Minimum stop loss percentage (closest to 0, default -3.0%)
+            max_stop: Maximum stop loss percentage (furthest from 0, default -6.0%)
             
         Returns:
-            Stop loss as negative percentage (e.g., -2.5 for 2.5% stop)
+            Stop loss as negative percentage (e.g., -4.0 for 4.0% stop)
         """
         if atr is None or current_price <= 0:
             return cls.DEFAULT_STOP_LOSS_PERCENT
@@ -130,6 +130,7 @@ class ATRCalculator:
         stop_percent = -atr_percent
         
         # Clamp to bounds (max_stop is more negative, min_stop is less negative)
+        # For penny stocks, we NEVER want stops tighter than 3%
         return max(max_stop, min(min_stop, stop_percent))
 
 
@@ -146,10 +147,11 @@ class TieredTrailingStop:
     
     # Tiers ordered from highest to lowest profit threshold
     # This ensures we check the most profitable tier first
+    # WIDENED: Penny stocks need wider trails - they're volatile
     TIERS = [
-        TrailingStopConfig(profit_threshold=3.0, trail_percent=1.5, min_locked_profit=1.5),
-        TrailingStopConfig(profit_threshold=2.0, trail_percent=0.3, min_locked_profit=0.0),
-        TrailingStopConfig(profit_threshold=1.0, trail_percent=0.5, min_locked_profit=0.0),
+        TrailingStopConfig(profit_threshold=5.0, trail_percent=2.0, min_locked_profit=3.0),  # Lock 3% at 5%+ profit
+        TrailingStopConfig(profit_threshold=3.0, trail_percent=1.5, min_locked_profit=1.5),  # Lock 1.5% at 3%+ profit
+        TrailingStopConfig(profit_threshold=2.0, trail_percent=1.0, min_locked_profit=0.5),  # Lock 0.5% at 2%+ profit
     ]
     
     @classmethod
@@ -196,8 +198,9 @@ class TieredTrailingStop:
 class MomentumConfirmation:
     """Validates entry momentum by checking recent bar direction."""
     
-    MIN_BARS_IN_TREND = 3
+    MIN_BARS_IN_TREND = 2  # 2 of 5 bars in trend direction is enough
     TOTAL_BARS_TO_CHECK = 5
+    MIN_PRICE_CHANGE_PERCENT = 2.0  # NEW: Require at least 2% price change over the period
     
     @classmethod
     def is_momentum_confirmed(
@@ -208,8 +211,10 @@ class MomentumConfirmation:
         """
         Check if momentum is confirmed for entry.
         
-        Requires at least 3 of the last 5 bars to move in the trend direction,
-        AND the most recent bar must confirm the trend.
+        Requires:
+        1. At least 2 of the last 5 bars to move in the trend direction
+        2. The most recent bar must confirm the trend
+        3. NEW: Overall price change must be at least 2% (avoid weak momentum entries)
         
         Args:
             bars: List of price bars with 'c' (close) key
@@ -222,6 +227,14 @@ class MomentumConfirmation:
             return False, f"Insufficient bars: {len(bars)} < {cls.TOTAL_BARS_TO_CHECK}"
         
         recent_bars = bars[-cls.TOTAL_BARS_TO_CHECK:]
+        
+        # NEW: Check overall price change - reject weak momentum
+        first_close = recent_bars[0].get('c', 0)
+        last_close = recent_bars[-1].get('c', 0)
+        if first_close > 0 and last_close > 0:
+            price_change_percent = abs((last_close - first_close) / first_close) * 100
+            if price_change_percent < cls.MIN_PRICE_CHANGE_PERCENT:
+                return False, f"Weak momentum: only {price_change_percent:.2f}% change (need {cls.MIN_PRICE_CHANGE_PERCENT}%)"
         
         # Count bars moving in trend direction
         bars_in_trend = 0
@@ -255,7 +268,7 @@ class MomentumConfirmation:
         if not last_bar_with_trend:
             return False, "Last bar moves against trend"
         
-        return True, f"Confirmed: {bars_in_trend}/{cls.TOTAL_BARS_TO_CHECK - 1} bars in trend, last bar confirms"
+        return True, f"Confirmed: {bars_in_trend}/{cls.TOTAL_BARS_TO_CHECK - 1} bars in trend, {price_change_percent:.1f}% change"
 
 
 @dataclass
@@ -270,10 +283,11 @@ class ExitDecision:
 class ExitDecisionEngine:
     """Centralized exit decision logic with priority-based evaluation."""
     
-    # TIGHTENED: Reduced holding period and emergency stop for faster exits
-    MIN_HOLDING_SECONDS = 15  # REDUCED from 60 - exit faster on losses
-    EMERGENCY_STOP_PERCENT = -1.5  # TIGHTENED from -3.0% - cut losses quickly
-    CONSECUTIVE_CHECKS_REQUIRED = 1  # REDUCED from 2 - exit immediately on stop
+    # MUCH WIDER: Penny stocks routinely swing 3-5% - need room to breathe
+    # Today's lesson: 9/10 trades lost due to stops triggering on normal volatility
+    MIN_HOLDING_SECONDS = 60  # INCREASED from 30 - give trades MORE time to develop
+    EMERGENCY_STOP_PERCENT = -7.0  # WIDENED from -3.0% - only exit on catastrophic loss
+    CONSECUTIVE_CHECKS_REQUIRED = 3  # INCREASED from 2 - require MORE confirmation before stop
     
     def __init__(self):
         self.consecutive_loss_checks: Dict[str, int] = {}
