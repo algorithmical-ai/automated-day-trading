@@ -82,6 +82,13 @@ class MomentumIndicator(BaseTradingIndicator):
         0.5  # Activate trailing stop after +0.5% profit (tiered system)
     )
     max_entry_hour_et: int = 15  # No entries after 3:00 PM ET (15:00)
+    max_entry_minute_et: int = 55  # No entries after XX:55 (5 min buffer before cutoff hour ends)
+    
+    # MFI (Money Flow Index) filters - avoid extreme conditions
+    mfi_min_for_long: float = 20.0  # Don't buy into extreme selling pressure (MFI < 20 = oversold/falling knife)
+    mfi_max_for_long: float = 80.0  # Don't buy at extreme buying exhaustion
+    mfi_min_for_short: float = 20.0  # Don't short already oversold stocks
+    mfi_max_for_short: float = 80.0  # Don't short into extreme buying (squeeze)
     # IMPROVED: Longer holding periods to let trades develop
     min_holding_period_seconds: int = (
         60  # INCREASED from 30 to 60 seconds - give trades room to breathe
@@ -185,14 +192,27 @@ class MomentumIndicator(BaseTradingIndicator):
     @classmethod
     def _is_after_entry_cutoff(cls) -> bool:
         """
-        Check if current time is after the entry cutoff time (15:00 ET).
-        No new entries allowed after this time to avoid late-day volatility.
+        Check if current time is after the entry cutoff time.
+        No new entries allowed after 3:55 PM ET to avoid late-day volatility
+        and ensure trades have time to develop before market close.
+        
+        Returns:
+            True if entries should be blocked, False if entries are allowed
         """
         est_tz = pytz.timezone("America/New_York")
         current_time_est = datetime.now(est_tz)
         current_hour = current_time_est.hour
-        # Use > instead of >= to allow entries until 3:59 PM ET
-        return current_hour > cls.max_entry_hour_et
+        current_minute = current_time_est.minute
+        
+        # Block entries after max_entry_hour_et (e.g., after 3PM = hour 16+)
+        if current_hour > cls.max_entry_hour_et:
+            return True
+        
+        # Block entries in the last 5 minutes of the allowed hour (e.g., 3:55-3:59 PM)
+        if current_hour == cls.max_entry_hour_et and current_minute >= cls.max_entry_minute_et:
+            return True
+        
+        return False
 
     @classmethod
     def _filter_bars_after_entry(
@@ -909,6 +929,7 @@ class MomentumIndicator(BaseTradingIndicator):
             )
 
         rsi = technical_analysis.get("rsi", 50.0)
+        mfi = technical_analysis.get("mfi", 50.0)  # Money Flow Index
         is_long = momentum_score > 0
         is_short = momentum_score < 0
 
@@ -926,6 +947,33 @@ class MomentumIndicator(BaseTradingIndicator):
                 False,
                 f"RSI too low for short: {rsi:.2f} < {cls.rsi_min_for_short} (may be oversold, risk of bounce)",
             )
+        
+        # MFI (Money Flow Index) filter - avoid extreme money flow conditions
+        # MFI < 20 = extreme selling pressure (falling knife for longs)
+        # MFI > 80 = extreme buying pressure (exhaustion for longs, squeeze for shorts)
+        if is_long:
+            if mfi < cls.mfi_min_for_long:
+                return (
+                    False,
+                    f"MFI too low for long: {mfi:.1f} < {cls.mfi_min_for_long} (extreme selling pressure, falling knife)",
+                )
+            if mfi > cls.mfi_max_for_long:
+                return (
+                    False,
+                    f"MFI too high for long: {mfi:.1f} > {cls.mfi_max_for_long} (buying exhaustion, likely reversal)",
+                )
+        
+        if is_short:
+            if mfi < cls.mfi_min_for_short:
+                return (
+                    False,
+                    f"MFI too low for short: {mfi:.1f} < {cls.mfi_min_for_short} (already oversold, risk of bounce)",
+                )
+            if mfi > cls.mfi_max_for_short:
+                return (
+                    False,
+                    f"MFI too high for short: {mfi:.1f} > {cls.mfi_max_for_short} (parabolic squeeze in progress)",
+                )
 
         # NEW: For shorts, reject if RSI is extremely overbought (>75) - parabolic squeeze in progress
         # These stocks often keep running higher before reversing
@@ -935,25 +983,66 @@ class MomentumIndicator(BaseTradingIndicator):
                 f"RSI too high for short: {rsi:.2f} > 75 (parabolic squeeze in progress, wait for exhaustion)",
             )
 
-        # Check stochastic confirmation for shorts (prevent shorting during bullish momentum)
-        if is_short:
-            stoch = technical_analysis.get("stoch", {})
-            if isinstance(stoch, dict):
-                # Handle None values explicitly - .get() with default only works if key missing
-                stoch_k_raw = stoch.get("k")
-                stoch_d_raw = stoch.get("d")
-                stoch_k = stoch_k_raw if stoch_k_raw is not None else 50.0
-                stoch_d = stoch_d_raw if stoch_d_raw is not None else 50.0
-            else:
-                stoch_k = 50.0
-                stoch_d = 50.0
+        # Check stochastic confirmation (prevent entering during wrong momentum phase)
+        stoch = technical_analysis.get("stoch", {})
+        if isinstance(stoch, dict):
+            # Handle dict format with "k" and "d" keys
+            stoch_k_raw = stoch.get("k")
+            stoch_d_raw = stoch.get("d")
+            stoch_k = stoch_k_raw if stoch_k_raw is not None else 50.0
+            stoch_d = stoch_d_raw if stoch_d_raw is not None else 50.0
+        elif isinstance(stoch, (list, tuple)) and len(stoch) >= 2:
+            # Handle list/tuple format [K, D] - this is the actual format from TechnicalAnalysisLib
+            stoch_k = stoch[0] if stoch[0] is not None else 50.0
+            stoch_d = stoch[1] if stoch[1] is not None else 50.0
+        else:
+            stoch_k = 50.0
+            stoch_d = 50.0
 
+        if is_short:
             # Don't short if stochastic is still bullish (K > D means upward momentum present)
             # This prevents shorting during active bullish momentum crossovers
             if stoch_k > stoch_d:
                 return (
                     False,
                     f"Stochastic not bearish for short: K={stoch_k:.2f} > D={stoch_d:.2f} (upward momentum still present)",
+                )
+        
+        if is_long:
+            # Don't buy if stochastic is overbought (K > 80) - likely at a top
+            # This prevents buying into exhausted rallies
+            if stoch_k > 80.0:
+                return (
+                    False,
+                    f"Stochastic overbought for long: K={stoch_k:.2f} > 80 (buying exhaustion, likely reversal)",
+                )
+            # Don't buy if stochastic is bearish (K < D means downward momentum present)
+            if stoch_k < stoch_d and stoch_k < 30.0:
+                return (
+                    False,
+                    f"Stochastic bearish for long: K={stoch_k:.2f} < D={stoch_d:.2f} with K < 30 (downward momentum present)",
+                )
+
+        # CCI (Commodity Channel Index) filter - avoid extreme readings
+        # CCI > 200 = extremely overbought (don't buy), CCI < -200 = extremely oversold (don't short)
+        # CCI > 100 with short = bullish momentum (don't short into strength)
+        cci = technical_analysis.get("cci", 0.0)
+        if cci is not None:
+            if is_long and cci > 200.0:
+                return (
+                    False,
+                    f"CCI extremely overbought for long: {cci:.1f} > 200 (price extended, likely reversal)",
+                )
+            if is_short and cci < -200.0:
+                return (
+                    False,
+                    f"CCI extremely oversold for short: {cci:.1f} < -200 (price extended, likely bounce)",
+                )
+            # Don't short when CCI shows strong bullish momentum
+            if is_short and cci > 100.0:
+                return (
+                    False,
+                    f"CCI bullish for short: {cci:.1f} > 100 (strong upward momentum, don't short into strength)",
                 )
 
         # Check for mean reversion risk (Bollinger Band extremes)
@@ -1128,11 +1217,19 @@ class MomentumIndicator(BaseTradingIndicator):
 
         return momentum_score, reason
 
+    # Minimum holding time before a trade can be preempted (in seconds)
+    min_holding_before_preempt_seconds: int = 60  # Don't preempt trades held less than 60 seconds
+    
     @classmethod
     async def _find_lowest_profitable_trade(
         cls, active_trades: List[Dict[str, Any]]
     ) -> Optional[Tuple[Dict[str, Any], float]]:
-        """Find the lowest profitable trade from active trades"""
+        """Find the lowest profitable trade from active trades that can be preempted.
+        
+        Only considers trades that:
+        1. Are currently profitable (>= profit_threshold)
+        2. Have been held for at least min_holding_before_preempt_seconds
+        """
         lowest_profit = None
         lowest_trade = None
 
@@ -1140,8 +1237,21 @@ class MomentumIndicator(BaseTradingIndicator):
             ticker = trade.get("ticker")
             enter_price = trade.get("enter_price")
             action = trade.get("action")
+            created_at = trade.get("created_at")
 
             if not ticker or enter_price is None or enter_price <= 0:
+                continue
+            
+            # Check minimum holding time before allowing preemption
+            # This prevents preempting trades that just entered (like ENVB after 2 seconds)
+            passed_min_hold, holding_minutes = cls._check_holding_period(
+                created_at, cls.min_holding_before_preempt_seconds
+            )
+            if not passed_min_hold:
+                logger.debug(
+                    f"Skipping {ticker} for preemption: held only {holding_minutes:.1f} min "
+                    f"(need {cls.min_holding_before_preempt_seconds / 60:.1f} min)"
+                )
                 continue
 
             indicators = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
@@ -1485,11 +1595,20 @@ class MomentumIndicator(BaseTradingIndicator):
             logger.debug("Market is closed, skipping momentum entry logic")
             await asyncio.sleep(cls.entry_cycle_seconds)
             return
-
-        if not await AlpacaClient.is_market_open():
-            logger.debug("Market is closed, skipping momentum entry logic")
+        
+        # Check entry cutoff time - no new entries after 3:55 PM ET
+        # This prevents late-day entries that don't have time to develop
+        if cls._is_after_entry_cutoff():
+            est_tz = pytz.timezone("America/New_York")
+            current_time_est = datetime.now(est_tz)
+            logger.info(
+                f"⏰ Entry cutoff reached ({current_time_est.strftime('%H:%M')} ET >= "
+                f"{cls.max_entry_hour_et}:{cls.max_entry_minute_et:02d} ET). "
+                "No new entries allowed - focusing on exit management only."
+            )
             await asyncio.sleep(cls.entry_cycle_seconds)
             return
+
         logger.info(
             "Market is open, proceeding with momentum entry logic (HIGHLY SELECTIVE)"
         )
