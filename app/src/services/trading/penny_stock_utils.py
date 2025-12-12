@@ -200,7 +200,7 @@ class MomentumConfirmation:
     
     MIN_BARS_IN_TREND = 2  # 2 of 5 bars in trend direction is enough
     TOTAL_BARS_TO_CHECK = 5
-    MIN_PRICE_CHANGE_PERCENT = 2.0  # NEW: Require at least 2% price change over the period
+    MIN_PRICE_CHANGE_PERCENT = 3.0  # INCREASED from 2.0% - RIG entered with 0.24% which is noise
     
     @classmethod
     def is_momentum_confirmed(
@@ -284,10 +284,10 @@ class ExitDecisionEngine:
     """Centralized exit decision logic with priority-based evaluation."""
     
     # MUCH WIDER: Penny stocks routinely swing 3-5% - need room to breathe
-    # Today's lesson: 9/10 trades lost due to stops triggering on normal volatility
-    MIN_HOLDING_SECONDS = 60  # INCREASED from 30 - give trades MORE time to develop
-    EMERGENCY_STOP_PERCENT = -7.0  # WIDENED from -3.0% - only exit on catastrophic loss
-    CONSECUTIVE_CHECKS_REQUIRED = 3  # INCREASED from 2 - require MORE confirmation before stop
+    # Dec 12: IRBT exited at 66s with -3.48% - still too fast
+    MIN_HOLDING_SECONDS = 90  # INCREASED from 60 - give trades MORE time to develop
+    EMERGENCY_STOP_PERCENT = -8.0  # WIDENED from -7.0% - only exit on catastrophic loss
+    CONSECUTIVE_CHECKS_REQUIRED = 4  # INCREASED from 3 - require MORE confirmation before stop
     
     def __init__(self):
         self.consecutive_loss_checks: Dict[str, int] = {}

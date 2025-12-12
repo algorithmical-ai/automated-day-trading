@@ -86,15 +86,16 @@ class PennyStocksIndicator(BaseTradingIndicator):
     max_daily_trades: int = 8  # REDUCED: Max trades per day (was 10) - quality over quantity
     
     # MUCH LONGER holding period - give trades time to develop
-    min_holding_period_seconds: int = 60  # INCREASED: from 30 to 60 seconds
-    min_holding_before_preempt_seconds: int = 120  # INCREASED: Don't preempt trades held < 2 min (was 60s)
+    min_holding_period_seconds: int = 90  # INCREASED: from 60 to 90 seconds (IRBT exited at 66s)
+    min_holding_before_preempt_seconds: int = 180  # INCREASED: Don't preempt trades held < 3 min (was 2 min)
+    max_holding_time_minutes: int = 60  # NEW: Max 1 hour hold (prevents overnight like RIG)
     recent_bars_for_trend: int = 5  # Use last 5 bars to determine trend
     
     # ATR configuration for volatility-based stops - MUCH WIDER for penny stocks
     atr_period: int = 14  # Period for ATR calculation
-    atr_multiplier: float = 3.0  # INCREASED: ATR multiplier (was 2.0) - penny stocks need room
-    atr_stop_min: float = -3.0  # WIDENED: Minimum stop loss (was -2.0%) - FLOOR at 3%
-    atr_stop_max: float = -6.0  # WIDENED: Maximum stop loss (was -4.0%) - CAP at 6%
+    atr_multiplier: float = 3.5  # INCREASED: ATR multiplier (was 3.0) - penny stocks need MORE room
+    atr_stop_min: float = -4.0  # WIDENED: Minimum stop loss (was -3.0%) - FLOOR at 4%
+    atr_stop_max: float = -8.0  # WIDENED: Maximum stop loss (was -6.0%) - CAP at 8%
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
@@ -1521,6 +1522,41 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     holding_seconds = (current_time - enter_time).total_seconds()
                 except Exception as e:
                     logger.debug(f"Error calculating holding period: {str(e)}")
+
+            # MAX HOLDING TIME CHECK - Force exit after 1 hour (prevents overnight holds like RIG)
+            holding_minutes = holding_seconds / 60.0
+            if holding_minutes >= cls.max_holding_time_minutes:
+                # Calculate profit for logging
+                current_price_check = await cls._get_current_price(ticker, original_action)
+                if current_price_check and current_price_check > 0:
+                    profit_percent = cls._calculate_profit_percent(enter_price, current_price_check, original_action)
+                    exit_reason = (
+                        f"Max holding time exceeded: {holding_minutes:.0f} min "
+                        f"(limit: {cls.max_holding_time_minutes} min, profit: {profit_percent:.2f}%)"
+                    )
+                    logger.warning(f"⏰ Force exit for penny stock {ticker}: {exit_reason}")
+                    
+                    # Get technical indicators for exit
+                    bars_data = await AlpacaClient.get_market_data(ticker, limit=cls.recent_bars_for_trend + 5)
+                    technical_indicators_exit = {"exit_type": "max_holding_time", "holding_seconds": holding_seconds}
+                    if bars_data:
+                        bars_dict = bars_data.get("bars", {})
+                        ticker_bars = bars_dict.get(ticker, [])
+                        if ticker_bars:
+                            latest_bar = ticker_bars[-1]
+                            technical_indicators_exit["close_price"] = latest_bar.get("c", 0.0)
+                            technical_indicators_exit["volume"] = latest_bar.get("v", 0)
+                    
+                    await cls._exit_trade(
+                        ticker=ticker,
+                        original_action=original_action,
+                        enter_price=enter_price,
+                        exit_price=current_price_check,
+                        exit_reason=exit_reason,
+                        technical_indicators_enter=tech_indicators_enter,
+                        technical_indicators_exit=technical_indicators_exit,
+                    )
+                    continue
 
             # Get current price using Alpaca API
             current_price = await cls._get_current_price(ticker, original_action)
