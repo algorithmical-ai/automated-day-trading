@@ -492,7 +492,7 @@ class BanditDecisionService:
         intraday_stats: IntradayStats
     ) -> bool:
         """
-        Record the decision in DynamoDB.
+        Record the decision in DynamoDB using update_item to preserve blocked_actions.
         
         Args:
             ticker: Stock ticker symbol
@@ -511,25 +511,31 @@ class BanditDecisionService:
         today = _get_est_date()
         
         try:
-            item = {
-                "ticker": ticker.upper(),
-                "indicator": indicator,
-                "date": today,
-                "successes": intraday_stats.successes,
-                "failures": intraday_stats.failures,
-                "total_decisions": intraday_stats.total_decisions + 1,
-                "last_decision": decision,
-                "last_decision_timestamp": now,
-                "last_confidence_score": confidence_score,
-                "last_price": current_price,
-                "last_action": action,
-                "last_reason": reason,
-                "last_updated": now
-            }
-            
-            result = await self.dynamodb_client.put_item(
+            # Use update_item instead of put_item to preserve blocked_actions
+            result = await self.dynamodb_client.update_item(
                 table_name=self.BANDIT_TABLE,
-                item=item
+                key={"ticker": ticker.upper(), "indicator": indicator},
+                update_expression=(
+                    "SET #d = :date, successes = :s, failures = :f, "
+                    "total_decisions = :td, last_decision = :ld, "
+                    "last_decision_timestamp = :ldt, last_confidence_score = :lcs, "
+                    "last_price = :lp, last_action = :la, last_reason = :lr, "
+                    "last_updated = :lu"
+                ),
+                expression_attribute_values={
+                    ":date": today,
+                    ":s": intraday_stats.successes,
+                    ":f": intraday_stats.failures,
+                    ":td": intraday_stats.total_decisions + 1,
+                    ":ld": decision,
+                    ":ldt": now,
+                    ":lcs": confidence_score,
+                    ":lp": current_price,
+                    ":la": action,
+                    ":lr": reason,
+                    ":lu": now
+                },
+                expression_attribute_names={"#d": "date"}
             )
             
             if result:
