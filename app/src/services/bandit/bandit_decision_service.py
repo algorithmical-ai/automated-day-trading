@@ -727,7 +727,7 @@ class BanditDecisionService:
             intraday_stats=stats
         )
         
-        logger.info(
+        logger.debug(
             f"can_proceed({ticker_upper}, {indicator}, {action_lower}): "
             f"decision={decision}, confidence={confidence_score:.2f}"
         )
