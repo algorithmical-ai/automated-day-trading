@@ -1,0 +1,115 @@
+# Implementation Plan
+
+- [x] 1. Create data models for bandit decision service
+  - [x] 1.1 Create IntradayStats dataclass with to_dict and from_dict methods
+    - Define fields: ticker, indicator, date, successes, failures, total_decisions, last_updated
+    - Implement serialization/deserialization methods
+    - _Requirements: 4.1, 7.3_
+  - [ ]* 1.2 Write property test for IntradayStats round-trip serialization
+    - **Property 13: Bandit State Round-Trip**
+    - **Validates: Requirements 7.3**
+  - [x] 1.3 Create BanditDecision dataclass with to_response_dict method
+    - Define fields: decision, ticker, indicator, action, reason, intraday_stats, confidence_score, current_price, timestamp
+    - Implement MCP response conversion
+    - _Requirements: 6.3_
+
+- [x] 2. Implement BanditDecisionService core logic
+  - [x] 2.1 Create BanditDecisionService class with thompson_sample static method
+    - Implement pure function using numpy.random.beta
+    - Accept alpha and beta parameters
+    - _Requirements: 2.3, 7.1_
+  - [ ]* 2.2 Write property test for Thompson Sampling statistical correctness
+    - **Property 12: Thompson Sampling Statistical Correctness**
+    - **Validates: Requirements 7.1**
+  - [ ]* 2.3 Write property test for Thompson Sampling Beta parameters
+    - **Property 5: Thompson Sampling Beta Parameters**
+    - **Validates: Requirements 2.3**
+  - [x] 2.4 Implement calculate_decision pure function
+    - Accept successes, failures, confidence_score, action parameters
+    - Return tuple of (decision: bool, reason: str)
+    - Handle exit actions (always return True)
+    - Use Thompson Sampling for entry actions
+    - Factor in confidence_score
+    - _Requirements: 1.1, 1.2, 1.3, 3.3_
+  - [ ]* 2.5 Write property test for exit actions always returning True
+    - **Property 2: Exit Actions Always Proceed**
+    - **Validates: Requirements 1.3**
+  - [ ]* 2.6 Write property test for success/failure ratio monotonicity
+    - **Property 3: Success/Failure Ratio Monotonicity**
+    - **Validates: Requirements 2.1, 3.1, 3.2**
+  - [ ]* 2.7 Write property test for neutral prior with new tickers
+    - **Property 4: Neutral Prior for New Tickers**
+    - **Validates: Requirements 2.2**
+  - [ ]* 2.8 Write property test for confidence score influence
+    - **Property 6: Confidence Score Influence**
+    - **Validates: Requirements 3.3**
+
+- [x] 3. Checkpoint - Make sure all tests are passing
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 4. Implement DynamoDB operations for BanditDecisionService
+  - [x] 4.1 Implement get_intraday_stats method
+    - Query BanditAlgorithmTable by ticker and indicator
+    - Filter by current EST date
+    - Return IntradayStats or default neutral stats if not found
+    - _Requirements: 4.3_
+  - [ ]* 4.2 Write property test for intraday data filtering
+    - **Property 9: Intraday Data Filtering**
+    - **Validates: Requirements 4.3**
+  - [x] 4.3 Implement record_decision method
+    - Store/update decision in BanditAlgorithmTable
+    - Include all required fields with EST timestamps
+    - Handle DynamoDB errors gracefully (fail-open)
+    - _Requirements: 1.4, 4.1, 4.2, 5.5_
+  - [ ]* 4.4 Write property test for decision record completeness
+    - **Property 7: Decision Record Completeness**
+    - **Validates: Requirements 4.1**
+  - [ ]* 4.5 Write property test for EST timezone consistency
+    - **Property 8: EST Timezone Consistency**
+    - **Validates: Requirements 4.2**
+  - [x] 4.6 Implement update_outcome method
+    - Update successes/failures count after trade completion
+    - _Requirements: 2.1, 3.1_
+
+- [x] 5. Implement main can_proceed method
+  - [x] 5.1 Implement input validation in can_proceed
+    - Validate ticker (non-empty, valid format)
+    - Validate indicator (non-empty)
+    - Validate action (one of valid actions)
+    - Validate confidence_score (between 0 and 1)
+    - Validate current_price (positive number)
+    - Raise ValueError with descriptive messages
+    - _Requirements: 5.1, 5.2, 5.3, 5.4_
+  - [ ]* 5.2 Write property test for invalid input rejection
+    - **Property 10: Invalid Input Rejection**
+    - **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
+  - [x] 5.3 Implement full can_proceed orchestration method
+    - Get intraday stats
+    - Calculate decision
+    - Record decision
+    - Return BanditDecision
+    - _Requirements: 1.1, 1.2_
+  - [ ]* 5.4 Write property test for return type consistency
+    - **Property 1: Return Type Consistency**
+    - **Validates: Requirements 1.1**
+
+- [x] 6. Checkpoint - Make sure all tests are passing
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 7. Expose can_proceed as MCP tool
+  - [x] 7.1 Create can_proceed tool handler function in tools.py
+    - Parse string parameters to appropriate types
+    - Call BanditDecisionService.can_proceed
+    - Format response as MCP-compatible dict
+    - _Requirements: 6.1, 6.2, 6.3_
+  - [x] 7.2 Register can_proceed in tool registry
+    - Add to get_tool_registry function
+    - Define inputSchema with all parameters
+    - Add description
+    - _Requirements: 6.1, 6.2_
+  - [ ]* 7.3 Write property test for MCP response structure
+    - **Property 11: MCP Response Structure**
+    - **Validates: Requirements 6.3**
+
+- [x] 8. Final Checkpoint - Make sure all tests are passing
+  - Ensure all tests pass, ask the user if questions arise.
