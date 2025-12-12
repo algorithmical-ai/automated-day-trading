@@ -248,17 +248,12 @@ class BanditDecisionService:
             )
             
             if item and item.get('date') == today:
-                # Check if the last action was the entry action we're looking for
-                last_action = item.get('last_action', '').lower()
-                if last_action == entry_action.lower():
-                    entry_price = item.get('last_price')
+                # Check if the stored entry_action matches what we're looking for
+                stored_entry_action = item.get('entry_action', '').lower()
+                if stored_entry_action == entry_action.lower():
+                    entry_price = item.get('entry_price')
                     if entry_price is not None:
                         return float(entry_price)
-                
-                # Also check for stored entry price field
-                entry_price = item.get('entry_price')
-                if entry_price is not None:
-                    return float(entry_price)
             
             return None
             
