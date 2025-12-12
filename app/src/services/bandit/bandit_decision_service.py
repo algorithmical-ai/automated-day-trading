@@ -677,8 +677,20 @@ class BanditDecisionService:
             if is_blocked:
                 decision = False
                 reason = block_reason
+            elif stats.total_decisions == 0:
+                # First entry of the day for this ticker+indicator - always allow
+                decision = True
+                reason = f"First {action_lower} of the day for {ticker_upper}/{indicator} - automatically approved"
+                
+                # Record the entry price for later comparison
+                await instance.record_entry_price(
+                    ticker=ticker_upper,
+                    indicator=indicator,
+                    entry_price=current_price,
+                    entry_action=action_lower
+                )
             else:
-                # Use Thompson Sampling for entry decision
+                # Use Thompson Sampling for subsequent entry decisions
                 decision, reason = cls.calculate_decision(
                     successes=stats.successes,
                     failures=stats.failures,
