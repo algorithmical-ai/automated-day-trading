@@ -2434,6 +2434,18 @@ class MomentumIndicator(BaseTradingIndicator):
                 except (ValueError, TypeError):
                     holding_seconds = 0.0
 
+            # PRIORITY 0: MAX HOLDING TIME - Force exit after 2 hours regardless of P/L
+            # This prevents overnight holds like ABTC (-7.14% after 22 hours)
+            MAX_HOLDING_MINUTES = 120  # 2 hours max
+            holding_minutes = holding_seconds / 60.0
+            if holding_minutes >= MAX_HOLDING_MINUTES:
+                should_exit = True
+                exit_reason = (
+                    f"Max holding time exceeded: {holding_minutes:.0f} min "
+                    f"(limit: {MAX_HOLDING_MINUTES} min, profit: {profit_percent:.2f}%)"
+                )
+                logger.warning(f"⏰ Force exit for {ticker}: held too long - {exit_reason}")
+
             # PRIORITY 1: Exit on profitable trend reversal (BOOK PROFIT QUICKLY)
             # FIXED: Now requires positive profit, minimum profit threshold, and minimum holding time
             # This prevents premature exits on normal market noise
@@ -2496,11 +2508,16 @@ class MomentumIndicator(BaseTradingIndicator):
                 
                 # PATIENT: Require 12 consecutive checks (60 seconds at 5s intervals)
                 # This gives the trade a full minute to recover from a dip
-                # Only exit immediately on catastrophic loss (> 2x stop threshold)
-                CONSECUTIVE_CHECKS_REQUIRED = 12  # 60 seconds of confirmation
-                CATASTROPHIC_LOSS_MULTIPLIER = 2.0  # Exit immediately if loss > 2x threshold
+                # Only exit immediately on catastrophic loss
+                CONSECUTIVE_CHECKS_REQUIRED = 6  # 30 seconds of confirmation (reduced from 60s)
+                CATASTROPHIC_FLOOR = -8.0  # HARD FLOOR: Never let a trade lose more than 8%
                 
-                catastrophic_threshold = stop_loss_threshold * CATASTROPHIC_LOSS_MULTIPLIER
+                # Catastrophic threshold is the HIGHER (less negative) of:
+                # - 2x the dynamic stop loss
+                # - Hard floor of -8%
+                # This prevents situations like VELO where -15% loss occurred
+                dynamic_catastrophic = stop_loss_threshold * 2.0
+                catastrophic_threshold = max(dynamic_catastrophic, CATASTROPHIC_FLOOR)
                 is_catastrophic = profit_percent < catastrophic_threshold
                 
                 if is_catastrophic:
