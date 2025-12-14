@@ -1,4 +1,0 @@
-# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/config/constants.py
-# hypothesis_version: 6.148.7
-
-[',', '.env', '0.2', '10', '10.0', '120', '15', '180', '2.5', '3.0', '300', '4.0', '5.0', '60', 'AWS_ACCESS_KEY_ID', 'AWS_BEDROCK_MODEL_ID', 'AWS_DEFAULT_REGION', 'Authorization', 'BUY_TO_CLOSE', 'BUY_TO_OPEN', 'CUSTOMER_TABLE', 'Customer', 'DEBUG_DAY_TRADING', 'DYNAMODB_TABLE_NAME', 'ENVIRONMENT', 'INFO', 'LOW_PRICE_THRESHOLD', 'MARKET_DATA_MCP_NAME', 'MARKET_DATA_MCP_URL', 'MCP_AUTH_HEADER_NAME', 'MID_PRICE_THRESHOLD', 'MOMENTUM_TOP_K', 'Market Data Analyzer', 'SELL_TO_CLOSE', 'SELL_TO_OPEN', 'TradingSignals', 'UW_API_TOKEN', 'UW_RATE_LIMIT_DELAY', 'UW_REQUEST_TIMEOUT', 'WEBHOOK_URL', 'development', 'market-data', 'streamable-http', 'true', 'us-east-1']

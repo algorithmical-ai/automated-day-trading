@@ -5,7 +5,6 @@ Constants and configuration loaded from environment variables
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Optional
 
 # Determine the project root directory (parent of app/src)
 APP_DIR = Path(__file__).parent
@@ -14,17 +13,6 @@ PROJECT_ROOT = APP_DIR.parent.parent
 # Load environment variables from .env file in project root
 env_path = PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=env_path, override=True)
-
-# MCP API Configuration
-MARKET_DATA_MCP_URL = os.getenv(
-    "MARKET_DATA_MCP_URL", "https://market-data-analyzer-d1d18da61b50.herokuapp.com/mcp"
-)
-
-MCP_AUTH_HEADER_NAME = os.getenv("MCP_AUTH_HEADER_NAME", "Authorization")
-MCP_AUTH_BEARER_TOKEN: Optional[str] = os.getenv("MCP_AUTH_BEARER_TOKEN", "")
-
-MARKET_DATA_MCP_TOKEN = os.getenv("MARKET_DATA_MCP_TOKEN", "")
-MARKET_DATA_MCP_NAME: str = os.getenv("MARKET_DATA_MCP_NAME", "market-data")
 
 DEBUG_DAY_TRADING = os.environ.get("DEBUG_DAY_TRADING", False)
 if isinstance(DEBUG_DAY_TRADING, str):
@@ -56,13 +44,6 @@ MOMENTUM_TOP_K = int(
 
 LOG_LEVEL: str = os.getenv("AUTOMATED_TRADING_SYSTEM_LOG_LEVEL", "INFO")
 ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
-
-
-# ---------------------------------------------------------------------------
-# MCP server transport configuration
-# ---------------------------------------------------------------------------
-
-MCP_SERVER_TRANSPORT: str = os.getenv("WORKFLOW_MCP_TRANSPORT", "streamable-http")
 
 
 # Get AWS credentials from environment variables
@@ -147,7 +128,9 @@ LOW_PRICE_THRESHOLD = float(os.environ.get("LOW_PRICE_THRESHOLD", "5.0"))
 MID_PRICE_THRESHOLD = float(os.environ.get("MID_PRICE_THRESHOLD", "10.0"))
 
 # ATR multipliers
-ATR_TRAILING_STOP_MULTIPLIER = float(os.environ.get("ATR_TRAILING_STOP_MULTIPLIER", "2.5"))
+ATR_TRAILING_STOP_MULTIPLIER = float(
+    os.environ.get("ATR_TRAILING_STOP_MULTIPLIER", "2.5")
+)
 ATR_STOP_LOSS_MULTIPLIER = float(os.environ.get("ATR_STOP_LOSS_MULTIPLIER", "3.0"))
 
 # Cooling periods (seconds)
@@ -156,6 +139,8 @@ LOW_PRICE_COOLING_PERIOD = int(os.environ.get("LOW_PRICE_COOLING_PERIOD", "120")
 DEFAULT_COOLING_PERIOD = int(os.environ.get("DEFAULT_COOLING_PERIOD", "60"))
 
 # Maximum ATR percentages for entry filter
-PENNY_STOCK_MAX_ATR_PERCENT = float(os.environ.get("PENNY_STOCK_MAX_ATR_PERCENT", "5.0"))
+PENNY_STOCK_MAX_ATR_PERCENT = float(
+    os.environ.get("PENNY_STOCK_MAX_ATR_PERCENT", "5.0")
+)
 LOW_PRICE_MAX_ATR_PERCENT = float(os.environ.get("LOW_PRICE_MAX_ATR_PERCENT", "4.0"))
 MID_PRICE_MAX_ATR_PERCENT = float(os.environ.get("MID_PRICE_MAX_ATR_PERCENT", "3.0"))

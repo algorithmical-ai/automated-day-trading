@@ -1,4 +1,0 @@
-# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/common/loguru_logger.py
-# hypothesis_version: 6.148.7
-
-['DYNO', 'ENVIRONMENT', 'INFO', 'LOG_LEVEL', 'boto3', 'botocore', 'development', 'httpcore', 'httpx', 'logger', 'mcp', 'mcp.client', 'urllib3']

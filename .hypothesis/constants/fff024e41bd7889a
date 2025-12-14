@@ -1,4 +1,0 @@
-# file: /Users/sriramsridhar/Downloads/automated-day-trading/app/src/services/mcp/mcp_client.py
-# hypothesis_version: 6.148.7
-
-[0.0, 0.1, 2.0, 200, 503, '2.0', '<!DOCTYPE', '<html', 'Content-Type', 'MCPClient', 'Unknown tool', 'action', 'all', 'application/json', 'arguments', 'clock', 'code', 'content', 'content_text', 'count', 'enter', 'enter_price', 'error', 'exit', 'gainers', 'get_market_clock', 'get_market_data', 'get_quote', 'id', 'is_open', 'is_tool_available', 'jsonrpc', 'losers', 'message', 'method', 'most_actives', 'name', 'params', 'result', 'send_webhook_signal', 'signal_data', 'text', 'text/html', 'ticker', 'tools/call', 'unknown']

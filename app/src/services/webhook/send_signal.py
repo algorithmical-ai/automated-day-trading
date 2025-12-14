@@ -16,7 +16,6 @@ from app.src.config.constants import (
 )
 
 from app.src.common.alpaca import AlpacaClient
-from app.src.services.mcp.mcp_client import MCPClient
 
 
 async def send_signal_to_webhook(
@@ -149,17 +148,19 @@ async def _send_signal_to_webhook_impl(  # noqa: C901
         "enter_reason": enter_reason if action in [BUY_TO_OPEN, SELL_TO_OPEN] else "",
         "is_golden_exception": is_golden_exception,
     }
-    
+
     # Add exit-specific fields
     if action in [BUY_TO_CLOSE, SELL_TO_CLOSE]:
-        payload["exit_reason"] = enter_reason  # enter_reason is used for exit reason too
+        payload["exit_reason"] = (
+            enter_reason  # enter_reason is used for exit reason too
+        )
         if profit_loss is not None:
             payload["profit_loss"] = profit_loss
         if enter_price is not None:
             payload["enter_price"] = enter_price
         if exit_price is not None:
             payload["exit_price"] = exit_price
-    
+
     # Add technical indicators if provided
     if technical_indicators is not None:
         payload["technical_indicators"] = technical_indicators
