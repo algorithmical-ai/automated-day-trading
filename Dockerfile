@@ -53,7 +53,7 @@ RUN echo '#!/bin/bash' > /usr/local/bin/heroku-start.sh && \
     echo 'set -e' >> /usr/local/bin/heroku-start.sh && \
     echo 'echo "🚀 HEROKU: Starting MCP Server and Trading Application" >&1' >> /usr/local/bin/heroku-start.sh && \
     echo 'echo "🚀 HEROKU: Starting MCP Server and Trading Application" >&2' >> /usr/local/bin/heroku-start.sh && \
-    echo 'exec conda run --no-capture-output -n automated_trading_system_env python -u -m app.src.web' >> /usr/local/bin/heroku-start.sh && \
+    echo 'exec conda run --no-capture-output -n automated_trading_system_env python -u -m app.src.app' >> /usr/local/bin/heroku-start.sh && \
     chmod +x /usr/local/bin/heroku-start.sh
 
 # Command to run the application
