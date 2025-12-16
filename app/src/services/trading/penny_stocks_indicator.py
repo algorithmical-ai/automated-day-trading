@@ -17,6 +17,7 @@ from typing import List, Tuple, Dict, Any, Optional
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
+from app.src.common.memory_monitor import MemoryMonitor
 from app.src.common.alpaca import AlpacaClient
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
@@ -617,9 +618,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
             f"Fetching market data for {len(candidates_to_fetch)} penny stock tickers in parallel batches"
         )
 
-        # Fetch market data using Alpaca API
+        # Fetch market data using Alpaca API (using memory-optimized batch size)
+        # max_concurrent=None will use memory-optimized config from MemoryMonitor
         market_data_dict = await cls._fetch_market_data_batch(
-            candidates_to_fetch, max_concurrent=25
+            candidates_to_fetch, max_concurrent=None
         )
 
         # Process results using validation pipeline

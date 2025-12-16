@@ -10,6 +10,7 @@ import pytz
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
+from app.src.common.memory_monitor import MemoryMonitor
 from app.src.common.alpaca import AlpacaClient
 from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
 from app.src.services.market_data.market_data_service import MarketDataService
@@ -350,9 +351,10 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             f"Fetching market data for {len(candidates_to_fetch)} tickers in parallel batches"
         )
 
-        # Fetch market data in parallel batches (increased concurrency for speed)
+        # Fetch market data in parallel batches (using memory-optimized batch size)
+        # max_concurrent=None will use memory-optimized config from MemoryMonitor
         market_data_dict = await cls._fetch_market_data_batch(
-            candidates_to_fetch, max_concurrent=25
+            candidates_to_fetch, max_concurrent=None
         )
 
         # Evaluate all tickers for entry
@@ -486,8 +488,9 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             async def log_one(log_data):
                 await DynamoDBClient.log_inactive_ticker_reason(**log_data)
 
-            # Write in batches of 20 to avoid overwhelming DynamoDB
-            batch_size = 20
+            # Write in batches using memory-optimized batch size
+            memory_config = MemoryMonitor.get_memory_config()
+            batch_size = memory_config["dynamodb_batch_size"]
             for i in range(0, len(inactive_ticker_logs), batch_size):
                 batch = inactive_ticker_logs[i : i + batch_size]
                 await asyncio.gather(

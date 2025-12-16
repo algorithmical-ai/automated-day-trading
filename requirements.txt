@@ -29,6 +29,9 @@ starlette>=0.27.0
 # Logging
 loguru>=0.7.0
 
+# Memory Monitoring
+psutil>=5.9.0
+
 # Timezone
 pytz>=2023.3
 

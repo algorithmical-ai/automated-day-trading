@@ -17,6 +17,7 @@ import pytz
 
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
+from app.src.common.memory_monitor import MemoryMonitor
 from app.src.common.alpaca import AlpacaClient
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
@@ -1647,9 +1648,10 @@ class MomentumIndicator(BaseTradingIndicator):
             f"Fetching market data for {len(candidates_to_fetch)} tickers in parallel batches"
         )
 
-        # Fetch market data in parallel batches (increased concurrency for speed)
+        # Fetch market data in parallel batches (using memory-optimized batch size)
+        # max_concurrent=None will use memory-optimized config from MemoryMonitor
         market_data_dict = await cls._fetch_market_data_batch(
-            candidates_to_fetch, max_concurrent=25
+            candidates_to_fetch, max_concurrent=None
         )
 
         # Process results
@@ -1885,8 +1887,9 @@ class MomentumIndicator(BaseTradingIndicator):
                     logger.error(f"Error logging inactive ticker {log_data.get('ticker')}: {str(e)}")
                     return False
 
-            # Write in batches of 20 to avoid overwhelming DynamoDB
-            batch_size = 20
+            # Write in batches using memory-optimized batch size
+            memory_config = MemoryMonitor.get_memory_config()
+            batch_size = memory_config["dynamodb_batch_size"]
             for i in range(0, len(inactive_ticker_logs), batch_size):
                 batch = inactive_ticker_logs[i : i + batch_size]
                 results = await asyncio.gather(

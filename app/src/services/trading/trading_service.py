@@ -7,6 +7,7 @@ import asyncio
 import os
 from typing import List, Tuple, Any
 from app.src.common.loguru_logger import logger
+from app.src.common.memory_monitor import MemoryMonitor
 from app.src.services.trading.momentum_indicator import MomentumIndicator
 from app.src.services.trading.deep_analyzer_indicator import DeepAnalyzerIndicator
 from app.src.services.trading.uw_enhanced_momentum_indicator import UWEnhancedMomentumIndicator
@@ -136,6 +137,24 @@ class TradingServiceCoordinator:
         
         if "UW-Enhanced Momentum Indicator" in cls._enabled_indicators:
             tasks.append(("UW-Enhanced Momentum Indicator", UWEnhancedMomentumIndicator.run()))
+
+        # Add periodic memory monitoring task
+        async def periodic_memory_monitor():
+            """Periodically log memory usage every 5 minutes"""
+            while True:
+                await asyncio.sleep(300)  # 5 minutes
+                MemoryMonitor.log_memory_usage(
+                    "Trading Service Coordinator (Periodic)",
+                    level="INFO"
+                )
+                # Check memory threshold and warn if high
+                MemoryMonitor.check_memory_threshold(
+                    threshold_mb=400.0,
+                    context="Trading Service Coordinator",
+                    action="WARNING"
+                )
+        
+        tasks.append(("Memory Monitor", periodic_memory_monitor()))
 
         # Run all enabled indicators concurrently with error isolation
         # Requirement 1.2: Using return_exceptions=True to capture exceptions without stopping others

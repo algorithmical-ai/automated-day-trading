@@ -9,9 +9,13 @@ from typing import Dict, Any, List, Tuple, Optional, ClassVar
 from datetime import datetime, date, timezone, time
 import pytz
 
+import gc
 from app.src.common.alpaca import AlpacaClient
 from app.src.common.loguru_logger import logger
-from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
+from app.src.common.memory_monitor import MemoryMonitor
+from app.src.services.technical_analysis.technical_analysis_lib import (
+    TechnicalAnalysisLib,
+)
 from app.src.services.candidate_generator.alpaca_screener import AlpacaScreenerService
 from app.src.db.dynamodb_client import DynamoDBClient, _get_est_timestamp
 from app.src.services.webhook.send_signal import send_signal_to_webhook
@@ -191,14 +195,15 @@ class BaseTradingIndicator(ABC):
 
     @classmethod
     async def _fetch_market_data_batch(
-        cls, tickers: List[str], max_concurrent: int = 10
+        cls, tickers: List[str], max_concurrent: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Fetch market data for multiple tickers in parallel batches.
+        Uses memory-optimized batch sizes based on environment configuration.
 
         Args:
             tickers: List of ticker symbols to fetch
-            max_concurrent: Maximum number of concurrent API calls
+            max_concurrent: Maximum number of concurrent API calls (uses config if None)
 
         Returns:
             Dictionary mapping ticker -> market_data_response (or None if failed)
@@ -206,23 +211,47 @@ class BaseTradingIndicator(ABC):
         if not tickers:
             return {}
 
+        # Get memory-optimized configuration
+        if max_concurrent is None:
+            memory_config = MemoryMonitor.get_memory_config()
+            max_concurrent = memory_config["market_data_batch_size"]
+
+        # Log memory before batch processing
+        MemoryMonitor.log_memory_usage(
+            f"{cls.indicator_name()}: Before fetching {len(tickers)} tickers",
+            level="DEBUG",
+        )
+
         async def fetch_one(ticker: str) -> Tuple[str, Any]:
             """Fetch market data for a single ticker"""
             try:
                 # Use TechnicalAnalysisLib directly instead of MCPClient
-                market_data = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
+                market_data = await TechnicalAnalysisLib.calculate_all_indicators(
+                    ticker
+                )
                 return (ticker, market_data)
             except Exception as e:
                 logger.debug(f"Failed to get market data for {ticker}: {str(e)}")
                 return (ticker, None)
 
-        # Process in batches to avoid overwhelming the API
+        # Process in batches to avoid overwhelming the API and memory
         results: Dict[str, Any] = {}
-        for i in range(0, len(tickers), max_concurrent):
+        total_batches = (len(tickers) + max_concurrent - 1) // max_concurrent
+
+        for batch_num, i in enumerate(range(0, len(tickers), max_concurrent), 1):
             batch = tickers[i : i + max_concurrent]
+
+            # Check memory threshold before processing batch
+            MemoryMonitor.check_memory_threshold(
+                threshold_mb=400.0,  # Warn at 400MB for Basic dyno
+                context=f"{cls.indicator_name()}: Batch {batch_num}/{total_batches}",
+                action="WARNING",
+            )
+
             batch_results = await asyncio.gather(
                 *[fetch_one(ticker) for ticker in batch], return_exceptions=True
             )
+
             for result in batch_results:
                 if isinstance(result, Exception):
                     logger.debug(f"Exception in batch fetch: {str(result)}")
@@ -230,6 +259,32 @@ class BaseTradingIndicator(ABC):
                 if isinstance(result, tuple) and len(result) == 2:
                     ticker, market_data = result
                     results[ticker] = market_data
+
+            # Log memory after each batch (every 5 batches to reduce log noise)
+            if batch_num % 5 == 0 or batch_num == total_batches:
+                MemoryMonitor.log_memory_usage(
+                    f"{cls.indicator_name()}: After batch {batch_num}/{total_batches}",
+                    level="DEBUG",
+                )
+
+            # Small delay between batches to allow memory cleanup
+            if batch_num < total_batches:
+                await asyncio.sleep(0.1)
+
+            # Periodic garbage collection every 10 batches to free memory
+            if batch_num % 10 == 0:
+                MemoryMonitor.force_garbage_collection(
+                    context=f"{cls.indicator_name()}: After batch {batch_num}"
+                )
+
+        # Final garbage collection and memory log
+        MemoryMonitor.force_garbage_collection(
+            context=f"{cls.indicator_name()}: After fetching {len(tickers)} tickers"
+        )
+        MemoryMonitor.log_memory_usage(
+            f"{cls.indicator_name()}: After fetching {len(tickers)} tickers",
+            level="DEBUG",
+        )
 
         return results
 
@@ -312,7 +367,7 @@ class BaseTradingIndicator(ABC):
                 # Convert Decimal to float if needed (DynamoDB returns Decimal)
                 enter_price = float(enter_price)
                 exit_price = float(exit_price)
-                
+
                 # Calculate number of shares bought with $2000
                 number_of_shares = cls.position_size_dollars / enter_price
 
@@ -429,7 +484,7 @@ class BaseTradingIndicator(ABC):
         # Convert Decimal to float if needed (DynamoDB returns Decimal)
         enter_price = float(enter_price) if enter_price is not None else 0.0
         current_price = float(current_price) if current_price is not None else 0.0
-        
+
         if action == "buy_to_open":
             return ((current_price - enter_price) / enter_price) * 100
         elif action == "sell_to_open":
@@ -437,14 +492,16 @@ class BaseTradingIndicator(ABC):
         return 0.0
 
     @classmethod
-    async def _get_current_price_for_exit(cls, ticker: str, action: str) -> Optional[float]:
+    async def _get_current_price_for_exit(
+        cls, ticker: str, action: str
+    ) -> Optional[float]:
         """
         Get current price for exit decision using Alpaca API.
-        
+
         Args:
             ticker: Stock ticker symbol
             action: "buy_to_open" (long) or "sell_to_open" (short)
-            
+
         Returns:
             Current price (bid for long, ask for short) or None if unavailable
         """
@@ -472,11 +529,11 @@ class BaseTradingIndicator(ABC):
     ) -> Tuple[bool, float]:
         """
         Check if trade has passed minimum holding period.
-        
+
         Args:
             created_at: ISO timestamp string when trade was created
             min_holding_seconds: Optional minimum holding period in seconds
-            
+
         Returns:
             Tuple of (passed_minimum: bool, holding_period_minutes: float)
         """
@@ -484,7 +541,7 @@ class BaseTradingIndicator(ABC):
             return True, 0.0  # No created_at means we can't check, allow processing
 
         if min_holding_seconds is None:
-            min_holding_seconds = getattr(cls, 'min_holding_period_seconds', 30)
+            min_holding_seconds = getattr(cls, "min_holding_period_seconds", 30)
 
         try:
             enter_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
@@ -505,12 +562,12 @@ class BaseTradingIndicator(ABC):
         """
         Check if we're within the specified minutes before market close.
         Market close is 4:00 PM ET (16:00).
-        
+
         Returns:
             True if within minutes_before_close_to_exit of market close
         """
-        minutes_before_close = getattr(cls, 'minutes_before_close_to_exit', 15)
-        
+        minutes_before_close = getattr(cls, "minutes_before_close_to_exit", 15)
+
         est_tz = pytz.timezone("America/New_York")
         current_time_est = datetime.now(est_tz)
         market_close_time = time(16, 0)  # 4:00 PM ET
@@ -538,26 +595,28 @@ class BaseTradingIndicator(ABC):
     ) -> Tuple[bool, Optional[str], float]:
         """
         Check if hard stop loss should trigger an exit.
-        
+
         Args:
             ticker: Stock ticker symbol
             enter_price: Entry price
             current_price: Current price
             action: Trade action ("buy_to_open" or "sell_to_open")
             dynamic_stop_loss: Dynamic stop loss percentage (negative value)
-            
+
         Returns:
             Tuple of (should_exit: bool, exit_reason: Optional[str], profit_percent: float)
         """
-        profit_percent = cls._calculate_profit_percent(enter_price, current_price, action)
-        
+        profit_percent = cls._calculate_profit_percent(
+            enter_price, current_price, action
+        )
+
         # Use dynamic stop loss if available, otherwise use default
         stop_loss_threshold = (
             float(dynamic_stop_loss)
             if dynamic_stop_loss is not None
-            else getattr(cls, 'stop_loss_threshold', -2.5)
+            else getattr(cls, "stop_loss_threshold", -2.5)
         )
-        
+
         if profit_percent < stop_loss_threshold:
             exit_reason = (
                 f"Hard stop loss triggered: {profit_percent:.2f}% "
@@ -565,7 +624,7 @@ class BaseTradingIndicator(ABC):
                 f"{' (dynamic)' if dynamic_stop_loss is not None else ''})"
             )
             return True, exit_reason, profit_percent
-        
+
         return False, None, profit_percent
 
     @classmethod
@@ -577,19 +636,19 @@ class BaseTradingIndicator(ABC):
         """
         Check if end-of-day forced closure should trigger.
         Only exits profitable trades; losing trades are held until next day.
-        
+
         Args:
             ticker: Stock ticker symbol
             profit_percent: Current profit percentage
-            
+
         Returns:
             Tuple of (should_exit: bool, exit_reason: Optional[str])
         """
         if not cls._is_near_market_close():
             return False, None
-        
-        minutes_before_close = getattr(cls, 'minutes_before_close_to_exit', 15)
-        
+
+        minutes_before_close = getattr(cls, "minutes_before_close_to_exit", 15)
+
         # Only exit if profitable
         if profit_percent > 0:
             exit_reason = (
@@ -617,7 +676,7 @@ class BaseTradingIndicator(ABC):
     ) -> Tuple[bool, Optional[str], float]:
         """
         Check if trailing stop should trigger an exit.
-        
+
         Args:
             ticker: Stock ticker symbol
             enter_price: Entry price
@@ -626,33 +685,41 @@ class BaseTradingIndicator(ABC):
             peak_profit_percent: Peak profit percentage achieved
             created_at: ISO timestamp when trade was created
             technical_indicators: Technical indicators for the ticker
-            
+
         Returns:
             Tuple of (should_exit: bool, exit_reason: Optional[str], profit_percent: float)
         """
-        profit_percent = cls._calculate_profit_percent(enter_price, current_price, action)
-        
+        profit_percent = cls._calculate_profit_percent(
+            enter_price, current_price, action
+        )
+
         # Get activation threshold
-        trailing_stop_activation_profit = getattr(cls, 'trailing_stop_activation_profit', 0.5)
-        
+        trailing_stop_activation_profit = getattr(
+            cls, "trailing_stop_activation_profit", 0.5
+        )
+
         # Check if trailing stop is activated
         if peak_profit_percent < trailing_stop_activation_profit:
             return False, None, profit_percent
-        
+
         # Check cooldown period if specified
-        trailing_stop_cooldown_seconds = getattr(cls, 'trailing_stop_cooldown_seconds', 30)
+        trailing_stop_cooldown_seconds = getattr(
+            cls, "trailing_stop_cooldown_seconds", 30
+        )
         if created_at and trailing_stop_cooldown_seconds > 0:
             try:
                 enter_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                 if enter_time.tzinfo is None:
                     enter_time = enter_time.replace(tzinfo=timezone.utc)
-                elapsed_seconds = (datetime.now(timezone.utc) - enter_time).total_seconds()
-                
+                elapsed_seconds = (
+                    datetime.now(timezone.utc) - enter_time
+                ).total_seconds()
+
                 if elapsed_seconds < trailing_stop_cooldown_seconds:
                     return False, None, profit_percent
             except Exception:
                 pass  # Continue if cooldown check fails
-        
+
         # Calculate trailing stop distance
         from app.src.services.trading.trading_config import (
             ATR_TRAILING_STOP_MULTIPLIER,
@@ -660,10 +727,10 @@ class BaseTradingIndicator(ABC):
             TRAILING_STOP_SHORT_MULTIPLIER,
             MAX_TRAILING_STOP_SHORT,
         )
-        
+
         is_short = action == "sell_to_open"
-        trailing_stop_percent = getattr(cls, 'trailing_stop_percent', 2.5)
-        
+        trailing_stop_percent = getattr(cls, "trailing_stop_percent", 2.5)
+
         # Use ATR-based trailing stop if available
         if technical_indicators:
             atr = technical_indicators.get("atr", 0.0)
@@ -681,18 +748,22 @@ class BaseTradingIndicator(ABC):
             else:
                 dynamic_trailing_stop = trailing_stop_percent
                 if is_short:
-                    trailing_stop_short_multiplier = getattr(cls, 'trailing_stop_short_multiplier', 1.5)
+                    trailing_stop_short_multiplier = getattr(
+                        cls, "trailing_stop_short_multiplier", 1.5
+                    )
                     dynamic_trailing_stop *= trailing_stop_short_multiplier
         else:
             dynamic_trailing_stop = trailing_stop_percent
             if is_short:
-                trailing_stop_short_multiplier = getattr(cls, 'trailing_stop_short_multiplier', 1.5)
+                trailing_stop_short_multiplier = getattr(
+                    cls, "trailing_stop_short_multiplier", 1.5
+                )
                 dynamic_trailing_stop *= trailing_stop_short_multiplier
-        
+
         # Check if trailing stop should trigger
         drop_from_peak = peak_profit_percent - profit_percent
         should_trigger = drop_from_peak >= dynamic_trailing_stop and profit_percent > 0
-        
+
         if should_trigger:
             exit_reason = (
                 f"Trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
@@ -700,7 +771,7 @@ class BaseTradingIndicator(ABC):
                 f"trailing stop: {dynamic_trailing_stop:.2f}%)"
             )
             return True, exit_reason, profit_percent
-        
+
         return False, None, profit_percent
 
     @classmethod
@@ -715,13 +786,13 @@ class BaseTradingIndicator(ABC):
         1. Hard stop loss (highest priority)
         2. End-of-day forced closure (only for profitable trades)
         3. Trailing stop (if activated)
-        
+
         Args:
             trade: Trade dictionary with ticker, action, enter_price, etc.
             technical_indicators: Optional technical indicators for the ticker
-            
+
         Returns:
-            Tuple of (should_exit: bool, exit_reason: Optional[str], 
+            Tuple of (should_exit: bool, exit_reason: Optional[str],
                      current_price: float, profit_percent: float)
         """
         ticker = trade.get("ticker")
@@ -730,71 +801,78 @@ class BaseTradingIndicator(ABC):
         peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
         created_at = trade.get("created_at")
         dynamic_stop_loss = trade.get("dynamic_stop_loss")
-        
+
         if not ticker or enter_price is None or enter_price <= 0:
             logger.warning(f"Invalid trade data: {trade}")
             return False, None, 0.0, 0.0
-        
+
         # Check minimum holding period
-        min_holding_seconds = getattr(cls, 'min_holding_period_seconds', 30)
+        min_holding_seconds = getattr(cls, "min_holding_period_seconds", 30)
         passed_holding, holding_minutes = cls._check_holding_period(
             created_at, min_holding_seconds
         )
-        
+
         if not passed_holding:
             logger.debug(
                 f"Skipping {ticker}: holding period {holding_minutes:.1f} min < "
                 f"minimum {min_holding_seconds/60:.2f} min"
             )
             return False, None, 0.0, 0.0
-        
+
         # Get current price
         current_price = await cls._get_current_price_for_exit(ticker, action)
         if current_price is None or current_price <= 0:
-            logger.warning(f"Failed to get quote for {ticker} - will retry in next cycle")
+            logger.warning(
+                f"Failed to get quote for {ticker} - will retry in next cycle"
+            )
             return False, None, 0.0, 0.0
-        
+
         # 1. Check hard stop loss (highest priority)
         should_exit, exit_reason, profit_percent = await cls._check_hard_stop_loss(
             ticker, enter_price, current_price, action, dynamic_stop_loss
         )
         if should_exit:
             return True, exit_reason, current_price, profit_percent
-        
+
         # 2. Check end-of-day forced closure (only for profitable trades)
         should_exit, exit_reason = await cls._check_end_of_day_closure(
             ticker, profit_percent
         )
         if should_exit:
             return True, exit_reason, current_price, profit_percent
-        
+
         # 3. Check trailing stop (if activated)
         should_exit, exit_reason, profit_percent = await cls._check_trailing_stop_exit(
-            ticker, enter_price, current_price, action, peak_profit_percent,
-            created_at, technical_indicators
+            ticker,
+            enter_price,
+            current_price,
+            action,
+            peak_profit_percent,
+            created_at,
+            technical_indicators,
         )
         if should_exit:
             return True, exit_reason, current_price, profit_percent
-        
+
         return False, None, current_price, profit_percent
-    
+
     @classmethod
     async def _log_inactive_ticker(
         cls,
         ticker: str,
         reason_not_to_enter_long: str,
         reason_not_to_enter_short: str,
-        technical_indicators: Optional[Dict[str, Any]] = None
+        technical_indicators: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
         Log an inactive ticker (evaluated but not traded).
-        
+
         Args:
             ticker: Stock ticker symbol
             reason_not_to_enter_long: Reason for not entering long position
             reason_not_to_enter_short: Reason for not entering short position
             technical_indicators: Technical indicators at evaluation time
-            
+
         Returns:
             True if successful, False otherwise
         """
@@ -804,9 +882,9 @@ class BaseTradingIndicator(ABC):
                 indicator=cls.indicator_name(),
                 reason_not_to_enter_long=reason_not_to_enter_long,
                 reason_not_to_enter_short=reason_not_to_enter_short,
-                technical_indicators=technical_indicators
+                technical_indicators=technical_indicators,
             )
-            
+
             logger.debug(
                 f"Logged inactive ticker {ticker} for {cls.indicator_name()}: "
                 f"long={reason_not_to_enter_long}, short={reason_not_to_enter_short}"
