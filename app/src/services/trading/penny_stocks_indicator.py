@@ -229,14 +229,20 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
     @classmethod
     async def _fetch_market_data_batch(
-        cls, tickers: List[str], max_concurrent: int = 10
+        cls, tickers: List[str], max_concurrent: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Fetch market data for multiple tickers using Alpaca API.
+        Uses memory-optimized batch sizes based on environment configuration.
         Returns dict mapping ticker -> bars data
         """
         if not tickers:
             return {}
+
+        # Get memory-optimized configuration
+        if max_concurrent is None:
+            memory_config = MemoryMonitor.get_memory_config()
+            max_concurrent = memory_config["market_data_batch_size"]
 
         async def fetch_one(ticker: str) -> Tuple[str, Any]:
             """Fetch market data for a single ticker"""

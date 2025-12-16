@@ -938,8 +938,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
         logger.info(f"Fetching market data for {len(candidates_to_fetch)} tickers")
 
+        # Use memory-optimized batch size (max_concurrent=None uses config)
         market_data_dict = await cls._fetch_market_data_batch(
-            candidates_to_fetch, max_concurrent=25
+            candidates_to_fetch, max_concurrent=None
         )
 
         ticker_momentum_scores = []
