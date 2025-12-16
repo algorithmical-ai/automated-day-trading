@@ -27,7 +27,7 @@ from app.src.services.trading.validation import (
     TrendAnalyzer,
     QuoteData,
     RejectionCollector,
-    InactiveTickerRepository
+    InactiveTickerRepository,
 )
 from app.src.services.trading.penny_stock_utils import (
     SpreadCalculator,
@@ -57,53 +57,77 @@ class PennyStocksIndicator(BaseTradingIndicator):
     # Today's losses: 9/10 trades lost due to tight stops triggering on normal volatility
     max_stock_price: float = 5.0  # Only trade stocks < $5
     min_stock_price: float = 0.75  # INCREASED: Avoid ultra-low penny stocks (was 0.50)
-    
+
     # MUCH WIDER STOPS - penny stocks swing 3-5% routinely
     trailing_stop_percent: float = 2.0  # WIDENED: Base trailing stop (was 1.0%)
-    profit_threshold: float = 2.5  # INCREASED: Exit at 2.5% profit (was 1.5%) - need bigger wins
-    immediate_loss_exit_threshold: float = -7.0  # WIDENED: Emergency stop at -7.0% (was -3.0%)
-    default_atr_stop_percent: float = -4.0  # WIDENED: Default ATR-based stop loss (was -2.5%)
-    
+    profit_threshold: float = (
+        2.5  # INCREASED: Exit at 2.5% profit (was 1.5%) - need bigger wins
+    )
+    immediate_loss_exit_threshold: float = (
+        -7.0
+    )  # WIDENED: Emergency stop at -7.0% (was -3.0%)
+    default_atr_stop_percent: float = (
+        -4.0
+    )  # WIDENED: Default ATR-based stop loss (was -2.5%)
+
     top_k: int = 1  # Only top 1 ticker to reduce exposure
-    min_momentum_threshold: float = 5.0  # INCREASED: Minimum 5% momentum (was 3.0% - too weak)
+    min_momentum_threshold: float = (
+        5.0  # INCREASED: Minimum 5% momentum (was 3.0% - too weak)
+    )
     max_momentum_threshold: float = 20.0  # Maximum 20% momentum
-    exceptional_momentum_threshold: float = 10.0  # INCREASED: Exceptional momentum for preemption (was 8.0%)
-    
-    min_volume: int = 10000  # INCREASED: Minimum volume (was 5000) - need MORE liquidity
+    exceptional_momentum_threshold: float = (
+        10.0  # INCREASED: Exceptional momentum for preemption (was 8.0%)
+    )
+
+    min_volume: int = (
+        10000  # INCREASED: Minimum volume (was 5000) - need MORE liquidity
+    )
     min_avg_volume: int = 10000  # INCREASED: Minimum average volume (was 5000)
     max_price_discrepancy_percent: float = 2.0  # TIGHTENED: Max % difference (was 3.0%)
-    max_bid_ask_spread_percent: float = 0.75  # TIGHTENED: Max bid-ask spread (was 1.0%) - spread kills profits
-    
+    max_bid_ask_spread_percent: float = (
+        0.75  # TIGHTENED: Max bid-ask spread (was 1.0%) - spread kills profits
+    )
+
     # Entry time restrictions - no late-day entries
     max_entry_hour_et: int = 15  # No entries after 3:00 PM ET
     max_entry_minute_et: int = 30  # EARLIER: No entries after 3:30 PM ET (was 3:55)
-    
+
     # SAFETY: Disable shorting for penny stocks - too risky (can spike 100%+ in minutes)
     allow_short_positions: bool = False
-    
+
     entry_cycle_seconds: int = 1  # Check for entries every 1 second
     exit_cycle_seconds: int = 1  # Check exits every 1 second
     max_active_trades: int = 2  # REDUCED: Max concurrent trades (was 3) - less exposure
-    max_daily_trades: int = 8  # REDUCED: Max trades per day (was 10) - quality over quantity
-    
+    max_daily_trades: int = (
+        8  # REDUCED: Max trades per day (was 10) - quality over quantity
+    )
+
     # MUCH LONGER holding period - give trades time to develop
-    min_holding_period_seconds: int = 90  # INCREASED: from 60 to 90 seconds (IRBT exited at 66s)
-    min_holding_before_preempt_seconds: int = 180  # INCREASED: Don't preempt trades held < 3 min (was 2 min)
-    max_holding_time_minutes: int = 60  # NEW: Max 1 hour hold (prevents overnight like RIG)
+    min_holding_period_seconds: int = (
+        90  # INCREASED: from 60 to 90 seconds (IRBT exited at 66s)
+    )
+    min_holding_before_preempt_seconds: int = (
+        180  # INCREASED: Don't preempt trades held < 3 min (was 2 min)
+    )
+    max_holding_time_minutes: int = (
+        60  # NEW: Max 1 hour hold (prevents overnight like RIG)
+    )
     recent_bars_for_trend: int = 5  # Use last 5 bars to determine trend
-    
+
     # ATR configuration for volatility-based stops - MUCH WIDER for penny stocks
     atr_period: int = 14  # Period for ATR calculation
-    atr_multiplier: float = 3.5  # INCREASED: ATR multiplier (was 3.0) - penny stocks need MORE room
+    atr_multiplier: float = (
+        3.5  # INCREASED: ATR multiplier (was 3.0) - penny stocks need MORE room
+    )
     atr_stop_min: float = -4.0  # WIDENED: Minimum stop loss (was -3.0%) - FLOOR at 4%
     atr_stop_max: float = -8.0  # WIDENED: Maximum stop loss (was -6.0%) - CAP at 8%
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
-    
+
     # Exit decision engine instance (shared across exit cycles)
     _exit_engine: Optional[ExitDecisionEngine] = None
-    
+
     # Daily performance metrics
     _daily_metrics: Optional[DailyPerformanceMetrics] = None
 
@@ -241,8 +265,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         # Get memory-optimized configuration
         if max_concurrent is None:
-            memory_config = MemoryMonitor.get_memory_config()
-            max_concurrent = memory_config["market_data_batch_size"]
+            try:
+                memory_config = MemoryMonitor.get_memory_config()
+                max_concurrent = memory_config.get("market_data_batch_size", 10)
+            except Exception as e:
+                logger.warning(f"Failed to get memory config, using default: {e}")
+                max_concurrent = 10
+        
+        # Ensure max_concurrent is a valid integer
+        if max_concurrent is None or not isinstance(max_concurrent, int) or max_concurrent <= 0:
+            logger.warning(f"Invalid max_concurrent value: {max_concurrent}, using default 10")
+            max_concurrent = 10
 
         async def fetch_one(ticker: str) -> Tuple[str, Any]:
             """Fetch market data for a single ticker"""
@@ -282,35 +315,35 @@ class PennyStocksIndicator(BaseTradingIndicator):
         ticker: str,
         bars: List[Dict[str, Any]],
         quote_data: QuoteData,
-        collector: RejectionCollector
+        collector: RejectionCollector,
     ) -> bool:
         """
         Validate ticker using SIMPLIFIED validation for penny stocks.
-        
+
         PHILOSOPHY: Alpaca's gainers/most_actives ARE the momentum signal.
         We trust that signal and only do minimal validation:
         1. Have at least 3 bars (minimal data quality)
         2. Valid bid/ask spread (can actually trade)
-        
+
         We DON'T over-filter with:
         - Complex momentum thresholds (Alpaca already screened for momentum)
         - Continuation scores (too restrictive for volatile penny stocks)
         - Price extreme rules (penny stocks are volatile by nature)
-        
+
         Args:
             ticker: Stock ticker symbol
             bars: Historical price bars
             quote_data: Current quote data
             collector: RejectionCollector to accumulate rejections
-            
+
         Returns:
             True if ticker passes validation, False otherwise
         """
         # Calculate trend metrics for logging purposes
         trend_metrics = TrendAnalyzer.calculate_trend_metrics(bars)
-        
+
         # SIMPLIFIED VALIDATION - Only essential checks
-        
+
         # 1. Minimal data quality - need at least 3 bars to calculate any trend
         MIN_BARS_REQUIRED = 3
         if not bars or len(bars) < MIN_BARS_REQUIRED:
@@ -320,10 +353,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 indicator=cls.indicator_name(),
                 reason_long=reason,
                 reason_short=reason,
-                technical_indicators=trend_metrics.to_dict() if trend_metrics else None
+                technical_indicators=trend_metrics.to_dict() if trend_metrics else None,
             )
             return False
-        
+
         # 2. Valid bid/ask - must be able to actually trade
         if quote_data.bid <= 0 or quote_data.ask <= 0:
             reason = f"Invalid bid/ask: bid={quote_data.bid}, ask={quote_data.ask}"
@@ -332,10 +365,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 indicator=cls.indicator_name(),
                 reason_long=reason,
                 reason_short=reason,
-                technical_indicators=trend_metrics.to_dict() if trend_metrics else None
+                technical_indicators=trend_metrics.to_dict() if trend_metrics else None,
             )
             return False
-        
+
         # 3. Spread check - but be lenient for penny stocks (they're volatile)
         MAX_SPREAD_FOR_PENNY = 5.0  # Allow up to 5% spread for penny stocks
         if quote_data.spread_percent > MAX_SPREAD_FOR_PENNY:
@@ -345,10 +378,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 indicator=cls.indicator_name(),
                 reason_long=reason,
                 reason_short=reason,
-                technical_indicators=trend_metrics.to_dict() if trend_metrics else None
+                technical_indicators=trend_metrics.to_dict() if trend_metrics else None,
             )
             return False
-        
+
         # PASSED - Trust Alpaca's gainer/most_active signal
         return True
 
@@ -466,24 +499,28 @@ class PennyStocksIndicator(BaseTradingIndicator):
         Check if current time is after the entry cutoff time.
         No new entries allowed after 3:55 PM ET to avoid late-day volatility
         and ensure trades have time to develop before market close.
-        
+
         Returns:
             True if entries should be blocked, False if entries are allowed
         """
         import pytz
+
         est_tz = pytz.timezone("America/New_York")
         current_time_est = datetime.now(est_tz)
         current_hour = current_time_est.hour
         current_minute = current_time_est.minute
-        
+
         # Block entries after max_entry_hour_et (e.g., after 3PM = hour 16+)
         if current_hour > cls.max_entry_hour_et:
             return True
-        
+
         # Block entries in the last 5 minutes of the allowed hour (e.g., 3:55-3:59 PM)
-        if current_hour == cls.max_entry_hour_et and current_minute >= cls.max_entry_minute_et:
+        if (
+            current_hour == cls.max_entry_hour_et
+            and current_minute >= cls.max_entry_minute_et
+        ):
             return True
-        
+
         return False
 
     @classmethod
@@ -495,11 +532,12 @@ class PennyStocksIndicator(BaseTradingIndicator):
             logger.debug("Market is closed, skipping penny stocks entry logic")
             await asyncio.sleep(cls.entry_cycle_seconds)
             return
-        
+
         # Check entry cutoff time - no new entries after 3:55 PM ET
         # This prevents late-day entries like ASST at 16:00 that don't have time to develop
         if cls._is_after_entry_cutoff():
             import pytz
+
             est_tz = pytz.timezone("America/New_York")
             current_time_est = datetime.now(est_tz)
             logger.info(
@@ -654,36 +692,36 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
             bars_dict = bars_data.get("bars", {})
             ticker_bars = bars_dict.get(ticker, [])
-            
+
             # Get current quote for validation
             current_quote = await AlpacaClient.quote(ticker)
             if not current_quote:
                 stats["no_market_data"] += 1
                 continue
-                
+
             quote_data_obj = current_quote.get("quote", {})
             quotes = quote_data_obj.get("quotes", {})
             ticker_quote = quotes.get(ticker, {})
             bid = ticker_quote.get("bp", 0.0)
             ask = ticker_quote.get("ap", 0.0)
-            
+
             # Create QuoteData object
             quote = QuoteData.from_bid_ask(ticker, bid, ask)
-            
+
             # Validate using pipeline
             passed = await cls._validate_ticker_with_pipeline(
                 ticker, ticker_bars, quote, rejection_collector
             )
-            
+
             if not passed:
                 stats["failed_filters"] += 1
                 continue
-            
+
             # Calculate trend metrics for passing tickers
             trend_metrics = TrendAnalyzer.calculate_trend_metrics(ticker_bars)
             momentum_score = trend_metrics.momentum_score
             reason = trend_metrics.reason
-            
+
             # SIMPLIFIED: Accept any momentum - Alpaca already screened these as gainers/most_actives
             # Even if our calculated momentum is 0, Alpaca identified this as a mover
             # Use a small positive/negative value if momentum is exactly 0 to indicate direction
@@ -693,25 +731,29 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 last_price = ticker_bars[-1].get("c", 0)
                 if first_price > 0 and last_price > 0:
                     price_change = ((last_price - first_price) / first_price) * 100
-                    momentum_score = price_change if price_change != 0 else 0.1  # Default to slight positive
+                    momentum_score = (
+                        price_change if price_change != 0 else 0.1
+                    )  # Default to slight positive
                     reason = f"Price change: {price_change:.2f}% (Alpaca gainer signal)"
                 else:
-                    momentum_score = 0.1  # Default to slight positive for Alpaca gainers
+                    momentum_score = (
+                        0.1  # Default to slight positive for Alpaca gainers
+                    )
                     reason = "Alpaca gainer signal (insufficient price data for momentum calc)"
-            
+
             stats["passed"] += 1
             ticker_momentum_scores.append((ticker, momentum_score, reason))
-            logger.debug(
-                f"{ticker} passed all filters: momentum={momentum_score:.2f}%"
-            )
+            logger.debug(f"{ticker} passed all filters: momentum={momentum_score:.2f}%")
 
         # Batch write all rejection records using repository
         if rejection_collector.has_records():
-            logger.debug(f"Writing {rejection_collector.count()} rejection records to DynamoDB")
-            
+            logger.debug(
+                f"Writing {rejection_collector.count()} rejection records to DynamoDB"
+            )
+
             repository = InactiveTickerRepository()
             records = rejection_collector.get_records()
-            
+
             try:
                 success = await repository.batch_write_rejections(records)
                 if success:
@@ -733,7 +775,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # RESTORED: Require minimum momentum threshold to filter out weak signals
         # The 0.01% threshold was too permissive and led to many losing trades
         MIN_MOMENTUM_FOR_ENTRY = cls.min_momentum_threshold  # Use class config (3.0%)
-        
+
         upward_tickers = [
             (t, score, reason)
             for t, score, reason in ticker_momentum_scores
@@ -744,7 +786,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             for t, score, reason in ticker_momentum_scores
             if score <= -MIN_MOMENTUM_FOR_ENTRY  # Require meaningful downward momentum
         ]
-        
+
         logger.info(
             f"Momentum split: {len(upward_tickers)} upward, {len(downward_tickers)} downward "
             f"(from {len(ticker_momentum_scores)} total candidates)"
@@ -788,18 +830,22 @@ class PennyStocksIndicator(BaseTradingIndicator):
         )
 
         # Log MAB-rejected tickers (passed validation but not selected by MAB)
-        selected_tickers_list = [t[0] for t in top_upward] + [t[0] for t in top_downward]
-        
+        selected_tickers_list = [t[0] for t in top_upward] + [
+            t[0] for t in top_downward
+        ]
+
         # Get rejection reasons for all rejected tickers
         all_candidates = upward_tickers + downward_tickers
         rejected_info = await MABService.get_rejected_tickers_with_reasons(
             indicator=cls.indicator_name(),
             ticker_candidates=all_candidates,
-            selected_tickers=selected_tickers_list
+            selected_tickers=selected_tickers_list,
         )
-        
+
         if rejected_info:
-            logger.debug(f"Logging {len(rejected_info)} tickers rejected by MAB to InactiveTickersForDayTrading")
+            logger.debug(
+                f"Logging {len(rejected_info)} tickers rejected by MAB to InactiveTickersForDayTrading"
+            )
             for ticker, rejection_data in rejected_info.items():
                 try:
                     bars_data = market_data_dict.get(ticker)
@@ -812,57 +858,75 @@ class PennyStocksIndicator(BaseTradingIndicator):
                             technical_indicators = {
                                 "close_price": latest_bar.get("c", 0.0),
                                 "volume": latest_bar.get("v", 0),
-                                "momentum_score": rejection_data.get('momentum_score', 0.0),
+                                "momentum_score": rejection_data.get(
+                                    "momentum_score", 0.0
+                                ),
                             }
-                    
-                    reason_long = rejection_data.get('reason_long', '')
-                    reason_short = rejection_data.get('reason_short', '')
-                    
+
+                    reason_long = rejection_data.get("reason_long", "")
+                    reason_short = rejection_data.get("reason_short", "")
+
                     # Enhanced: If no MAB reasons, generate enhanced reasons using MAB rejection enhancer
                     if not reason_long and not reason_short:
-                        logger.debug(f"No MAB rejection reason for {ticker}, generating enhanced reason")
-                        from app.src.services.mab.mab_rejection_enhancer import MABRejectionEnhancer
-                        
-                        enhanced_reasons = await MABRejectionEnhancer.enhance_real_time_record(
-                            ticker=ticker,
-                            indicator=cls.indicator_name(),
-                            technical_indicators=technical_indicators
+                        logger.debug(
+                            f"No MAB rejection reason for {ticker}, generating enhanced reason"
                         )
-                        
-                        reason_long = enhanced_reasons.get('reason_long', '')
-                        reason_short = enhanced_reasons.get('reason_short', '')
-                        
+                        from app.src.services.mab.mab_rejection_enhancer import (
+                            MABRejectionEnhancer,
+                        )
+
+                        enhanced_reasons = (
+                            await MABRejectionEnhancer.enhance_real_time_record(
+                                ticker=ticker,
+                                indicator=cls.indicator_name(),
+                                technical_indicators=technical_indicators,
+                            )
+                        )
+
+                        reason_long = enhanced_reasons.get("reason_long", "")
+                        reason_short = enhanced_reasons.get("reason_short", "")
+
                         if not reason_long and not reason_short:
                             # Fallback: create a basic reason based on momentum
-                            momentum_score = rejection_data.get('momentum_score', 0.0)
+                            momentum_score = rejection_data.get("momentum_score", 0.0)
                             if momentum_score >= 0:
                                 reason_long = f"Not selected by MAB algorithm - ranked below top {cls.top_k} candidates (momentum: {momentum_score:.2f}%)"
                             else:
                                 reason_short = f"Not selected by MAB algorithm - ranked below top {cls.top_k} candidates (momentum: {momentum_score:.2f}%)"
-                    
+
                     # Ensure at least one reason is populated
                     if not reason_long and not reason_short:
-                        logger.warning(f"Still no rejection reason for {ticker} after enhancement, skipping log")
+                        logger.warning(
+                            f"Still no rejection reason for {ticker} after enhancement, skipping log"
+                        )
                         continue
-                    
+
                     result = await DynamoDBClient.log_inactive_ticker(
                         ticker=ticker,
                         indicator=cls.indicator_name(),
                         reason_not_to_enter_long=reason_long,
                         reason_not_to_enter_short=reason_short,
-                        technical_indicators=technical_indicators
+                        technical_indicators=technical_indicators,
                     )
-                    
+
                     if not result:
-                        logger.warning(f"Failed to log MAB rejection for {ticker} to InactiveTickersForDayTrading")
+                        logger.warning(
+                            f"Failed to log MAB rejection for {ticker} to InactiveTickersForDayTrading"
+                        )
                     else:
-                        logger.debug(f"Logged MAB rejection for {ticker}: long={bool(reason_long)}, short={bool(reason_short)}")
+                        logger.debug(
+                            f"Logged MAB rejection for {ticker}: long={bool(reason_long)}, short={bool(reason_short)}"
+                        )
                 except Exception as e:
-                    logger.warning(f"Error logging MAB rejection for {ticker}: {str(e)}")
+                    logger.warning(
+                        f"Error logging MAB rejection for {ticker}: {str(e)}"
+                    )
 
         # Log MAB-selected tickers with positive selection reasons
         # This ensures we know which tickers were chosen by MAB (even if they later fail entry validation)
-        logger.debug(f"Logging {len(selected_tickers_list)} tickers selected by MAB to InactiveTickersForDayTrading")
+        logger.debug(
+            f"Logging {len(selected_tickers_list)} tickers selected by MAB to InactiveTickersForDayTrading"
+        )
         for selected_ticker in selected_tickers_list:
             try:
                 # Find the ticker in the original candidates to get momentum score
@@ -871,12 +935,12 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     if ticker == selected_ticker:
                         ticker_data = (ticker, momentum_score, reason)
                         break
-                
+
                 if not ticker_data:
                     continue
-                
+
                 ticker, momentum_score, reason = ticker_data
-                
+
                 # Get technical indicators
                 bars_data = market_data_dict.get(ticker)
                 technical_indicators = {}
@@ -890,41 +954,47 @@ class PennyStocksIndicator(BaseTradingIndicator):
                             "volume": latest_bar.get("v", 0),
                             "momentum_score": momentum_score,
                         }
-                
+
                 # Create positive selection reason
                 is_long = momentum_score >= 0
                 direction = "long" if is_long else "short"
-                
+
                 # Get MAB stats to show why this ticker was selected
-                mab_stats = await MABService._get_instance().get_stats(cls.indicator_name(), ticker)
+                mab_stats = await MABService._get_instance().get_stats(
+                    cls.indicator_name(), ticker
+                )
                 if mab_stats:
-                    successes = mab_stats.get('successes', 0)
-                    failures = mab_stats.get('failures', 0)
-                    total = mab_stats.get('total_trades', 0)
+                    successes = mab_stats.get("successes", 0)
+                    failures = mab_stats.get("failures", 0)
+                    total = mab_stats.get("total_trades", 0)
                     success_rate = (successes / total * 100) if total > 0 else 0
                     selection_reason = f"✅ Selected by MAB for {direction} entry - ranked in top {cls.top_k} (success rate: {success_rate:.1f}%, momentum: {momentum_score:.2f}%)"
                 else:
                     selection_reason = f"✅ Selected by MAB for {direction} entry - ranked in top {cls.top_k} (new ticker, momentum: {momentum_score:.2f}%)"
-                
+
                 # Log with positive reason in the appropriate direction
                 reason_long = selection_reason if is_long else ""
                 reason_short = selection_reason if not is_long else ""
-                
+
                 result = await DynamoDBClient.log_inactive_ticker(
                     ticker=ticker,
                     indicator=cls.indicator_name(),
                     reason_not_to_enter_long=reason_long,
                     reason_not_to_enter_short=reason_short,
-                    technical_indicators=technical_indicators
+                    technical_indicators=technical_indicators,
                 )
-                
+
                 if result:
-                    logger.debug(f"Logged MAB selection for {ticker}: {direction} - {selection_reason[:50]}...")
+                    logger.debug(
+                        f"Logged MAB selection for {ticker}: {direction} - {selection_reason[:50]}..."
+                    )
                 else:
                     logger.warning(f"Failed to log MAB selection for {ticker}")
-                    
+
             except Exception as e:
-                logger.warning(f"Error logging MAB selection for {selected_ticker}: {str(e)}")
+                logger.warning(
+                    f"Error logging MAB selection for {selected_ticker}: {str(e)}"
+                )
 
         # Process long entries
         for rank, (ticker, momentum_score, reason) in enumerate(top_upward, start=1):
@@ -945,7 +1015,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # Process short entries (if enabled)
         # SAFETY: Shorting penny stocks is extremely risky - they can spike 100%+ in minutes
         if cls.allow_short_positions:
-            for rank, (ticker, momentum_score, reason) in enumerate(top_downward, start=1):
+            for rank, (ticker, momentum_score, reason) in enumerate(
+                top_downward, start=1
+            ):
                 if not cls.running:
                     break
 
@@ -973,11 +1045,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
     ) -> Optional[Tuple[Dict[str, Any], float]]:
         """
         Find the lowest profitable trade from active trades for preemption.
-        
+
         CONSERVATIVE: Only preempt trades that:
         1. Are already profitable (>= 0.5%)
         2. Have been held for at least min_holding_before_preempt_seconds
-        
+
         This ensures we lock in gains and don't preempt trades that just entered.
         """
         lowest_profit = None
@@ -988,21 +1060,23 @@ class PennyStocksIndicator(BaseTradingIndicator):
             enter_price = trade.get("enter_price")
             action = trade.get("action")
             created_at = trade.get("created_at")
-            
+
             # Convert Decimal to float if needed (DynamoDB returns Decimal)
             if enter_price is not None:
                 enter_price = float(enter_price)
-            
+
             # Check minimum holding time before allowing preemption
             # This prevents preempting trades that just entered (like DNN after 21 min is OK, but not after 22 sec)
             if created_at:
                 try:
-                    enter_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    enter_time = datetime.fromisoformat(
+                        created_at.replace("Z", "+00:00")
+                    )
                     if enter_time.tzinfo is None:
                         enter_time = enter_time.replace(tzinfo=timezone.utc)
                     current_time = datetime.now(timezone.utc)
                     holding_seconds = (current_time - enter_time).total_seconds()
-                    
+
                     if holding_seconds < cls.min_holding_before_preempt_seconds:
                         logger.debug(
                             f"Skipping {ticker} for preemption: held only {holding_seconds:.0f}s "
@@ -1010,7 +1084,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
                         )
                         continue
                 except Exception as e:
-                    logger.debug(f"Error calculating holding period for {ticker}: {str(e)}")
+                    logger.debug(
+                        f"Error calculating holding period for {ticker}: {str(e)}"
+                    )
 
             if not ticker or enter_price is None or enter_price <= 0:
                 continue
@@ -1041,7 +1117,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
     ) -> bool:
         """
         Preempt the lowest profitable trade to make room for exceptional momentum trade.
-        
+
         CONSERVATIVE: Only preempt trades that are already profitable (>= 0.5%).
         This ensures we lock in gains rather than locking in losses.
         """
@@ -1052,7 +1128,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         result = await cls._find_lowest_profitable_trade(active_trades)
         if not result:
-            logger.debug("No profitable trades to preempt (all trades are losing or below 0.5%)")
+            logger.debug(
+                "No profitable trades to preempt (all trades are losing or below 0.5%)"
+            )
             return False
 
         lowest_trade, lowest_profit = result
@@ -1065,7 +1143,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         original_action = lowest_trade.get("action")
         enter_price = lowest_trade.get("enter_price")
-        
+
         # Convert Decimal to float if needed (DynamoDB returns Decimal)
         if enter_price is not None:
             enter_price = float(enter_price)
@@ -1151,8 +1229,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 if not preempted:
                     logger.info(f"Could not preempt for {ticker}, skipping entry")
                     await cls._log_selected_ticker_entry_failure(
-                        ticker, momentum_score, action, 
-                        f"Could not preempt existing trade for exceptional momentum {momentum_score:.2f}%"
+                        ticker,
+                        momentum_score,
+                        action,
+                        f"Could not preempt existing trade for exceptional momentum {momentum_score:.2f}%",
                     )
                     return False
 
@@ -1171,8 +1251,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     f"exceptional threshold: {cls.exceptional_momentum_threshold})"
                 )
                 await cls._log_selected_ticker_entry_failure(
-                    ticker, momentum_score, action, 
-                    f"At max capacity ({active_count}/{cls.max_active_trades}), momentum {momentum_score:.2f}% < exceptional threshold {cls.exceptional_momentum_threshold}%"
+                    ticker,
+                    momentum_score,
+                    action,
+                    f"At max capacity ({active_count}/{cls.max_active_trades}), momentum {momentum_score:.2f}% < exceptional threshold {cls.exceptional_momentum_threshold}%",
                 )
                 return False
 
@@ -1208,8 +1290,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 f"Skipping {ticker}: bid-ask spread {spread_percent:.2f}% > max {cls.max_bid_ask_spread_percent}%"
             )
             await cls._log_selected_ticker_entry_failure(
-                ticker, momentum_score, action, 
-                f"Bid-ask spread too wide: {spread_percent:.2f}% > max {cls.max_bid_ask_spread_percent}%"
+                ticker,
+                momentum_score,
+                action,
+                f"Bid-ask spread too wide: {spread_percent:.2f}% > max {cls.max_bid_ask_spread_percent}%",
             )
             return False
 
@@ -1219,7 +1303,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
         if enter_price <= 0:
             logger.warning(f"Invalid entry price for {ticker}, skipping")
             await cls._log_selected_ticker_entry_failure(
-                ticker, momentum_score, action, f"Invalid entry price: ${enter_price:.4f}"
+                ticker,
+                momentum_score,
+                action,
+                f"Invalid entry price: ${enter_price:.4f}",
             )
             return False
 
@@ -1233,8 +1320,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 f"Skipping {ticker}: entry price ${enter_price:.2f} < ${cls.min_stock_price:.2f}"
             )
             await cls._log_selected_ticker_entry_failure(
-                ticker, momentum_score, action, 
-                f"Entry price too low: ${enter_price:.2f} < ${cls.min_stock_price:.2f}"
+                ticker,
+                momentum_score,
+                action,
+                f"Entry price too low: ${enter_price:.2f} < ${cls.min_stock_price:.2f}",
             )
             return False
         if enter_price >= cls.max_stock_price:
@@ -1242,8 +1331,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 f"Skipping {ticker}: entry price ${enter_price:.2f} >= ${cls.max_stock_price:.2f}"
             )
             await cls._log_selected_ticker_entry_failure(
-                ticker, momentum_score, action, 
-                f"Entry price too high: ${enter_price:.2f} >= ${cls.max_stock_price:.2f}"
+                ticker,
+                momentum_score,
+                action,
+                f"Entry price too high: ${enter_price:.2f} >= ${cls.max_stock_price:.2f}",
             )
             return False
 
@@ -1259,35 +1350,37 @@ class PennyStocksIndicator(BaseTradingIndicator):
             latest_bar = ticker_bars[-1]
             close_price = latest_bar.get("c", 0.0)
             if close_price > 0:
-                price_discrepancy = (
-                    abs(enter_price - close_price) / close_price * 100
-                )
+                price_discrepancy = abs(enter_price - close_price) / close_price * 100
                 if price_discrepancy > cls.max_price_discrepancy_percent:
                     logger.warning(
                         f"Skipping {ticker}: entry price ${enter_price:.4f} differs from close ${close_price:.4f} "
                         f"by {price_discrepancy:.2f}% (max: {cls.max_price_discrepancy_percent}%)"
                     )
                     await cls._log_selected_ticker_entry_failure(
-                        ticker, momentum_score, action, 
-                        f"Price discrepancy too large: quote=${enter_price:.4f} vs close=${close_price:.4f} ({price_discrepancy:.2f}%)"
+                        ticker,
+                        momentum_score,
+                        action,
+                        f"Price discrepancy too large: quote=${enter_price:.4f} vs close=${close_price:.4f} ({price_discrepancy:.2f}%)",
                     )
                     return False
 
         # RESTORED: Momentum confirmation check - verify trend is continuing
         # Without this, we were entering trades that immediately reversed
         from app.src.services.trading.penny_stock_utils import MomentumConfirmation
-        
+
         is_confirmed, confirm_reason = MomentumConfirmation.is_momentum_confirmed(
             ticker_bars, is_long
         )
         if not is_confirmed:
             logger.info(f"Skipping {ticker}: momentum not confirmed - {confirm_reason}")
             await cls._log_selected_ticker_entry_failure(
-                ticker, momentum_score, action,
-                f"Momentum not confirmed: {confirm_reason}"
+                ticker,
+                momentum_score,
+                action,
+                f"Momentum not confirmed: {confirm_reason}",
             )
             return False
-        
+
         logger.debug(f"{ticker} momentum confirmed: {confirm_reason}")
 
         # IMPROVED: Calculate breakeven price accounting for spread
@@ -1296,7 +1389,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
         )
 
         # IMPROVED: Calculate ATR-based stop loss
-        atr = ATRCalculator.calculate_atr(ticker_bars, period=cls.atr_period) if ticker_bars else None
+        atr = (
+            ATRCalculator.calculate_atr(ticker_bars, period=cls.atr_period)
+            if ticker_bars
+            else None
+        )
         atr_stop_percent = ATRCalculator.calculate_stop_loss_percent(
             atr, enter_price, cls.atr_multiplier, cls.atr_stop_min, cls.atr_stop_max
         )
@@ -1344,8 +1441,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
         if not entry_success:
             logger.error(f"Failed to enter trade for {ticker}")
             await cls._log_selected_ticker_entry_failure(
-                ticker, momentum_score, action, 
-                "Failed to enter trade (database or API error)"
+                ticker,
+                momentum_score,
+                action,
+                "Failed to enter trade (database or API error)",
             )
             return False
 
@@ -1368,49 +1467,47 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
     @classmethod
     async def _log_selected_ticker_entry_failure(
-        cls,
-        ticker: str,
-        momentum_score: float,
-        action: str,
-        failure_reason: str
+        cls, ticker: str, momentum_score: float, action: str, failure_reason: str
     ) -> None:
         """
         Log when a MAB-selected ticker fails to enter a trade.
-        
+
         This provides transparency about why selected tickers didn't result in trades.
         """
         try:
             is_long = action == "buy_to_open"
             direction = "long" if is_long else "short"
-            
+
             # Create a comprehensive failure reason that shows the ticker was selected but failed entry
             full_reason = f"⚠️ Selected by MAB for {direction} entry (momentum: {momentum_score:.2f}%) but failed validation: {failure_reason}"
-            
+
             # Get technical indicators if available
             technical_indicators = {
                 "momentum_score": momentum_score,
                 "selected_by_mab": True,
                 "entry_failure": True,
-                "failure_reason": failure_reason
+                "failure_reason": failure_reason,
             }
-            
+
             # Log with failure reason in the appropriate direction
             reason_long = full_reason if is_long else ""
             reason_short = full_reason if not is_long else ""
-            
+
             result = await DynamoDBClient.log_inactive_ticker(
                 ticker=ticker,
                 indicator=cls.indicator_name(),
                 reason_not_to_enter_long=reason_long,
                 reason_not_to_enter_short=reason_short,
-                technical_indicators=technical_indicators
+                technical_indicators=technical_indicators,
             )
-            
+
             if result:
-                logger.debug(f"Logged entry failure for MAB-selected {ticker}: {failure_reason}")
+                logger.debug(
+                    f"Logged entry failure for MAB-selected {ticker}: {failure_reason}"
+                )
             else:
                 logger.warning(f"Failed to log entry failure for {ticker}")
-                
+
         except Exception as e:
             logger.warning(f"Error logging entry failure for {ticker}: {str(e)}")
 
@@ -1447,7 +1544,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
     async def _run_exit_cycle(cls):
         """
         IMPROVED exit monitoring cycle using ExitDecisionEngine.
-        
+
         Key improvements:
         - Uses breakeven price accounting for bid-ask spread
         - ATR-based stop losses with sensible bounds
@@ -1472,7 +1569,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             cls._exit_engine = ExitDecisionEngine()
         if cls._daily_metrics is None:
             cls._daily_metrics = DailyPerformanceMetrics()
-        
+
         # Check if we need to reset daily metrics
         today = datetime.now().strftime("%Y-%m-%d")
         if cls._daily_metrics.date != today:
@@ -1491,11 +1588,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
             ticker = trade.get("ticker")
             original_action = trade.get("action")
             enter_price = trade.get("enter_price")
-            
+
             # Convert Decimal to float if needed (DynamoDB returns Decimal)
             if enter_price is not None:
                 enter_price = float(enter_price)
-            
+
             peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
 
             if not ticker or enter_price is None or enter_price <= 0:
@@ -1508,22 +1605,33 @@ class PennyStocksIndicator(BaseTradingIndicator):
             if isinstance(tech_indicators_enter, str):
                 try:
                     import json
+
                     tech_indicators_enter = json.loads(tech_indicators_enter)
                 except (json.JSONDecodeError, TypeError):
                     tech_indicators_enter = {}
             if not isinstance(tech_indicators_enter, dict):
                 tech_indicators_enter = {}
-            
-            spread_percent = float(tech_indicators_enter.get("spread_percent", 1.0))  # Default 1%
-            breakeven_price = float(tech_indicators_enter.get("breakeven_price", enter_price))
-            atr_stop_percent = float(tech_indicators_enter.get("atr_stop_percent", cls.default_atr_stop_percent))
+
+            spread_percent = float(
+                tech_indicators_enter.get("spread_percent", 1.0)
+            )  # Default 1%
+            breakeven_price = float(
+                tech_indicators_enter.get("breakeven_price", enter_price)
+            )
+            atr_stop_percent = float(
+                tech_indicators_enter.get(
+                    "atr_stop_percent", cls.default_atr_stop_percent
+                )
+            )
 
             # Calculate holding period
             holding_seconds = 0.0
             created_at = trade.get("created_at")
             if created_at:
                 try:
-                    enter_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    enter_time = datetime.fromisoformat(
+                        created_at.replace("Z", "+00:00")
+                    )
                     if enter_time.tzinfo is None:
                         enter_time = enter_time.replace(tzinfo=timezone.utc)
                     current_time = datetime.now(timezone.utc)
@@ -1535,26 +1643,39 @@ class PennyStocksIndicator(BaseTradingIndicator):
             holding_minutes = holding_seconds / 60.0
             if holding_minutes >= cls.max_holding_time_minutes:
                 # Calculate profit for logging
-                current_price_check = await cls._get_current_price(ticker, original_action)
+                current_price_check = await cls._get_current_price(
+                    ticker, original_action
+                )
                 if current_price_check and current_price_check > 0:
-                    profit_percent = cls._calculate_profit_percent(enter_price, current_price_check, original_action)
+                    profit_percent = cls._calculate_profit_percent(
+                        enter_price, current_price_check, original_action
+                    )
                     exit_reason = (
                         f"Max holding time exceeded: {holding_minutes:.0f} min "
                         f"(limit: {cls.max_holding_time_minutes} min, profit: {profit_percent:.2f}%)"
                     )
-                    logger.warning(f"⏰ Force exit for penny stock {ticker}: {exit_reason}")
-                    
+                    logger.warning(
+                        f"⏰ Force exit for penny stock {ticker}: {exit_reason}"
+                    )
+
                     # Get technical indicators for exit
-                    bars_data = await AlpacaClient.get_market_data(ticker, limit=cls.recent_bars_for_trend + 5)
-                    technical_indicators_exit = {"exit_type": "max_holding_time", "holding_seconds": holding_seconds}
+                    bars_data = await AlpacaClient.get_market_data(
+                        ticker, limit=cls.recent_bars_for_trend + 5
+                    )
+                    technical_indicators_exit = {
+                        "exit_type": "max_holding_time",
+                        "holding_seconds": holding_seconds,
+                    }
                     if bars_data:
                         bars_dict = bars_data.get("bars", {})
                         ticker_bars = bars_dict.get(ticker, [])
                         if ticker_bars:
                             latest_bar = ticker_bars[-1]
-                            technical_indicators_exit["close_price"] = latest_bar.get("c", 0.0)
+                            technical_indicators_exit["close_price"] = latest_bar.get(
+                                "c", 0.0
+                            )
                             technical_indicators_exit["volume"] = latest_bar.get("v", 0)
-                    
+
                     await cls._exit_trade(
                         ticker=ticker,
                         original_action=original_action,
@@ -1569,17 +1690,35 @@ class PennyStocksIndicator(BaseTradingIndicator):
             # Get current price using Alpaca API
             current_price = await cls._get_current_price(ticker, original_action)
             if current_price is None or current_price <= 0:
-                logger.warning(f"Failed to get quote for {ticker} - will retry in next cycle")
+                logger.warning(
+                    f"Failed to get quote for {ticker} - will retry in next cycle"
+                )
                 continue
 
             is_long = original_action == "buy_to_open"
 
             # Track peak price for trailing stop
             if is_long:
-                peak_price = max(enter_price, current_price, peak_profit_percent * enter_price / 100 + enter_price if peak_profit_percent > 0 else enter_price)
+                peak_price = max(
+                    enter_price,
+                    current_price,
+                    (
+                        peak_profit_percent * enter_price / 100 + enter_price
+                        if peak_profit_percent > 0
+                        else enter_price
+                    ),
+                )
             else:
                 # For shorts, "peak" is actually the lowest price (best for shorts)
-                peak_price = min(enter_price, current_price, enter_price - peak_profit_percent * enter_price / 100 if peak_profit_percent > 0 else enter_price)
+                peak_price = min(
+                    enter_price,
+                    current_price,
+                    (
+                        enter_price - peak_profit_percent * enter_price / 100
+                        if peak_profit_percent > 0
+                        else enter_price
+                    ),
+                )
 
             # Use ExitDecisionEngine for exit decision
             exit_decision: ExitDecision = cls._exit_engine.evaluate_exit(
@@ -1591,11 +1730,13 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 atr_stop_percent=atr_stop_percent,
                 holding_seconds=holding_seconds,
                 is_long=is_long,
-                spread_percent=spread_percent
+                spread_percent=spread_percent,
             )
 
             # Calculate current profit for logging and tracking
-            profit_percent = cls._calculate_profit_percent(enter_price, current_price, original_action)
+            profit_percent = cls._calculate_profit_percent(
+                enter_price, current_price, original_action
+            )
 
             if not exit_decision.should_exit:
                 # Update peak profit in database
@@ -1607,7 +1748,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     peak_profit_percent=new_peak,
                     skipped_exit_reason=exit_decision.reason,
                 )
-                logger.debug(f"{ticker}: {exit_decision.reason} (profit: {profit_percent:.2f}%)")
+                logger.debug(
+                    f"{ticker}: {exit_decision.reason} (profit: {profit_percent:.2f}%)"
+                )
                 continue
 
             # Exit triggered
@@ -1621,25 +1764,37 @@ class PennyStocksIndicator(BaseTradingIndicator):
             exit_price = await cls._get_current_price(ticker, original_action)
             if exit_price is None or exit_price <= 0:
                 exit_price = current_price
-                logger.warning(f"Failed to get exit quote for {ticker}, using current price ${current_price:.4f}")
+                logger.warning(
+                    f"Failed to get exit quote for {ticker}, using current price ${current_price:.4f}"
+                )
 
             # Calculate final profit
-            final_profit_percent = cls._calculate_profit_percent(enter_price, exit_price, original_action)
+            final_profit_percent = cls._calculate_profit_percent(
+                enter_price, exit_price, original_action
+            )
 
             # Record metrics
-            cls._daily_metrics.record_trade(final_profit_percent, exit_decision.is_spread_induced)
+            cls._daily_metrics.record_trade(
+                final_profit_percent, exit_decision.is_spread_induced
+            )
 
             # If trade ended in loss, mark ticker as losing for today
             if final_profit_percent < 0:
                 cls._losing_tickers_today.add(ticker)
-                loss_type = "spread-induced" if exit_decision.is_spread_induced else "price movement"
+                loss_type = (
+                    "spread-induced"
+                    if exit_decision.is_spread_induced
+                    else "price movement"
+                )
                 logger.warning(
                     f"📛 Marked {ticker} as losing ticker ({loss_type} loss: {final_profit_percent:.2f}%) - "
                     f"excluded from MAB selection for rest of day"
                 )
 
             # Get technical indicators for exit
-            bars_data = await AlpacaClient.get_market_data(ticker, limit=cls.recent_bars_for_trend + 5)
+            bars_data = await AlpacaClient.get_market_data(
+                ticker, limit=cls.recent_bars_for_trend + 5
+            )
             technical_indicators_exit = {}
             if bars_data:
                 bars_dict = bars_data.get("bars", {})

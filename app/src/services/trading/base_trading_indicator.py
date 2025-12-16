@@ -213,8 +213,17 @@ class BaseTradingIndicator(ABC):
 
         # Get memory-optimized configuration
         if max_concurrent is None:
-            memory_config = MemoryMonitor.get_memory_config()
-            max_concurrent = memory_config["market_data_batch_size"]
+            try:
+                memory_config = MemoryMonitor.get_memory_config()
+                max_concurrent = memory_config.get("market_data_batch_size", 10)
+            except Exception as e:
+                logger.warning(f"Failed to get memory config, using default: {e}")
+                max_concurrent = 10
+        
+        # Ensure max_concurrent is a valid integer
+        if max_concurrent is None or not isinstance(max_concurrent, int) or max_concurrent <= 0:
+            logger.warning(f"Invalid max_concurrent value: {max_concurrent}, using default 10")
+            max_concurrent = 10
 
         # Log memory before batch processing
         MemoryMonitor.log_memory_usage(
