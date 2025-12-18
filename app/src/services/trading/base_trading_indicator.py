@@ -25,7 +25,8 @@ from app.src.services.mab.mab_service import MABService
 
 # Memory optimization: Limit max tickers to process per cycle
 # This prevents OOM on Heroku Basic/Standard dynos (512MB-1GB)
-MAX_TICKERS_PER_CYCLE = int(os.getenv("MAX_TICKERS_PER_CYCLE", "50"))
+# Reduced from 50 to 25 after continued OOM issues
+MAX_TICKERS_PER_CYCLE = int(os.getenv("MAX_TICKERS_PER_CYCLE", "25"))
 
 
 class BaseTradingIndicator(ABC):
@@ -246,15 +247,16 @@ class BaseTradingIndicator(ABC):
         max_concurrent = min(max_concurrent, 10)
 
         # Check memory before starting - abort if too high
+        # AGGRESSIVE THRESHOLDS: Reduced from 700/800 to 500/600 MB
         current_mem = MemoryMonitor.get_current_memory_mb()
-        if current_mem > 700:  # 700MB threshold for 1GB dyno
+        if current_mem > 500:  # 500MB threshold for 1GB dyno (was 700)
             logger.warning(
-                f"⚠️ Memory too high ({current_mem:.0f}MB), running GC before batch fetch"
+                f"⚠️ Memory high ({current_mem:.0f}MB), running GC before batch fetch"
             )
             gc.collect()
             await TechnicalAnalysisLib.cleanup_cache()
             current_mem = MemoryMonitor.get_current_memory_mb()
-            if current_mem > 800:
+            if current_mem > 600:  # 600MB abort threshold (was 800)
                 logger.error(
                     f"🚨 Memory still too high ({current_mem:.0f}MB) after GC, skipping batch fetch"
                 )
@@ -279,15 +281,16 @@ class BaseTradingIndicator(ABC):
         for batch_num, i in enumerate(range(0, len(tickers), max_concurrent), 1):
             batch = tickers[i : i + max_concurrent]
 
-            # Check memory threshold before processing batch
+            # Check memory threshold before processing batch - AGGRESSIVE
             current_mem = MemoryMonitor.get_current_memory_mb()
-            if current_mem > 600:
+            if current_mem > 400:  # Warn and GC at 400MB (was 600)
                 logger.warning(
                     f"⚠️ Memory at {current_mem:.0f}MB in batch {batch_num}, running GC"
                 )
                 gc.collect()
+                await TechnicalAnalysisLib.cleanup_cache()
                 
-            if current_mem > 750:
+            if current_mem > 550:  # Stop at 550MB (was 750)
                 logger.warning(
                     f"🚨 Memory too high ({current_mem:.0f}MB), stopping batch processing early"
                 )
@@ -944,6 +947,20 @@ class BaseTradingIndicator(ABC):
 
     @classmethod
     async def run(cls):
-        """Run both entry and exit services concurrently"""
+        """Run both entry and exit services concurrently with staggered startup"""
         logger.info(f"Starting {cls.indicator_name()} trading service...")
-        await asyncio.gather(cls.entry_service(), cls.exit_service())
+        
+        # MEMORY OPTIMIZATION: Add startup delay to let the app stabilize
+        # This prevents all indicators from hammering the API simultaneously at startup
+        startup_delay = int(os.getenv("INDICATOR_STARTUP_DELAY_SECONDS", "5"))
+        if startup_delay > 0:
+            logger.info(f"{cls.indicator_name()}: Waiting {startup_delay}s before starting...")
+            await asyncio.sleep(startup_delay)
+        
+        # Stagger entry and exit services to reduce memory spikes
+        async def delayed_entry_service():
+            # Entry service starts 3 seconds after exit service
+            await asyncio.sleep(3)
+            await cls.entry_service()
+        
+        await asyncio.gather(cls.exit_service(), delayed_entry_service())

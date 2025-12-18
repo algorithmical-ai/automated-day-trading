@@ -95,8 +95,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
     # SAFETY: Disable shorting for penny stocks - too risky (can spike 100%+ in minutes)
     allow_short_positions: bool = False
 
-    entry_cycle_seconds: int = 1  # Check for entries every 1 second
-    exit_cycle_seconds: int = 1  # Check exits every 1 second
+    # MEMORY OPTIMIZATION: Increased cycle times from 1s to reduce memory pressure
+    # 1-second cycles caused OOM crashes on Heroku
+    entry_cycle_seconds: int = 5  # Check for entries every 5 seconds (was 1)
+    exit_cycle_seconds: int = 3  # Check exits every 3 seconds (was 1)
     max_active_trades: int = 2  # REDUCED: Max concurrent trades (was 3) - less exposure
     max_daily_trades: int = (
         8  # REDUCED: Max trades per day (was 10) - quality over quantity

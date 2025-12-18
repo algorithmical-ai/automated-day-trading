@@ -123,20 +123,41 @@ class TradingServiceCoordinator:
         for indicator_name in cls._enabled_indicators:
             logger.info(f"  - {indicator_name}")
 
+        # MEMORY OPTIMIZATION: Stagger indicator startup to prevent OOM
+        # Each indicator starts with a delay to avoid simultaneous memory spikes
+        stagger_delay = int(os.getenv("INDICATOR_STAGGER_DELAY_SECONDS", "10"))
+        
+        async def run_with_delay(name: str, coro, delay: int):
+            """Run a coroutine after a delay"""
+            if delay > 0:
+                logger.info(f"⏳ {name} will start in {delay} seconds...")
+                await asyncio.sleep(delay)
+            logger.info(f"🚀 Starting {name}")
+            return await coro
+        
         # Build list of indicator tasks based on what's enabled
+        # Stagger each indicator by stagger_delay seconds
         tasks: List[Tuple[str, Any]] = []
+        current_delay = 0
         
         if "Momentum Trading Indicator" in cls._enabled_indicators:
-            tasks.append(("Momentum Trading Indicator", MomentumIndicator.run()))
+            tasks.append(("Momentum Trading Indicator", 
+                         run_with_delay("Momentum Trading Indicator", MomentumIndicator.run(), current_delay)))
+            current_delay += stagger_delay
         
         if "Penny Stocks Indicator" in cls._enabled_indicators:
-            tasks.append(("Penny Stocks Indicator", PennyStocksIndicator.run()))
+            tasks.append(("Penny Stocks Indicator", 
+                         run_with_delay("Penny Stocks Indicator", PennyStocksIndicator.run(), current_delay)))
+            current_delay += stagger_delay
         
         if "Deep Analyzer Indicator" in cls._enabled_indicators:
-            tasks.append(("Deep Analyzer Indicator", DeepAnalyzerIndicator.run()))
+            tasks.append(("Deep Analyzer Indicator", 
+                         run_with_delay("Deep Analyzer Indicator", DeepAnalyzerIndicator.run(), current_delay)))
+            current_delay += stagger_delay
         
         if "UW-Enhanced Momentum Indicator" in cls._enabled_indicators:
-            tasks.append(("UW-Enhanced Momentum Indicator", UWEnhancedMomentumIndicator.run()))
+            tasks.append(("UW-Enhanced Momentum Indicator", 
+                         run_with_delay("UW-Enhanced Momentum Indicator", UWEnhancedMomentumIndicator.run(), current_delay)))
 
         # Add periodic memory monitoring task
         async def periodic_memory_monitor():
