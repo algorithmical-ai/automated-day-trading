@@ -10,10 +10,15 @@ Features:
 - Custom VWAP and VWMA calculations
 - Statistical analysis including outlier detection
 - Comprehensive technical indicator suite
+- Memory-optimized caching for indicators (TTL-based)
 """
 
 # pylint: disable=no-member
-from typing import Any, Dict
+import asyncio
+import gc
+import os
+import time
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,6 +35,118 @@ except ImportError:
 
 from app.src.common.loguru_logger import logger
 from app.src.common.alpaca import AlpacaClient
+
+
+class IndicatorCache:
+    """
+    Memory-efficient cache for technical indicators with TTL.
+    Uses a simple dict with timestamp-based expiration.
+    """
+    
+    def __init__(self, ttl_seconds: int = 10, max_size: int = 100):
+        """
+        Initialize the indicator cache.
+        
+        Args:
+            ttl_seconds: Time-to-live for cached entries (default: 10 seconds)
+            max_size: Maximum number of entries to cache (default: 100)
+        """
+        self._cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._ttl_seconds = ttl_seconds
+        self._max_size = max_size
+        self._lock = asyncio.Lock()
+        self._hits = 0
+        self._misses = 0
+        
+    async def get(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Get cached indicators for a ticker if still valid."""
+        async with self._lock:
+            if ticker not in self._cache:
+                self._misses += 1
+                return None
+            
+            data, timestamp = self._cache[ticker]
+            age = time.time() - timestamp
+            
+            if age > self._ttl_seconds:
+                # Expired - remove and return None
+                del self._cache[ticker]
+                self._misses += 1
+                return None
+            
+            self._hits += 1
+            return data
+    
+    async def put(self, ticker: str, data: Dict[str, Any]) -> None:
+        """Store indicators for a ticker."""
+        async with self._lock:
+            # Evict oldest entries if at max size
+            if len(self._cache) >= self._max_size and ticker not in self._cache:
+                self._evict_oldest()
+            
+            self._cache[ticker] = (data, time.time())
+    
+    def _evict_oldest(self) -> None:
+        """Evict oldest entries to make room."""
+        if not self._cache:
+            return
+        
+        # Sort by timestamp and remove oldest 20%
+        sorted_items = sorted(self._cache.items(), key=lambda x: x[1][1])
+        evict_count = max(1, len(sorted_items) // 5)
+        
+        for ticker, _ in sorted_items[:evict_count]:
+            del self._cache[ticker]
+            
+        logger.debug(f"Indicator cache evicted {evict_count} entries")
+    
+    async def clear(self) -> None:
+        """Clear all cached entries."""
+        async with self._lock:
+            count = len(self._cache)
+            self._cache.clear()
+            self._hits = 0
+            self._misses = 0
+            logger.debug(f"Indicator cache cleared {count} entries")
+    
+    async def cleanup_expired(self) -> int:
+        """Remove expired entries and return count removed."""
+        async with self._lock:
+            current_time = time.time()
+            expired = [
+                ticker for ticker, (_, ts) in self._cache.items()
+                if current_time - ts > self._ttl_seconds
+            ]
+            for ticker in expired:
+                del self._cache[ticker]
+            
+            if expired:
+                logger.debug(f"Indicator cache cleaned up {len(expired)} expired entries")
+            
+            return len(expired)
+    
+    async def stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        async with self._lock:
+            total = self._hits + self._misses
+            hit_rate = (self._hits / total * 100) if total > 0 else 0.0
+            return {
+                "size": len(self._cache),
+                "max_size": self._max_size,
+                "ttl_seconds": self._ttl_seconds,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": f"{hit_rate:.1f}%",
+            }
+
+
+# Global indicator cache instance
+# TTL of 10 seconds is appropriate for fast trading while reducing API calls
+# Max size of 100 to limit memory (100 tickers × ~5KB per ticker = ~500KB)
+_indicator_cache = IndicatorCache(
+    ttl_seconds=int(os.getenv("INDICATOR_CACHE_TTL_SECONDS", "10")),
+    max_size=int(os.getenv("INDICATOR_CACHE_MAX_SIZE", "100"))
+)
 
 
 class TechnicalAnalysisLib:
@@ -252,18 +369,46 @@ class TechnicalAnalysisLib:
         return df
 
     @classmethod
-    async def calculate_all_indicators(cls, ticker: str) -> Dict[str, Any]:
+    async def get_cache_stats(cls) -> Dict[str, Any]:
+        """Get indicator cache statistics."""
+        return await _indicator_cache.stats()
+    
+    @classmethod
+    async def clear_cache(cls) -> None:
+        """Clear the indicator cache."""
+        await _indicator_cache.clear()
+        gc.collect()
+    
+    @classmethod
+    async def cleanup_cache(cls) -> int:
+        """Cleanup expired cache entries and run garbage collection."""
+        count = await _indicator_cache.cleanup_expired()
+        gc.collect()
+        return count
+
+    @classmethod
+    async def calculate_all_indicators(cls, ticker: str, use_cache: bool = True) -> Dict[str, Any]:
         """
         Calculate all technical indicators using TA-Lib, including additional ones.
+        Uses caching to reduce memory usage and API calls.
 
         Args:
             ticker: Stock ticker symbol (e.g., "AAPL")
+            use_cache: Whether to use cached data if available (default: True)
 
         Returns:
             Dict with all technical indicators
         """
+        # Check cache first (reduces memory churn and API calls)
+        if use_cache:
+            cached = await _indicator_cache.get(ticker)
+            if cached is not None:
+                logger.debug(f"Using cached indicators for {ticker}")
+                return cached
+        
         # Get market data from Alpaca API
-        bars_data = await AlpacaClient.get_market_data(ticker, limit=200)
+        # Reduced from 200 to 100 bars to save memory (still enough for all indicators)
+        bars_data = await AlpacaClient.get_market_data(ticker, limit=100)
 
         if not bars_data:
             logger.warning(f"No bars data for {ticker}, returning default indicators")
@@ -460,29 +605,50 @@ class TechnicalAnalysisLib:
                     datetime_price[ts_str] = float(price)
 
             # Return all as dict to include additional
-            return {
-                "rsi": rsi,
-                "macd": (macd, signal, hist),
-                "bollinger": (upper, middle, lower),
-                "adx": adx,
-                "ema_fast": ema_fast,
-                "ema_slow": ema_slow,
-                "volume_sma": volume_sma,
-                "obv": obv,
-                "mfi": mfi,
-                "ad": ad,
-                "stoch": (slowk, slowd),
-                "cci": cci,
-                "atr": atr,
-                "willr": willr,
-                "roc": roc,
-                "vwap": vwap,
-                "vwma": vwma,
-                "wma": wma,
-                "volume": volume_val,
-                "close_price": close[-1],
+            result = {
+                "rsi": float(rsi) if not np.isnan(rsi) else 50.0,
+                "macd": (
+                    float(macd) if not np.isnan(macd) else 0.0,
+                    float(signal) if not np.isnan(signal) else 0.0,
+                    float(hist) if not np.isnan(hist) else 0.0,
+                ),
+                "bollinger": (
+                    float(upper) if not np.isnan(upper) else close[-1] * 1.02,
+                    float(middle) if not np.isnan(middle) else close[-1],
+                    float(lower) if not np.isnan(lower) else close[-1] * 0.98,
+                ),
+                "adx": float(adx) if not np.isnan(adx) else 20.0,
+                "ema_fast": float(ema_fast) if not np.isnan(ema_fast) else close[-1],
+                "ema_slow": float(ema_slow) if not np.isnan(ema_slow) else close[-1],
+                "volume_sma": float(volume_sma) if not np.isnan(volume_sma) else 1000.0,
+                "obv": float(obv) if not np.isnan(obv) else 0.0,
+                "mfi": float(mfi) if not np.isnan(mfi) else 50.0,
+                "ad": float(ad) if not np.isnan(ad) else 0.0,
+                "stoch": (
+                    float(slowk) if not np.isnan(slowk) else 50.0,
+                    float(slowd) if not np.isnan(slowd) else 50.0,
+                ),
+                "cci": float(cci) if not np.isnan(cci) else 0.0,
+                "atr": float(atr) if not np.isnan(atr) else close[-1] * 0.01,
+                "willr": float(willr) if not np.isnan(willr) else -50.0,
+                "roc": float(roc) if not np.isnan(roc) else 0.0,
+                "vwap": float(vwap) if vwap and not np.isnan(vwap) else 0.0,
+                "vwma": float(vwma) if vwma and not np.isnan(vwma) else 0.0,
+                "wma": float(wma) if not np.isnan(wma) else close[-1],
+                "volume": float(volume_val) if not np.isnan(volume_val) else 0.0,
+                "close_price": float(close[-1]),
                 "datetime_price": datetime_price,
             }
+            
+            # Cache the result before returning
+            if use_cache:
+                await _indicator_cache.put(ticker, result)
+            
+            # Explicitly delete large objects to help GC
+            del prices, processed_prices, recent_prices
+            del high, low, close, volume, open_
+            
+            return result
 
         except Exception as e:
             logger.info(f"Error calculating indicators for {ticker}: {e}")

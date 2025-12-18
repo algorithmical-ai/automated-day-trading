@@ -6,6 +6,8 @@ Requirements: 1.1, 1.3, 20.2, 20.5
 """
 
 import asyncio
+import gc
+import os
 import signal
 from app.src.common.loguru_logger import logger
 from app.src.common.logging_utils import log_operation, log_error_with_context
@@ -14,9 +16,15 @@ from app.src.services.trading.trading_service import TradingServiceCoordinator
 from app.src.services.threshold_adjustment.threshold_adjustment_service import (
     ThresholdAdjustmentService,
 )
+from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
 
 # Global flag for graceful shutdown
 _shutdown_event: asyncio.Event = None
+
+# Memory management configuration
+MEMORY_CLEANUP_INTERVAL_SECONDS = int(os.getenv("MEMORY_CLEANUP_INTERVAL_SECONDS", "30"))
+MEMORY_WARNING_THRESHOLD_MB = float(os.getenv("MEMORY_WARNING_THRESHOLD_MB", "600"))
+MEMORY_CRITICAL_THRESHOLD_MB = float(os.getenv("MEMORY_CRITICAL_THRESHOLD_MB", "800"))
 
 
 def setup_signal_handlers():
@@ -34,6 +42,75 @@ def setup_signal_handlers():
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+
+async def memory_management_task():
+    """
+    Background task to monitor and manage memory usage.
+    Periodically cleans up caches and runs garbage collection.
+    """
+    logger.info(f"🧹 Memory management task started (interval: {MEMORY_CLEANUP_INTERVAL_SECONDS}s)")
+    
+    while not _shutdown_event.is_set():
+        try:
+            # Wait for interval or shutdown
+            try:
+                await asyncio.wait_for(
+                    _shutdown_event.wait(), 
+                    timeout=MEMORY_CLEANUP_INTERVAL_SECONDS
+                )
+                # If we get here, shutdown was triggered
+                break
+            except asyncio.TimeoutError:
+                # Normal timeout - continue with cleanup
+                pass
+            
+            # Get current memory usage
+            current_mem = MemoryMonitor.get_current_memory_mb()
+            
+            # Log memory status periodically
+            if current_mem > MEMORY_WARNING_THRESHOLD_MB:
+                logger.warning(
+                    f"⚠️ Memory usage high: {current_mem:.0f}MB "
+                    f"(warning: {MEMORY_WARNING_THRESHOLD_MB:.0f}MB, "
+                    f"critical: {MEMORY_CRITICAL_THRESHOLD_MB:.0f}MB)"
+                )
+            else:
+                logger.debug(f"💾 Memory usage: {current_mem:.0f}MB")
+            
+            # Clean up indicator cache
+            expired_count = await TechnicalAnalysisLib.cleanup_cache()
+            if expired_count > 0:
+                logger.debug(f"🧹 Cleaned up {expired_count} expired cache entries")
+            
+            # Run garbage collection
+            gc.collect()
+            
+            # Log cache stats periodically
+            cache_stats = await TechnicalAnalysisLib.get_cache_stats()
+            logger.debug(
+                f"📊 Indicator cache: {cache_stats['size']}/{cache_stats['max_size']} entries, "
+                f"hit rate: {cache_stats['hit_rate']}"
+            )
+            
+            # If memory is critical, force clear cache
+            if current_mem > MEMORY_CRITICAL_THRESHOLD_MB:
+                logger.warning(
+                    f"🚨 Memory critical ({current_mem:.0f}MB), clearing indicator cache"
+                )
+                await TechnicalAnalysisLib.clear_cache()
+                gc.collect()
+                new_mem = MemoryMonitor.get_current_memory_mb()
+                logger.info(f"💾 Memory after cleanup: {new_mem:.0f}MB")
+            
+        except asyncio.CancelledError:
+            logger.info("Memory management task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in memory management task: {e}", exc_info=True)
+            await asyncio.sleep(MEMORY_CLEANUP_INTERVAL_SECONDS)
+    
+    logger.info("🧹 Memory management task stopped")
 
 
 async def main():
@@ -90,11 +167,15 @@ async def main():
         # Using return_exceptions=True for error isolation (Requirement 1.2)
         logger.info("Starting concurrent service execution...")
         logger.info("  - Trading Service Coordinator")
+        logger.info("  - Memory Management Task")
 
         # Create service tasks
         tasks = [
             asyncio.create_task(
                 TradingServiceCoordinator.run(), name="TradingCoordinator"
+            ),
+            asyncio.create_task(
+                memory_management_task(), name="MemoryManagement"
             ),
         ]
 

@@ -20,7 +20,9 @@ import aiohttp
 from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
 from app.src.common.alpaca import AlpacaClient
-from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
+from app.src.services.technical_analysis.technical_analysis_lib import (
+    TechnicalAnalysisLib,
+)
 from app.src.db.dynamodb_client import DynamoDBClient
 from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
@@ -193,7 +195,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         quote_response = await AlpacaClient.quote(ticker)
         enter_price = None
         quote_source = "none"
-        
+
         if quote_response:
             quote_data = quote_response.get("quote", {})
             quotes = quote_data.get("quotes", {})
@@ -204,7 +206,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             else:
                 enter_price = ticker_quote.get("bp", 0.0)  # Bid price for short entry
             quote_source = "alpaca"
-        
+
         return enter_price if enter_price and enter_price > 0 else None, quote_source
 
     @classmethod
@@ -725,9 +727,11 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             webhook_technical_indicators = None
             if technical_indicators:
                 webhook_technical_indicators = {
-                    k: v for k, v in technical_indicators.items() if k != "datetime_price"
+                    k: v
+                    for k, v in technical_indicators.items()
+                    if k != "datetime_price"
                 }
-            
+
             await send_signal_to_webhook(
                 ticker=ticker,
                 action=action,
@@ -758,7 +762,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             if not ticker or enter_price is None or enter_price <= 0:
                 continue
 
-            market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
+            market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(
+                ticker
+            )
             if not market_data_response:
                 continue
 
@@ -813,7 +819,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         else:
             return False
 
-        market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(ticker_to_exit)
+        market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(
+            ticker_to_exit
+        )
         if not market_data_response:
             return False
 
@@ -827,7 +835,7 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
         quote_response = await AlpacaClient.quote(ticker_to_exit)
         exit_price = None
         exit_quote_source = "none"
-        
+
         if quote_response:
             quote_data = quote_response.get("quote", {})
             quotes = quote_data.get("quotes", {})
@@ -970,13 +978,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             atr = technical_analysis.get("atr", 0)
 
             # Use MCP datetime_price for momentum calculation
-            datetime_price_for_momentum = technical_analysis.get(
-                "datetime_price", []
-            )
+            datetime_price_for_momentum = technical_analysis.get("datetime_price", [])
             if datetime_price_for_momentum:
-                logger.debug(
-                    f"Using MCP datetime_price for {ticker} momentum"
-                )
+                logger.debug(f"Using MCP datetime_price for {ticker} momentum")
             else:
                 stats["no_datetime_price"] += 1
                 continue
@@ -1464,16 +1468,20 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
             quote_response = await AlpacaClient.quote(ticker)
             current_price = None
             quote_source = "none"
-            
+
             if quote_response:
                 quote_data = quote_response.get("quote", {})
                 quotes = quote_data.get("quotes", {})
                 ticker_quote = quotes.get(ticker, {})
                 is_long = original_action == "buy_to_open"
                 if is_long:
-                    current_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                    current_price = ticker_quote.get(
+                        "bp", 0.0
+                    )  # Bid price for long exit
                 else:
-                    current_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+                    current_price = ticker_quote.get(
+                        "ap", 0.0
+                    )  # Ask price for short exit
                 quote_source = "alpaca"
 
             if current_price is None or current_price <= 0:
@@ -1488,7 +1496,9 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
 
             # Get market data for technical indicators (may be delayed, but don't block exit decisions)
             # Exit decisions are based on get_quote() which is more up-to-date
-            market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
+            market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(
+                ticker
+            )
             technical_analysis = {}
             atr = 0
             if market_data_response:
@@ -1532,16 +1542,20 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         quote_response = await AlpacaClient.quote(ticker)
                         latest_price = None
                         latest_quote_source = "none"
-                        
+
                         if quote_response:
                             quote_data = quote_response.get("quote", {})
                             quotes = quote_data.get("quotes", {})
                             ticker_quote = quotes.get(ticker, {})
                             is_long = original_action == "buy_to_open"
                             if is_long:
-                                latest_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                                latest_price = ticker_quote.get(
+                                    "bp", 0.0
+                                )  # Bid price for long exit
                             else:
-                                latest_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+                                latest_price = ticker_quote.get(
+                                    "ap", 0.0
+                                )  # Ask price for short exit
                             latest_quote_source = "alpaca"
 
                         if latest_price and latest_price > 0:
@@ -1612,16 +1626,20 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                         quote_response = await AlpacaClient.quote(ticker)
                         final_price = None
                         final_quote_source = "none"
-                        
+
                         if quote_response:
                             quote_data = quote_response.get("quote", {})
                             quotes = quote_data.get("quotes", {})
                             ticker_quote = quotes.get(ticker, {})
                             is_long = original_action == "buy_to_open"
                             if is_long:
-                                final_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                                final_price = ticker_quote.get(
+                                    "bp", 0.0
+                                )  # Bid price for long exit
                             else:
-                                final_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+                                final_price = ticker_quote.get(
+                                    "ap", 0.0
+                                )  # Ask price for short exit
                             final_quote_source = "alpaca"
 
                         if final_price and final_price > 0:
@@ -1752,16 +1770,20 @@ class UWEnhancedMomentumIndicator(BaseTradingIndicator):
                 quote_response = await AlpacaClient.quote(ticker)
                 exit_price = None
                 exit_quote_source = "none"
-                
+
                 if quote_response:
                     quote_data = quote_response.get("quote", {})
                     quotes = quote_data.get("quotes", {})
                     ticker_quote = quotes.get(ticker, {})
                     is_long = original_action == "buy_to_open"
                     if is_long:
-                        exit_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
+                        exit_price = ticker_quote.get(
+                            "bp", 0.0
+                        )  # Bid price for long exit
                     else:
-                        exit_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
+                        exit_price = ticker_quote.get(
+                            "ap", 0.0
+                        )  # Ask price for short exit
                     exit_quote_source = "alpaca"
 
                 if exit_price is None or exit_price <= 0:

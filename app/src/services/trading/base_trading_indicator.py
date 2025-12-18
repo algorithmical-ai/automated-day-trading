@@ -4,6 +4,7 @@ Abstract base class for trading indicators with shared infrastructure
 """
 
 import asyncio
+import os
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Tuple, Optional, ClassVar
 from datetime import datetime, date, timezone, time
@@ -22,6 +23,11 @@ from app.src.services.webhook.send_signal import send_signal_to_webhook
 from app.src.services.mab.mab_service import MABService
 
 
+# Memory optimization: Limit max tickers to process per cycle
+# This prevents OOM on Heroku Basic/Standard dynos (512MB-1GB)
+MAX_TICKERS_PER_CYCLE = int(os.getenv("MAX_TICKERS_PER_CYCLE", "50"))
+
+
 class BaseTradingIndicator(ABC):
     """Base class for trading indicators with shared infrastructure"""
 
@@ -33,6 +39,9 @@ class BaseTradingIndicator(ABC):
     entry_cycle_seconds: int = 5
     exit_cycle_seconds: int = 5
     position_size_dollars: float = 2000.0  # Fixed position size in dollars
+    
+    # Memory optimization: max tickers to process per entry cycle
+    max_tickers_per_cycle: int = MAX_TICKERS_PER_CYCLE
 
     # Daily tracking
     daily_trades_count: int = 0
@@ -199,7 +208,7 @@ class BaseTradingIndicator(ABC):
     ) -> Dict[str, Any]:
         """
         Fetch market data for multiple tickers in parallel batches.
-        Uses memory-optimized batch sizes based on environment configuration.
+        Uses memory-optimized batch sizes and caching.
 
         Args:
             tickers: List of ticker symbols to fetch
@@ -211,39 +220,59 @@ class BaseTradingIndicator(ABC):
         if not tickers:
             return {}
 
+        # MEMORY OPTIMIZATION: Limit number of tickers to prevent OOM
+        original_count = len(tickers)
+        if len(tickers) > cls.max_tickers_per_cycle:
+            logger.debug(
+                f"{cls.indicator_name()}: Limiting tickers from {len(tickers)} to {cls.max_tickers_per_cycle}"
+            )
+            tickers = tickers[:cls.max_tickers_per_cycle]
+
         # Get memory-optimized configuration
         if max_concurrent is None:
             try:
                 memory_config = MemoryMonitor.get_memory_config()
-                max_concurrent = memory_config.get("market_data_batch_size", 10)
+                max_concurrent = memory_config.get("market_data_batch_size", 5)
             except Exception as e:
                 logger.warning(f"Failed to get memory config, using default: {e}")
-                max_concurrent = 10
+                max_concurrent = 5
         
-        # Ensure max_concurrent is a valid integer
+        # Ensure max_concurrent is a valid integer (reduced default for memory)
         if max_concurrent is None or not isinstance(max_concurrent, int) or max_concurrent <= 0:
-            logger.warning(f"Invalid max_concurrent value: {max_concurrent}, using default 10")
-            max_concurrent = 10
+            logger.warning(f"Invalid max_concurrent value: {max_concurrent}, using default 5")
+            max_concurrent = 5
+        
+        # Cap max_concurrent to prevent too many concurrent requests
+        max_concurrent = min(max_concurrent, 10)
 
-        # Log memory before batch processing
-        MemoryMonitor.log_memory_usage(
-            f"{cls.indicator_name()}: Before fetching {len(tickers)} tickers",
-            level="DEBUG",
-        )
+        # Check memory before starting - abort if too high
+        current_mem = MemoryMonitor.get_current_memory_mb()
+        if current_mem > 700:  # 700MB threshold for 1GB dyno
+            logger.warning(
+                f"⚠️ Memory too high ({current_mem:.0f}MB), running GC before batch fetch"
+            )
+            gc.collect()
+            await TechnicalAnalysisLib.cleanup_cache()
+            current_mem = MemoryMonitor.get_current_memory_mb()
+            if current_mem > 800:
+                logger.error(
+                    f"🚨 Memory still too high ({current_mem:.0f}MB) after GC, skipping batch fetch"
+                )
+                return {}
 
         async def fetch_one(ticker: str) -> Tuple[str, Any]:
-            """Fetch market data for a single ticker"""
+            """Fetch market data for a single ticker using caching"""
             try:
-                # Use TechnicalAnalysisLib directly instead of MCPClient
+                # Use TechnicalAnalysisLib with caching enabled
                 market_data = await TechnicalAnalysisLib.calculate_all_indicators(
-                    ticker
+                    ticker, use_cache=True
                 )
                 return (ticker, market_data)
             except Exception as e:
                 logger.debug(f"Failed to get market data for {ticker}: {str(e)}")
                 return (ticker, None)
 
-        # Process in batches to avoid overwhelming the API and memory
+        # Process in batches to avoid overwhelming memory
         results: Dict[str, Any] = {}
         total_batches = (len(tickers) + max_concurrent - 1) // max_concurrent
 
@@ -251,11 +280,18 @@ class BaseTradingIndicator(ABC):
             batch = tickers[i : i + max_concurrent]
 
             # Check memory threshold before processing batch
-            MemoryMonitor.check_memory_threshold(
-                threshold_mb=400.0,  # Warn at 400MB for Basic dyno
-                context=f"{cls.indicator_name()}: Batch {batch_num}/{total_batches}",
-                action="WARNING",
-            )
+            current_mem = MemoryMonitor.get_current_memory_mb()
+            if current_mem > 600:
+                logger.warning(
+                    f"⚠️ Memory at {current_mem:.0f}MB in batch {batch_num}, running GC"
+                )
+                gc.collect()
+                
+            if current_mem > 750:
+                logger.warning(
+                    f"🚨 Memory too high ({current_mem:.0f}MB), stopping batch processing early"
+                )
+                break
 
             batch_results = await asyncio.gather(
                 *[fetch_one(ticker) for ticker in batch], return_exceptions=True
@@ -269,31 +305,22 @@ class BaseTradingIndicator(ABC):
                     ticker, market_data = result
                     results[ticker] = market_data
 
-            # Log memory after each batch (every 5 batches to reduce log noise)
-            if batch_num % 5 == 0 or batch_num == total_batches:
-                MemoryMonitor.log_memory_usage(
-                    f"{cls.indicator_name()}: After batch {batch_num}/{total_batches}",
-                    level="DEBUG",
-                )
-
             # Small delay between batches to allow memory cleanup
             if batch_num < total_batches:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
 
-            # Periodic garbage collection every 10 batches to free memory
-            if batch_num % 10 == 0:
-                MemoryMonitor.force_garbage_collection(
-                    context=f"{cls.indicator_name()}: After batch {batch_num}"
-                )
+            # Periodic garbage collection every 5 batches to free memory
+            if batch_num % 5 == 0:
+                gc.collect()
 
-        # Final garbage collection and memory log
-        MemoryMonitor.force_garbage_collection(
-            context=f"{cls.indicator_name()}: After fetching {len(tickers)} tickers"
-        )
-        MemoryMonitor.log_memory_usage(
-            f"{cls.indicator_name()}: After fetching {len(tickers)} tickers",
-            level="DEBUG",
-        )
+        # Final garbage collection
+        gc.collect()
+
+        if original_count > len(tickers):
+            logger.debug(
+                f"{cls.indicator_name()}: Processed {len(results)}/{original_count} tickers "
+                f"(limited to {cls.max_tickers_per_cycle})"
+            )
 
         return results
 
