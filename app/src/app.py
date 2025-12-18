@@ -9,6 +9,7 @@ import asyncio
 import gc
 import os
 import signal
+from aiohttp import web
 from app.src.common.loguru_logger import logger
 from app.src.common.logging_utils import log_operation, log_error_with_context
 from app.src.common.memory_monitor import MemoryMonitor
@@ -17,6 +18,31 @@ from app.src.services.threshold_adjustment.threshold_adjustment_service import (
     ThresholdAdjustmentService,
 )
 from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
+
+
+# Minimal health check server for Heroku
+async def health_check(request):
+    """Health check endpoint for Heroku."""
+    mem = MemoryMonitor.get_current_memory_mb()
+    return web.json_response({
+        "status": "ok",
+        "memory_mb": round(mem, 1),
+    })
+
+
+async def start_health_server():
+    """Start minimal HTTP server for Heroku health checks."""
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"🌐 Health check server started on port {port}")
+    return runner
 
 # Global flag for graceful shutdown
 _shutdown_event: asyncio.Event = None
@@ -131,6 +157,9 @@ async def main():
     logger.info("Automated Day Trading Application Starting")
     logger.info("=" * 80)
 
+    # Start health check server FIRST (Heroku requires response within 60s)
+    health_runner = await start_health_server()
+
     # Start memory monitoring
     MemoryMonitor.start_tracking()
     memory_config = MemoryMonitor.get_memory_config()
@@ -242,6 +271,11 @@ async def main():
 
         # Give services a moment to clean up
         await asyncio.sleep(1)
+
+        # Stop health check server
+        if health_runner:
+            await health_runner.cleanup()
+            logger.info("Health check server stopped")
 
         # Log final memory usage
         MemoryMonitor.log_memory_usage("Application Shutdown", level="INFO")
