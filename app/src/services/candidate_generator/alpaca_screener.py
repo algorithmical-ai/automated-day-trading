@@ -35,9 +35,9 @@ class AlpacaScreenerService(metaclass=SingletonMeta):
         else:
             logger.warning("⚠️  Alpaca API credentials not found - screener API calls may fail")
         
-        # MEMORY OPTIMIZATION: Reduced from 100 to 30 to limit memory usage
-        # This means we'll fetch at most 30 most actives + 20 gainers + 20 losers = ~60 tickers
-        self._screener_max_tickers = int(os.getenv("SCREENER_MAX_TICKERS", "30"))
+        # BASIC DYNO (512MB): Drastically reduced to minimize memory
+        # Only fetch 10 most actives + 5 gainers + 5 losers = ~20 tickers max
+        self._screener_max_tickers = int(os.getenv("SCREENER_MAX_TICKERS", "10"))
 
         # Shared cache for screened tickers (updated every 10 seconds)
         self._cached_screened_tickers: Dict[str, Set[str]] = {
@@ -187,11 +187,10 @@ class AlpacaScreenerService(metaclass=SingletonMeta):
         """Update the cached screened tickers by fetching from API"""
         try:
             logger.debug("Fetching screener data from Alpaca API...")
-            # MEMORY OPTIMIZATION: Reduced ticker counts to limit memory usage
-            # max_tickers is now configurable via SCREENER_MAX_TICKERS env var (default: 30)
+            # BASIC DYNO (512MB): Minimal tickers only
             most_actives = await self.get_most_actives(top=self._screener_max_tickers)
-            # Limit movers to reduce total ticker count
-            movers_top = min(20, self._screener_max_tickers)
+            # Only 5 gainers and 5 losers
+            movers_top = min(5, self._screener_max_tickers)
             movers = await self.get_movers(top=movers_top)
 
             gainers = movers.get("gainers", [])

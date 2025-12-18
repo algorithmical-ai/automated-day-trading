@@ -21,11 +21,11 @@ from app.src.services.technical_analysis.technical_analysis_lib import Technical
 # Global flag for graceful shutdown
 _shutdown_event: asyncio.Event = None
 
-# Memory management configuration - AGGRESSIVE for 1GB dyno
-# Reduced thresholds to prevent OOM crashes
-MEMORY_CLEANUP_INTERVAL_SECONDS = int(os.getenv("MEMORY_CLEANUP_INTERVAL_SECONDS", "15"))  # More frequent cleanup
-MEMORY_WARNING_THRESHOLD_MB = float(os.getenv("MEMORY_WARNING_THRESHOLD_MB", "400"))  # Was 600
-MEMORY_CRITICAL_THRESHOLD_MB = float(os.getenv("MEMORY_CRITICAL_THRESHOLD_MB", "550"))  # Was 800
+# Memory management configuration - BASIC DYNO (512MB)
+# Very aggressive thresholds for 512MB RAM
+MEMORY_CLEANUP_INTERVAL_SECONDS = int(os.getenv("MEMORY_CLEANUP_INTERVAL_SECONDS", "10"))  # Every 10s
+MEMORY_WARNING_THRESHOLD_MB = float(os.getenv("MEMORY_WARNING_THRESHOLD_MB", "250"))  # 250MB warning
+MEMORY_CRITICAL_THRESHOLD_MB = float(os.getenv("MEMORY_CRITICAL_THRESHOLD_MB", "350"))  # 350MB critical
 
 
 def setup_signal_handlers():

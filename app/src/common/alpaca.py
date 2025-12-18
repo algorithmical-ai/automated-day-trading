@@ -161,7 +161,7 @@ class AlpacaClient:
 
     @classmethod
     async def get_market_data(
-        cls, ticker: str, limit: int = 100
+        cls, ticker: str, limit: int = 50
     ) -> Optional[Dict[str, Any]]:
         """
         Get historical bars for a ticker from Alpaca API.

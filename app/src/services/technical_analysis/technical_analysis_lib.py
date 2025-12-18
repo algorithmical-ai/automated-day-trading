@@ -37,116 +37,32 @@ from app.src.common.loguru_logger import logger
 from app.src.common.alpaca import AlpacaClient
 
 
+# MEMORY OPTIMIZATION: No caching for Basic dyno (512MB)
+# Process one ticker at a time, discard immediately
+# Caching was removed to minimize RAM usage
+
 class IndicatorCache:
-    """
-    Memory-efficient cache for technical indicators with TTL.
-    Uses a simple dict with timestamp-based expiration.
-    """
+    """Disabled cache - no-op for memory constrained environments."""
     
-    def __init__(self, ttl_seconds: int = 10, max_size: int = 100):
-        """
-        Initialize the indicator cache.
-        
-        Args:
-            ttl_seconds: Time-to-live for cached entries (default: 10 seconds)
-            max_size: Maximum number of entries to cache (default: 100)
-        """
-        self._cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
-        self._ttl_seconds = ttl_seconds
-        self._max_size = max_size
-        self._lock = asyncio.Lock()
-        self._hits = 0
-        self._misses = 0
-        
     async def get(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """Get cached indicators for a ticker if still valid."""
-        async with self._lock:
-            if ticker not in self._cache:
-                self._misses += 1
-                return None
-            
-            data, timestamp = self._cache[ticker]
-            age = time.time() - timestamp
-            
-            if age > self._ttl_seconds:
-                # Expired - remove and return None
-                del self._cache[ticker]
-                self._misses += 1
-                return None
-            
-            self._hits += 1
-            return data
+        return None  # Always miss - no caching
     
     async def put(self, ticker: str, data: Dict[str, Any]) -> None:
-        """Store indicators for a ticker."""
-        async with self._lock:
-            # Evict oldest entries if at max size
-            if len(self._cache) >= self._max_size and ticker not in self._cache:
-                self._evict_oldest()
-            
-            self._cache[ticker] = (data, time.time())
-    
-    def _evict_oldest(self) -> None:
-        """Evict oldest entries to make room."""
-        if not self._cache:
-            return
-        
-        # Sort by timestamp and remove oldest 20%
-        sorted_items = sorted(self._cache.items(), key=lambda x: x[1][1])
-        evict_count = max(1, len(sorted_items) // 5)
-        
-        for ticker, _ in sorted_items[:evict_count]:
-            del self._cache[ticker]
-            
-        logger.debug(f"Indicator cache evicted {evict_count} entries")
+        pass  # Don't store anything
     
     async def clear(self) -> None:
-        """Clear all cached entries."""
-        async with self._lock:
-            count = len(self._cache)
-            self._cache.clear()
-            self._hits = 0
-            self._misses = 0
-            logger.debug(f"Indicator cache cleared {count} entries")
+        gc.collect()
     
     async def cleanup_expired(self) -> int:
-        """Remove expired entries and return count removed."""
-        async with self._lock:
-            current_time = time.time()
-            expired = [
-                ticker for ticker, (_, ts) in self._cache.items()
-                if current_time - ts > self._ttl_seconds
-            ]
-            for ticker in expired:
-                del self._cache[ticker]
-            
-            if expired:
-                logger.debug(f"Indicator cache cleaned up {len(expired)} expired entries")
-            
-            return len(expired)
+        gc.collect()
+        return 0
     
     async def stats(self) -> Dict[str, Any]:
-        """Get cache statistics."""
-        async with self._lock:
-            total = self._hits + self._misses
-            hit_rate = (self._hits / total * 100) if total > 0 else 0.0
-            return {
-                "size": len(self._cache),
-                "max_size": self._max_size,
-                "ttl_seconds": self._ttl_seconds,
-                "hits": self._hits,
-                "misses": self._misses,
-                "hit_rate": f"{hit_rate:.1f}%",
-            }
+        return {"size": 0, "max_size": 0, "ttl_seconds": 0, "hits": 0, "misses": 0, "hit_rate": "0%", "status": "DISABLED"}
 
 
-# Global indicator cache instance
-# TTL of 10 seconds is appropriate for fast trading while reducing API calls
-# Max size of 100 to limit memory (100 tickers × ~5KB per ticker = ~500KB)
-_indicator_cache = IndicatorCache(
-    ttl_seconds=int(os.getenv("INDICATOR_CACHE_TTL_SECONDS", "10")),
-    max_size=int(os.getenv("INDICATOR_CACHE_MAX_SIZE", "100"))
-)
+# Disabled cache for 512MB Basic dyno
+_indicator_cache = IndicatorCache()
 
 
 class TechnicalAnalysisLib:
@@ -407,8 +323,8 @@ class TechnicalAnalysisLib:
                 return cached
         
         # Get market data from Alpaca API
-        # Reduced from 200 to 100 bars to save memory (still enough for all indicators)
-        bars_data = await AlpacaClient.get_market_data(ticker, limit=100)
+        # BASIC DYNO: Only 50 bars to minimize memory (minimum needed for indicators)
+        bars_data = await AlpacaClient.get_market_data(ticker, limit=50)
 
         if not bars_data:
             logger.warning(f"No bars data for {ticker}, returning default indicators")

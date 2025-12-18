@@ -123,9 +123,9 @@ class TradingServiceCoordinator:
         for indicator_name in cls._enabled_indicators:
             logger.info(f"  - {indicator_name}")
 
-        # MEMORY OPTIMIZATION: Stagger indicator startup to prevent OOM
+        # BASIC DYNO (512MB): Long stagger delay between indicators
         # Each indicator starts with a delay to avoid simultaneous memory spikes
-        stagger_delay = int(os.getenv("INDICATOR_STAGGER_DELAY_SECONDS", "10"))
+        stagger_delay = int(os.getenv("INDICATOR_STAGGER_DELAY_SECONDS", "30"))
         
         async def run_with_delay(name: str, coro, delay: int):
             """Run a coroutine after a delay"""
