@@ -1960,7 +1960,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
         # Enhanced diagnostic logging for zero trades
         if len(top_upward) == 0 and len(top_downward) == 0:
-            logger.warning(
+            logger.info(
                 f"⚠️ MAB service returned zero tickers! "
                 f"Upward candidates: {len(upward_tickers)}, "
                 f"Downward candidates: {len(downward_tickers)}, "
@@ -2089,7 +2089,7 @@ class MomentumIndicator(BaseTradingIndicator):
         # Summary log for entry cycle
         total_entries_attempted = len(top_upward) + len(top_downward)
         if total_entries_attempted == 0:
-            logger.warning(
+            logger.info(
                 f"⚠️ Entry cycle completed with ZERO trade entries attempted. "
                 f"Summary: {len(candidates_to_fetch)} candidates fetched, "
                 f"{len(ticker_momentum_scores)} passed all filters, "
