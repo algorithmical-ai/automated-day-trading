@@ -1908,7 +1908,7 @@ class MomentumIndicator(BaseTradingIndicator):
         
         # Enhanced diagnostics: log if no tickers passed all filters
         if len(ticker_momentum_scores) == 0:
-            logger.warning(
+            logger.info(
                 f"⚠️ ZERO tickers passed all filters! "
                 f"Total candidates: {len(candidates_to_fetch)}, "
                 f"No market data: {stats['no_market_data']}, "
@@ -1978,12 +1978,12 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"{[(t, f'{s:.2f}%') for t, s, _ in downward_tickers[:5]]}"
                 )
         elif len(upward_tickers) > 0 and len(top_upward) == 0:
-            logger.warning(
+            logger.info(
                 f"⚠️ MAB service returned zero upward tickers despite {len(upward_tickers)} candidates passing filters. "
                 f"Top 3 candidates: {[(t, f'{s:.2f}%') for t, s, _ in upward_tickers[:3]]}"
             )
         elif len(downward_tickers) > 0 and len(top_downward) == 0:
-            logger.warning(
+            logger.info(
                 f"⚠️ MAB service returned zero downward tickers despite {len(downward_tickers)} candidates passing filters. "
                 f"Top 3 candidates: {[(t, f'{s:.2f}%') for t, s, _ in downward_tickers[:3]]}"
             )
