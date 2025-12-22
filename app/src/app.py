@@ -97,7 +97,7 @@ async def memory_management_task():
             
             # Log memory status periodically
             if current_mem > MEMORY_WARNING_THRESHOLD_MB:
-                logger.warning(
+                logger.info(
                     f"⚠️ Memory usage high: {current_mem:.0f}MB "
                     f"(warning: {MEMORY_WARNING_THRESHOLD_MB:.0f}MB, "
                     f"critical: {MEMORY_CRITICAL_THRESHOLD_MB:.0f}MB)"
