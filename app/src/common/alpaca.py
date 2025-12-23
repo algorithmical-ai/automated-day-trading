@@ -641,3 +641,100 @@ class AlpacaClient:
         if not clock:
             return False
         return clock.get("is_open", False)
+
+    @classmethod
+    async def is_shortable(cls, ticker: str) -> bool:
+        """
+        Check if a ticker is shortable by querying the Alpaca assets API.
+
+        Args:
+            ticker: Stock ticker symbol (e.g., "AAPL")
+
+        Returns:
+            True if ticker is shortable, False otherwise (or if API call fails)
+        """
+        if not cls.API_KEY_ID or not cls.API_SECRET_KEY:
+            logger.warning("Alpaca API credentials not configured, assuming ticker is not shortable")
+            return False
+
+        # Assets endpoint is on Trading API, not Data API
+        trading_base_url = "https://api.alpaca.markets/v2"
+        url = f"{trading_base_url}/assets/{ticker}"
+
+        headers = {
+            "accept": "application/json",
+            "APCA-API-KEY-ID": cls.API_KEY_ID,
+            "APCA-API-SECRET-KEY": cls.API_SECRET_KEY,
+        }
+
+        max_retries = 3
+        timeout_seconds = 3
+
+        for attempt in range(max_retries):
+            try:
+                timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            shortable = data.get("shortable", False)
+                            logger.debug(
+                                f"Ticker {ticker} shortable status: {shortable} "
+                                f"(easy_to_borrow: {data.get('easy_to_borrow', False)})"
+                            )
+                            return shortable
+                        elif response.status == 404:
+                            # Ticker not found - assume not shortable
+                            logger.debug(f"Ticker {ticker} not found in Alpaca assets, assuming not shortable")
+                            return False
+                        else:
+                            error_text = await response.text()
+                            logger.warning(
+                                f"Alpaca assets API error for {ticker}: HTTP {response.status} - {error_text[:200]}"
+                            )
+
+                            # Retry on server errors (5xx)
+                            if response.status >= 500 and attempt < max_retries - 1:
+                                logger.info(
+                                    f"Retrying Alpaca assets request for {ticker} "
+                                    f"(attempt {attempt + 1}/{max_retries})"
+                                )
+                                await asyncio.sleep(timeout_seconds)
+                                continue
+
+                            # Don't retry on client errors (4xx) - assume not shortable
+                            return False
+
+            except asyncio.TimeoutError:
+                if attempt < max_retries - 1:
+                    logger.debug(
+                        f"Timeout checking shortable status for {ticker} "
+                        f"(attempt {attempt + 1}/{max_retries}), retrying..."
+                    )
+                    await asyncio.sleep(timeout_seconds)
+                    continue
+                logger.warning(
+                    f"Timeout checking shortable status for {ticker} after {max_retries} attempts, assuming not shortable"
+                )
+                return False
+
+            except aiohttp.ClientError as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"HTTP client error checking shortable status for {ticker}: {e} "
+                        f"(attempt {attempt + 1}/{max_retries}), retrying..."
+                    )
+                    await asyncio.sleep(timeout_seconds)
+                    continue
+                logger.warning(
+                    f"HTTP client error checking shortable status for {ticker} after {max_retries} attempts, assuming not shortable"
+                )
+                return False
+
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    f"Unexpected error checking shortable status for {ticker}: {e}, assuming not shortable"
+                )
+                return False
+
+        return False

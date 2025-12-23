@@ -1481,6 +1481,14 @@ class MomentumIndicator(BaseTradingIndicator):
 
         # For shorts, re-check quality filters at entry time
         if action == "sell_to_open":
+            # Check if ticker is shortable via Alpaca API
+            is_shortable = await AlpacaClient.is_shortable(ticker)
+            if not is_shortable:
+                logger.info(
+                    f"Skipping {ticker} short entry: ticker is not shortable according to Alpaca API"
+                )
+                return False
+
             passes_filter, filter_reason = await cls._passes_stock_quality_filters(
                 ticker, market_data_response, momentum_score
             )

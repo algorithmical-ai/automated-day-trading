@@ -145,13 +145,20 @@ class TrailingStopConfig:
 class TieredTrailingStop:
     """Manages tiered trailing stop logic that tightens as profit grows."""
     
+    # IMPROVED: More responsive trailing stops for penny stocks
+    # Strategy: Lock in profits aggressively as price moves in our favor
     # Tiers ordered from highest to lowest profit threshold
     # This ensures we check the most profitable tier first
-    # WIDENED: Penny stocks need wider trails - they're volatile
     TIERS = [
+        # High profit tier: Lock in substantial gains
+        TrailingStopConfig(profit_threshold=10.0, trail_percent=3.0, min_locked_profit=7.0),  # Lock 7% at 10%+ profit
+        TrailingStopConfig(profit_threshold=7.0, trail_percent=2.5, min_locked_profit=4.5),  # Lock 4.5% at 7%+ profit
         TrailingStopConfig(profit_threshold=5.0, trail_percent=2.0, min_locked_profit=3.0),  # Lock 3% at 5%+ profit
+        # Medium profit tier: Lock in moderate gains
         TrailingStopConfig(profit_threshold=3.0, trail_percent=1.5, min_locked_profit=1.5),  # Lock 1.5% at 3%+ profit
-        TrailingStopConfig(profit_threshold=2.0, trail_percent=1.0, min_locked_profit=0.5),  # Lock 0.5% at 2%+ profit
+        # Low profit tier: Lock in small gains (protect breakeven)
+        TrailingStopConfig(profit_threshold=1.5, trail_percent=1.0, min_locked_profit=0.5),  # Lock 0.5% at 1.5%+ profit
+        TrailingStopConfig(profit_threshold=0.5, trail_percent=0.5, min_locked_profit=0.0),  # Protect breakeven at 0.5%+ profit
     ]
     
     @classmethod
@@ -289,6 +296,10 @@ class ExitDecisionEngine:
     EMERGENCY_STOP_PERCENT = -8.0  # WIDENED from -7.0% - only exit on catastrophic loss
     CONSECUTIVE_CHECKS_REQUIRED = 4  # INCREASED from 3 - require MORE confirmation before stop
     
+    # IMPROVED: Trend reversal detection for better exit timing
+    TREND_REVERSAL_BARS = 3  # Number of recent bars to check for reversal
+    TREND_REVERSAL_THRESHOLD = 1.5  # % drop from peak to trigger reversal exit (for profitable trades)
+    
     def __init__(self):
         self.consecutive_loss_checks: Dict[str, int] = {}
     
@@ -302,7 +313,8 @@ class ExitDecisionEngine:
         atr_stop_percent: float,
         holding_seconds: float,
         is_long: bool,
-        spread_percent: float
+        spread_percent: float,
+        recent_bars: Optional[List[Dict[str, Any]]] = None
     ) -> ExitDecision:
         """
         Evaluate whether trade should exit and why.
@@ -311,7 +323,8 @@ class ExitDecisionEngine:
         1. Emergency exit on significant loss (always active, even during holding period)
         2. Block non-emergency exits during minimum holding period
         3. Trailing stop for profitable trades
-        4. ATR-based stop loss with consecutive check requirement
+        4. Trend reversal detection (for profitable trades)
+        5. ATR-based stop loss with consecutive check requirement
         
         Args:
             ticker: Stock ticker symbol
@@ -323,6 +336,7 @@ class ExitDecisionEngine:
             holding_seconds: Seconds since trade entry
             is_long: True for long positions
             spread_percent: Bid-ask spread at entry as percentage
+            recent_bars: Optional list of recent price bars for trend reversal detection
             
         Returns:
             ExitDecision with should_exit, reason, exit_type, and is_spread_induced
@@ -349,20 +363,36 @@ class ExitDecisionEngine:
             )
         
         # PRIORITY 2: Trailing stop (if in profit vs breakeven)
-        if profit_vs_breakeven >= 1.0:
+        # IMPROVED: Activate trailing stop earlier (at 0.5% profit) to protect breakeven
+        if profit_vs_breakeven >= 0.5:
             trailing_stop_price = TieredTrailingStop.get_trailing_stop_price(
                 peak_price, profit_vs_breakeven, breakeven_price, is_long
             )
             if trailing_stop_price:
                 triggered = (current_price <= trailing_stop_price) if is_long else (current_price >= trailing_stop_price)
                 if triggered:
+                    # Calculate how much profit we're locking in
+                    locked_profit = self._calc_profit(breakeven_price, trailing_stop_price, is_long)
                     return ExitDecision(
                         should_exit=True,
-                        reason=f"Trailing stop triggered at ${trailing_stop_price:.4f}",
+                        reason=f"Trailing stop triggered at ${trailing_stop_price:.4f} (locking in {locked_profit:.2f}% profit)",
                         exit_type='trailing_stop'
                     )
         
-        # PRIORITY 3: ATR-based stop loss (requires consecutive checks)
+        # PRIORITY 3: Trend reversal detection (for profitable trades)
+        # IMPROVED: Exit when trend reverses to lock in profits
+        if profit_vs_breakeven >= 1.0 and recent_bars and len(recent_bars) >= self.TREND_REVERSAL_BARS:
+            is_reversing = self._detect_trend_reversal(recent_bars, is_long, peak_price, current_price)
+            if is_reversing:
+                drop_from_peak = self._calc_profit(peak_price, current_price, is_long)
+                if drop_from_peak <= -self.TREND_REVERSAL_THRESHOLD:
+                    return ExitDecision(
+                        should_exit=True,
+                        reason=f"Trend reversal detected: dropped {abs(drop_from_peak):.2f}% from peak ${peak_price:.4f} (locking in {profit_vs_breakeven:.2f}% profit)",
+                        exit_type='trend_reversal'
+                    )
+        
+        # PRIORITY 4: ATR-based stop loss (requires consecutive checks)
         if profit_vs_breakeven <= atr_stop_percent:
             self.consecutive_loss_checks[ticker] = self.consecutive_loss_checks.get(ticker, 0) + 1
             
@@ -404,6 +434,57 @@ class ExitDecisionEngine:
             return ((current_price - base_price) / base_price) * 100
         else:
             return ((base_price - current_price) / base_price) * 100
+    
+    def _detect_trend_reversal(
+        self,
+        recent_bars: List[Dict[str, Any]],
+        is_long: bool,
+        peak_price: float,
+        current_price: float
+    ) -> bool:
+        """
+        Detect if trend is reversing based on recent price action.
+        
+        For longs: Check if recent bars show consistent downward movement
+        For shorts: Check if recent bars show consistent upward movement
+        
+        Args:
+            recent_bars: List of recent price bars (most recent last)
+            is_long: True for long positions
+            peak_price: Peak price since entry
+            current_price: Current price
+            
+        Returns:
+            True if trend reversal is detected, False otherwise
+        """
+        if len(recent_bars) < self.TREND_REVERSAL_BARS:
+            return False
+        
+        # Get last N bars
+        last_bars = recent_bars[-self.TREND_REVERSAL_BARS:]
+        
+        # Extract close prices
+        closes = [bar.get('c', 0) for bar in last_bars if bar.get('c', 0) > 0]
+        if len(closes) < self.TREND_REVERSAL_BARS:
+            return False
+        
+        # Count bars moving against our position
+        # For longs: count downward moves
+        # For shorts: count upward moves
+        against_trend_count = 0
+        for i in range(1, len(closes)):
+            if is_long:
+                # For longs, reversal means price going down
+                if closes[i] < closes[i-1]:
+                    against_trend_count += 1
+            else:
+                # For shorts, reversal means price going up
+                if closes[i] > closes[i-1]:
+                    against_trend_count += 1
+        
+        # If most recent bars are moving against us, it's a reversal
+        reversal_ratio = against_trend_count / (len(closes) - 1)
+        return reversal_ratio >= 0.67  # 2/3 of bars moving against us
 
 
 @dataclass

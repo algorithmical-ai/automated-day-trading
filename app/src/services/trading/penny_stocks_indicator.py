@@ -43,13 +43,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
     """
     Penny stocks trading indicator for stocks < $5 USD
 
-    TREND-FOLLOWING STRATEGY - Ride volatility for quick profits:
-    - Enter LONG only if last few bars show clear UPWARD trend
-    - Enter SHORT only if last few bars show clear DOWNWARD trend (if enabled)
-    - Hold LONG until dip from peak (trend reversal) - then exit immediately
-    - Hold SHORT until rise from bottom (trend reversal) - then exit immediately
+    IMPROVED STRATEGY (Dec 2024):
+    - ONE ENTRY PER TICKER PER DAY: Prevents overtrading and reduces risk
+    - TREND-FOLLOWING: Enter LONG only if last few bars show clear UPWARD trend
+    - IMPROVED TRAILING STOPS: Multi-tier system that locks in profits as price moves favorably
+      * Activates at 0.5% profit to protect breakeven
+      * Tightens as profit grows (0.5% → 1.5% → 3% → 5% → 7% → 10%+)
+      * Locks in minimum profits at each tier
+    - TREND REVERSAL DETECTION: Exit when trend reverses to lock in profits
+    - ATR-BASED STOP LOSSES: Wider stops (-4% to -8%) to account for volatility
     - Losing tickers excluded from MAB for rest of day
-    - No entries after 3:55 PM ET to avoid late-day chaos
+    - No entries after 3:30 PM ET to avoid late-day chaos
     """
 
     # Configuration - CONSERVATIVE PENNY STOCK TRADING (Dec 2024)
@@ -125,6 +129,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
+    
+    # IMPROVED: Track ALL traded tickers for the day (one entry per ticker per day)
+    _traded_tickers_today: set = set()  # Tickers that have been traded today (win or lose)
 
     # Exit decision engine instance (shared across exit cycles)
     _exit_engine: Optional[ExitDecisionEngine] = None
@@ -553,7 +560,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         await cls._reset_daily_stats_if_needed()
 
-        # Reset losing tickers list at start of new day (when daily stats reset)
+        # Reset losing tickers and traded tickers lists at start of new day
         # Check if we're in a new day by checking if daily_trades_date changed
         from datetime import date
 
@@ -563,8 +570,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
             or cls._losing_tickers_date != today
         ):
             cls._losing_tickers_today = set()
+            cls._traded_tickers_today = set()  # IMPROVED: Reset all traded tickers
             cls._losing_tickers_date = today
-            logger.info("🔄 Reset losing tickers list for new trading day")
+            logger.info("🔄 Reset losing tickers and traded tickers lists for new trading day")
 
         # Check daily limit
         daily_limit_reached = await cls._has_reached_daily_trade_limit()
@@ -588,21 +596,28 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         logger.info(f"Current active trades: {active_count}/{cls.max_active_trades}")
 
-        # Filter out active tickers, those in cooldown, special securities, and losing tickers from today
+        # IMPROVED: Filter out active tickers, those in cooldown, special securities, 
+        # losing tickers, AND all previously traded tickers (one entry per ticker per day)
         candidates_to_fetch = [
             ticker
             for ticker in all_tickers
             if ticker not in active_ticker_set
             and not cls._is_ticker_in_cooldown(ticker)
             and not cls._is_special_security(ticker)
-            and ticker
-            not in cls._losing_tickers_today  # Exclude tickers that showed loss today
+            and ticker not in cls._losing_tickers_today  # Exclude tickers that showed loss today
+            and ticker not in cls._traded_tickers_today  # IMPROVED: Exclude all previously traded tickers
         ]
 
         if cls._losing_tickers_today:
             logger.info(
                 f"Excluding {len(cls._losing_tickers_today)} losing tickers from today's selection: "
                 f"{list(cls._losing_tickers_today)[:10]}"  # Show first 10
+            )
+        
+        if cls._traded_tickers_today:
+            logger.info(
+                f"Excluding {len(cls._traded_tickers_today)} previously traded tickers (one entry per ticker per day): "
+                f"{list(cls._traded_tickers_today)[:10]}"  # Show first 10
             )
 
         special_securities_count = sum(
@@ -1259,6 +1274,21 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 )
                 return False
 
+        # For shorts, check if ticker is shortable via Alpaca API
+        if action == "sell_to_open":
+            is_shortable = await AlpacaClient.is_shortable(ticker)
+            if not is_shortable:
+                logger.info(
+                    f"Skipping {ticker} short entry: ticker is not shortable according to Alpaca API"
+                )
+                await cls._log_selected_ticker_entry_failure(
+                    ticker,
+                    momentum_score,
+                    action,
+                    "Ticker is not shortable according to Alpaca API",
+                )
+                return False
+
         # Get entry price using Alpaca API
         quote_response = await AlpacaClient.quote(ticker)
         if not quote_response:
@@ -1458,6 +1488,8 @@ class PennyStocksIndicator(BaseTradingIndicator):
             skipped_exit_reason="",
         )
 
+        # IMPROVED: Mark ticker as traded (one entry per ticker per day)
+        cls._traded_tickers_today.add(ticker)
         logger.info(
             f"✅ Entered {ticker} {action} at ${enter_price:.4f} "
             f"(quick exit: {cls.profit_threshold:.2f}% profit, "
@@ -1721,7 +1753,18 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     ),
                 )
 
-            # Use ExitDecisionEngine for exit decision
+            # IMPROVED: Get recent bars for trend reversal detection
+            bars_data_for_exit = await AlpacaClient.get_market_data(
+                ticker, limit=cls.recent_bars_for_trend + 5
+            )
+            recent_bars = []
+            if bars_data_for_exit:
+                bars_dict = bars_data_for_exit.get("bars", {})
+                ticker_bars = bars_dict.get(ticker, [])
+                if ticker_bars:
+                    recent_bars = ticker_bars[-cls.recent_bars_for_trend:] if len(ticker_bars) >= cls.recent_bars_for_trend else ticker_bars
+
+            # Use ExitDecisionEngine for exit decision with trend reversal detection
             exit_decision: ExitDecision = cls._exit_engine.evaluate_exit(
                 ticker=ticker,
                 entry_price=enter_price,
@@ -1732,6 +1775,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 holding_seconds=holding_seconds,
                 is_long=is_long,
                 spread_percent=spread_percent,
+                recent_bars=recent_bars,  # IMPROVED: Pass recent bars for trend reversal detection
             )
 
             # Calculate current profit for logging and tracking
@@ -1779,6 +1823,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 final_profit_percent, exit_decision.is_spread_induced
             )
 
+            # IMPROVED: Mark ticker as traded (already done on entry, but ensure it's marked)
+            cls._traded_tickers_today.add(ticker)
+            
             # If trade ended in loss, mark ticker as losing for today
             if final_profit_percent < 0:
                 cls._losing_tickers_today.add(ticker)
@@ -1790,6 +1837,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 logger.warning(
                     f"📛 Marked {ticker} as losing ticker ({loss_type} loss: {final_profit_percent:.2f}%) - "
                     f"excluded from MAB selection for rest of day"
+                )
+            else:
+                logger.info(
+                    f"✅ {ticker} exited profitably ({final_profit_percent:.2f}%) - "
+                    f"will not re-enter today (one entry per ticker per day)"
                 )
 
             # Get technical indicators for exit
