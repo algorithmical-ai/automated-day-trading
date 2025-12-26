@@ -1727,24 +1727,33 @@ class MomentumIndicator(BaseTradingIndicator):
             )
 
             abs_momentum = abs(momentum_score)
-            if abs_momentum < cls.min_momentum_threshold:
+            # Dynamic momentum threshold based on price
+            # For penny stocks, we need a much higher threshold to filter out noise/spread
+            current_price = technical_analysis.get("close_price", 0.0)
+            required_momentum = cls.min_momentum_threshold
+            
+            if current_price > 0 and current_price < cls.max_stock_price_for_penny_treatment:
+                required_momentum = 5.0  # Require 5% momentum for stocks under $5
+                
+            if abs_momentum < required_momentum:
                 stats["low_momentum"] += 1
                 logger.debug(
                     f"Skipping {ticker}: momentum {momentum_score:.2f}% < "
-                    f"minimum threshold {cls.min_momentum_threshold}%"
+                    f"minimum threshold {required_momentum}% "
+                    f"{'(adjusted for penny stock)' if required_momentum > cls.min_momentum_threshold else ''}"
                 )
                 # Momentum threshold applies to both directions
                 # If positive momentum is too low, can't go long; if negative is too low, can't go short
                 if momentum_score > 0:
-                    reason_long = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}% (insufficient upward momentum for long entry)"
+                    reason_long = f"Momentum {momentum_score:.2f}% < minimum threshold {required_momentum}% (insufficient upward momentum for long entry)"
                     reason_short = f"Not evaluated for short entry (momentum is positive {momentum_score:.2f}%, would evaluate momentum threshold on negative momentum for short entry)"
                 elif momentum_score < 0:
                     reason_long = f"Not evaluated for long entry (momentum is negative {momentum_score:.2f}%, would evaluate momentum threshold on positive momentum for long entry)"
-                    reason_short = f"Momentum {abs(momentum_score):.2f}% < minimum threshold {cls.min_momentum_threshold}% (insufficient downward momentum for short entry)"
+                    reason_short = f"Momentum {abs(momentum_score):.2f}% < minimum threshold {required_momentum}% (insufficient downward momentum for short entry)"
                 else:
                     # Zero momentum - applies to both
-                    reason_long = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}% (insufficient momentum for long entry)"
-                    reason_short = f"Momentum {momentum_score:.2f}% < minimum threshold {cls.min_momentum_threshold}% (insufficient momentum for short entry)"
+                    reason_long = f"Momentum {momentum_score:.2f}% < minimum threshold {required_momentum}% (insufficient momentum for long entry)"
+                    reason_short = f"Momentum {momentum_score:.2f}% < minimum threshold {required_momentum}% (insufficient momentum for short entry)"
 
                 inactive_ticker_logs.append(
                     {
