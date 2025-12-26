@@ -354,7 +354,34 @@ class ExitDecisionEngine:
                 is_spread_induced=is_spread_induced
             )
         
-        # Within minimum holding period - only emergency exits allowed
+        # PRIORITY 2: ATR-based stop loss (requires consecutive checks)
+        # MOVED UP: Check this BEFORE holding period to ensure we respect risk limits
+        if profit_vs_breakeven <= atr_stop_percent:
+            self.consecutive_loss_checks[ticker] = self.consecutive_loss_checks.get(ticker, 0) + 1
+            
+            if self.consecutive_loss_checks[ticker] >= self.CONSECUTIVE_CHECKS_REQUIRED:
+                is_spread_induced = abs(profit_vs_entry) <= spread_percent * 1.5
+                self.consecutive_loss_checks[ticker] = 0
+                return ExitDecision(
+                    should_exit=True,
+                    reason=f"ATR stop loss: {profit_vs_breakeven:.2f}% (threshold: {atr_stop_percent:.2f}%)",
+                    exit_type='stop_loss',
+                    is_spread_induced=is_spread_induced
+                )
+            else:
+                # While we are counting consecutive losses, we should NOT exit, but we also 
+                # shouldn't return "none" and fall through to other checks.
+                # We return should_exit=False with a warning.
+                return ExitDecision(
+                    should_exit=False,
+                    reason=f"Loss warning {self.consecutive_loss_checks[ticker]}/{self.CONSECUTIVE_CHECKS_REQUIRED}",
+                    exit_type='none'
+                )
+        else:
+            # Reset consecutive loss counter if not in loss
+            self.consecutive_loss_checks[ticker] = 0
+            
+        # PRIORITY 3: Block non-emergency exits during minimum holding period
         if holding_seconds < self.MIN_HOLDING_SECONDS:
             return ExitDecision(
                 should_exit=False,
@@ -362,7 +389,7 @@ class ExitDecisionEngine:
                 exit_type='none'
             )
         
-        # PRIORITY 2: Trailing stop (if in profit vs breakeven)
+        # PRIORITY 4: Trailing stop (if in profit vs breakeven)
         # IMPROVED: Activate trailing stop earlier (at 0.5% profit) to protect breakeven
         if profit_vs_breakeven >= 0.5:
             trailing_stop_price = TieredTrailingStop.get_trailing_stop_price(
@@ -379,7 +406,7 @@ class ExitDecisionEngine:
                         exit_type='trailing_stop'
                     )
         
-        # PRIORITY 3: Trend reversal detection (for profitable trades)
+        # PRIORITY 5: Trend reversal detection (for profitable trades)
         # IMPROVED: Exit when trend reverses to lock in profits
         if profit_vs_breakeven >= 1.0 and recent_bars and len(recent_bars) >= self.TREND_REVERSAL_BARS:
             is_reversing = self._detect_trend_reversal(recent_bars, is_long, peak_price, current_price)
@@ -391,29 +418,6 @@ class ExitDecisionEngine:
                         reason=f"Trend reversal detected: dropped {abs(drop_from_peak):.2f}% from peak ${peak_price:.4f} (locking in {profit_vs_breakeven:.2f}% profit)",
                         exit_type='trend_reversal'
                     )
-        
-        # PRIORITY 4: ATR-based stop loss (requires consecutive checks)
-        if profit_vs_breakeven <= atr_stop_percent:
-            self.consecutive_loss_checks[ticker] = self.consecutive_loss_checks.get(ticker, 0) + 1
-            
-            if self.consecutive_loss_checks[ticker] >= self.CONSECUTIVE_CHECKS_REQUIRED:
-                is_spread_induced = abs(profit_vs_entry) <= spread_percent * 1.5
-                self.consecutive_loss_checks[ticker] = 0
-                return ExitDecision(
-                    should_exit=True,
-                    reason=f"ATR stop loss: {profit_vs_breakeven:.2f}% (threshold: {atr_stop_percent:.2f}%)",
-                    exit_type='stop_loss',
-                    is_spread_induced=is_spread_induced
-                )
-            else:
-                return ExitDecision(
-                    should_exit=False,
-                    reason=f"Loss warning {self.consecutive_loss_checks[ticker]}/{self.CONSECUTIVE_CHECKS_REQUIRED}",
-                    exit_type='none'
-                )
-        else:
-            # Reset consecutive loss counter if not in loss
-            self.consecutive_loss_checks[ticker] = 0
         
         return ExitDecision(
             should_exit=False,
