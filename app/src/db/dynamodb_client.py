@@ -857,6 +857,38 @@ class DynamoDBClient:
         return 0
     
     @classmethod
+    async def was_ticker_traded_today(cls, date: str, indicator: str, ticker: str) -> bool:
+        """
+        Check if a specific ticker was already traded today.
+        
+        Args:
+            date: Trade date (yyyy-mm-dd)
+            indicator: Trading indicator name
+            ticker: Stock ticker symbol
+            
+        Returns:
+            True if ticker was already traded today, False otherwise
+        """
+        instance = cls._get_instance()
+        
+        # Get the aggregated record for this date+indicator
+        item = await instance.get_item(
+            table_name='CompletedTradesForAutomatedDayTrading',
+            key={'date': date, 'indicator': indicator}
+        )
+        
+        if not item:
+            return False
+        
+        # Check if ticker exists in completed trades
+        completed_trades = item.get('completed_trades', [])
+        for trade in completed_trades:
+            if trade.get('ticker') == ticker:
+                return True
+        
+        return False
+    
+    @classmethod
     async def log_inactive_ticker(
         cls,
         ticker: str,

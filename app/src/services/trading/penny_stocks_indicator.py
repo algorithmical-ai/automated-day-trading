@@ -634,6 +634,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         # IMPROVED: Filter out active tickers, those in cooldown, special securities, 
         # losing tickers, AND all previously traded tickers (one entry per ticker per day)
+        # Also check database to ensure persistence across restarts
+        from datetime import date as date_class
+        today_str = date_class.today().isoformat()
+        
+        # Pre-filter using in-memory set (fast)
         candidates_to_fetch = [
             ticker
             for ticker in all_tickers
@@ -643,6 +648,24 @@ class PennyStocksIndicator(BaseTradingIndicator):
             and ticker not in cls._losing_tickers_today  # Exclude tickers that showed loss today
             and ticker not in cls._traded_tickers_today  # IMPROVED: Exclude all previously traded tickers
         ]
+        
+        # Additional check: verify against database (prevents duplicate entries after restarts)
+        # This is a safety check - the in-memory set should catch most cases
+        verified_candidates = []
+        for ticker in candidates_to_fetch:
+            was_traded = await DynamoDBClient.was_ticker_traded_today(
+                date=today_str,
+                indicator=cls.indicator_name(),
+                ticker=ticker
+            )
+            if was_traded:
+                logger.debug(f"Excluding {ticker}: already traded today (found in database)")
+                # Add to in-memory set to avoid checking again
+                cls._traded_tickers_today.add(ticker)
+            else:
+                verified_candidates.append(ticker)
+        
+        candidates_to_fetch = verified_candidates
 
         if cls._losing_tickers_today:
             logger.info(
@@ -1450,6 +1473,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         logger.debug(f"{ticker} momentum confirmed: {confirm_reason}")
 
+        # CRITICAL: Mark ticker as traded BEFORE entry to prevent duplicate entries
+        # This must happen before _enter_trade() to prevent race conditions
+        cls._traded_tickers_today.add(ticker)
+        logger.debug(f"Marked {ticker} as traded (before entry) to prevent duplicate entries")
+
         # IMPROVED: Calculate breakeven price accounting for spread
         breakeven_price = SpreadCalculator.calculate_breakeven_price(
             enter_price, spread_percent, is_long
@@ -1507,6 +1535,8 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         if not entry_success:
             logger.error(f"Failed to enter trade for {ticker}")
+            # Remove from traded set since entry failed (allow retry)
+            cls._traded_tickers_today.discard(ticker)
             await cls._log_selected_ticker_entry_failure(
                 ticker,
                 momentum_score,
@@ -1524,8 +1554,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             skipped_exit_reason="",
         )
 
-        # IMPROVED: Mark ticker as traded (one entry per ticker per day)
-        cls._traded_tickers_today.add(ticker)
+        # Note: ticker already marked as traded above (before entry) to prevent race conditions
         logger.info(
             f"✅ Entered {ticker} {action} at ${enter_price:.4f} "
             f"(quick exit: {cls.profit_threshold:.2f}% profit, "
