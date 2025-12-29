@@ -82,6 +82,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
     exceptional_momentum_threshold: float = (
         10.0  # INCREASED: Exceptional momentum for preemption (was 8.0%)
     )
+    min_continuation_threshold: float = (
+        0.6  # NEW: Minimum continuation score (0.0-1.0) to avoid entering at trend peaks
+    )
 
     min_volume: int = (
         10000  # INCREASED: Minimum volume (was 5000) - need MORE liquidity
@@ -332,10 +335,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
         We trust that signal and only do minimal validation:
         1. Have at least 3 bars (minimal data quality)
         2. Valid bid/ask spread (can actually trade)
+        3. Continuation score meets minimum threshold (avoids entering at trend peaks)
 
         We DON'T over-filter with:
         - Complex momentum thresholds (Alpaca already screened for momentum)
-        - Continuation scores (too restrictive for volatile penny stocks)
         - Price extreme rules (penny stocks are volatile by nature)
 
         Args:
@@ -389,6 +392,39 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 technical_indicators=trend_metrics.to_dict() if trend_metrics else None,
             )
             return False
+
+        # 4. Continuation check - avoid entering when trend is weakening (NEW)
+        # This prevents entering at trend peaks like WOK (continuation=0.50)
+        if trend_metrics and trend_metrics.momentum_score > 0:
+            # Upward trend - check continuation for long entries
+            if trend_metrics.continuation_score < cls.min_continuation_threshold:
+                reason = (
+                    f"Trend continuation too weak: {trend_metrics.continuation_score:.2f} < "
+                    f"{cls.min_continuation_threshold} (trend may be at peak, avoid long entry)"
+                )
+                collector.add_rejection(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    reason_long=reason,
+                    reason_short=None,  # Short entry not applicable for upward trend
+                    technical_indicators=trend_metrics.to_dict() if trend_metrics else None,
+                )
+                return False
+        elif trend_metrics and trend_metrics.momentum_score < 0:
+            # Downward trend - check continuation for short entries
+            if trend_metrics.continuation_score < cls.min_continuation_threshold:
+                reason = (
+                    f"Trend continuation too weak: {trend_metrics.continuation_score:.2f} < "
+                    f"{cls.min_continuation_threshold} (trend may be at bottom, avoid short entry)"
+                )
+                collector.add_rejection(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    reason_long=None,  # Long entry not applicable for downward trend
+                    reason_short=reason,
+                    technical_indicators=trend_metrics.to_dict() if trend_metrics else None,
+                )
+                return False
 
         # PASSED - Trust Alpaca's gainer/most_active signal
         return True
