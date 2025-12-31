@@ -29,6 +29,7 @@ async def send_signal_to_webhook(
     enter_price: Optional[float] = None,
     exit_price: Optional[float] = None,
     technical_indicators: Optional[dict] = None,
+    confidence_score: Optional[float] = None,
 ) -> None:
     """Send buy/sell signal to webhook and manage DynamoDB entries with timeout protection."""
     # Add overall timeout protection
@@ -45,6 +46,7 @@ async def send_signal_to_webhook(
                 enter_price,
                 exit_price,
                 technical_indicators,
+                confidence_score,
             ),
             timeout=8.0,
         )
@@ -63,6 +65,7 @@ async def _send_signal_to_webhook_impl(  # noqa: C901
     enter_price: Optional[float] = None,
     exit_price: Optional[float] = None,
     technical_indicators: Optional[dict] = None,
+    confidence_score: Optional[float] = None,
 ) -> None:
     """Internal implementation of webhook signal sending."""
 
@@ -164,6 +167,12 @@ async def _send_signal_to_webhook_impl(  # noqa: C901
     # Add technical indicators if provided
     if technical_indicators is not None:
         payload["technical_indicators"] = technical_indicators
+
+    # Add confidence_score if provided (0.0 to 1.0 scale)
+    if confidence_score is not None:
+        # Clamp confidence_score to 0.0-1.0 range
+        confidence_score = max(0.0, min(1.0, confidence_score))
+        payload["confidence_score"] = confidence_score
 
     # Log payload for debugging (excluding sensitive data)
     logger.debug(f"📦 Webhook payload for {ticker} {action}: {payload}")

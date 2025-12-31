@@ -1272,6 +1272,86 @@ class PennyStocksIndicator(BaseTradingIndicator):
         return True  # Momentum still valid
 
     @classmethod
+    def _calculate_confidence_score(
+        cls,
+        momentum_score: float,
+        peak_price: Optional[float],
+        enter_price: float,
+        spread_percent: float,
+        volume: int,
+        rank: int,
+    ) -> float:
+        """
+        Calculate confidence score (0.0 to 1.0) for penny stock entry.
+        
+        Factors considered:
+        1. Momentum score (higher = higher confidence)
+        2. Distance from peak (further below peak = higher confidence)
+        3. Spread (lower spread = higher confidence)
+        4. Volume (higher volume = higher confidence)
+        5. Rank (lower rank = higher confidence)
+        
+        Args:
+            momentum_score: Momentum score from trend calculation
+            peak_price: Detected peak price (None if unavailable)
+            enter_price: Entry price
+            spread_percent: Bid-ask spread percentage
+            volume: Trading volume
+            rank: Ranking of this ticker (1 = best)
+            
+        Returns:
+            Confidence score between 0.0 and 1.0
+        """
+        # Base score from momentum (normalize to 0-1 range)
+        # Penny stocks: min_momentum_threshold = 5.0%, max reasonable = 20.0%
+        min_momentum = cls.min_momentum_threshold  # 5.0%
+        max_momentum = 20.0  # Use 20% as reasonable max for normalization
+        momentum_normalized = min(1.0, max(0.0, (momentum_score - min_momentum) / (max_momentum - min_momentum)))
+        
+        # Peak distance factor (further below peak = higher confidence)
+        peak_factor = 1.0
+        if peak_price and peak_price > 0:
+            price_below_peak_percent = ((peak_price - enter_price) / peak_price) * 100
+            # Optimal: 2-5% below peak = high confidence (1.0)
+            # Too close (< 1%) = lower confidence (0.7)
+            # Far below (> 10%) = lower confidence (0.8)
+            if price_below_peak_percent < 1.0:
+                peak_factor = 0.7  # Too close to peak
+            elif price_below_peak_percent < 2.0:
+                peak_factor = 0.85
+            elif price_below_peak_percent <= 5.0:
+                peak_factor = 1.0  # Optimal range
+            elif price_below_peak_percent <= 10.0:
+                peak_factor = 0.9
+            else:
+                peak_factor = 0.8  # Too far below peak
+        
+        # Spread factor (lower spread = higher confidence)
+        # max_bid_ask_spread_percent = 0.75% for penny stocks
+        max_spread = cls.max_bid_ask_spread_percent  # 0.75%
+        spread_factor = max(0.5, 1.0 - (spread_percent / max_spread))  # 0.5 to 1.0
+        
+        # Volume factor (normalize volume, higher = better)
+        # Use min_volume as baseline (10,000)
+        min_volume = cls.min_volume  # 10,000
+        volume_factor = min(1.0, max(0.5, volume / (min_volume * 2)))  # 0.5 to 1.0
+        
+        # Rank factor (rank 1 = 1.0, rank 2 = 0.9, rank 3+ = 0.8)
+        rank_factor = 1.0 if rank == 1 else (0.9 if rank == 2 else 0.8)
+        
+        # Weighted combination
+        confidence = (
+            momentum_normalized * 0.35 +  # 35% weight on momentum
+            peak_factor * 0.25 +            # 25% weight on peak distance
+            spread_factor * 0.20 +          # 20% weight on spread
+            volume_factor * 0.15 +          # 15% weight on volume
+            rank_factor * 0.05              # 5% weight on rank
+        )
+        
+        # Ensure result is between 0.0 and 1.0
+        return max(0.0, min(1.0, confidence))
+
+    @classmethod
     async def _preempt_low_profit_trade(
         cls, new_ticker: str, new_momentum_score: float
     ) -> bool:
@@ -1655,6 +1735,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 "atr": atr if atr else 0.0,
             }
 
+        # Calculate confidence score (0.0 to 1.0)
+        peak_price = cls._extract_peak_price_from_reason(reason)
+        confidence_score = cls._calculate_confidence_score(
+            momentum_score=momentum_score,
+            peak_price=peak_price,
+            enter_price=enter_price,
+            spread_percent=spread_percent,
+            volume=technical_indicators.get("volume", 0),
+            rank=rank,
+        )
+
         await send_signal_to_webhook(
             ticker=ticker,
             action=action,
@@ -1662,6 +1753,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             enter_reason=ranked_reason,
             enter_price=enter_price,
             technical_indicators=technical_indicators,
+            confidence_score=confidence_score,
         )
 
         # IMPROVED: Enter trade with ATR-based stop loss instead of fixed tight stop

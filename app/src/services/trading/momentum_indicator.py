@@ -1484,6 +1484,113 @@ class MomentumIndicator(BaseTradingIndicator):
         return True  # Momentum still valid
 
     @classmethod
+    def _calculate_confidence_score(
+        cls,
+        momentum_score: float,
+        recent_avg: Optional[float],
+        enter_price: float,
+        spread_percent: float,
+        volume: int,
+        rank: int,
+        is_golden: bool,
+        technical_indicators: Optional[dict] = None,
+    ) -> float:
+        """
+        Calculate confidence score (0.0 to 1.0) for momentum trading entry.
+        
+        Factors considered:
+        1. Momentum score (higher = higher confidence)
+        2. Distance from recent_avg (further below = higher confidence)
+        3. Spread (lower spread = higher confidence)
+        4. Volume (higher volume = higher confidence)
+        5. Rank (lower rank = higher confidence)
+        6. Golden status (golden = higher confidence)
+        7. RSI (for longs: 50-65 = optimal, overbought/oversold = lower confidence)
+        
+        Args:
+            momentum_score: Momentum score from calculation
+            recent_avg: Recent average price (None if unavailable)
+            enter_price: Entry price
+            spread_percent: Bid-ask spread percentage
+            volume: Trading volume
+            rank: Ranking of this ticker (1 = best)
+            is_golden: Whether this is a golden/exceptional ticker
+            technical_indicators: Optional technical indicators dict
+            
+        Returns:
+            Confidence score between 0.0 and 1.0
+        """
+        # Base score from momentum (normalize to 0-1 range)
+        # Momentum: min_momentum_threshold = 1.5%, max_momentum_threshold = 15.0%
+        min_momentum = cls.min_momentum_threshold  # 1.5%
+        max_momentum = cls.max_momentum_threshold  # 15.0%
+        momentum_normalized = min(1.0, max(0.0, (abs(momentum_score) - min_momentum) / (max_momentum - min_momentum)))
+        
+        # Recent average distance factor (further below = higher confidence)
+        recent_avg_factor = 1.0
+        if recent_avg and recent_avg > 0:
+            price_below_recent_avg_percent = ((recent_avg - enter_price) / recent_avg) * 100
+            # Optimal: 1-3% below recent_avg = high confidence (1.0)
+            # Too close (< 0.5%) = lower confidence (0.7)
+            # Far below (> 5%) = lower confidence (0.8)
+            if price_below_recent_avg_percent < 0.5:
+                recent_avg_factor = 0.7  # Too close to recent_avg
+            elif price_below_recent_avg_percent < 1.0:
+                recent_avg_factor = 0.85
+            elif price_below_recent_avg_percent <= 3.0:
+                recent_avg_factor = 1.0  # Optimal range
+            elif price_below_recent_avg_percent <= 5.0:
+                recent_avg_factor = 0.9
+            else:
+                recent_avg_factor = 0.8  # Too far below
+        
+        # Spread factor (lower spread = higher confidence)
+        max_spread = cls.max_bid_ask_spread_percent  # 3.0%
+        spread_factor = max(0.5, 1.0 - (spread_percent / max_spread))  # 0.5 to 1.0
+        
+        # Volume factor (normalize volume, higher = better)
+        min_volume = cls.min_daily_volume  # 1000
+        volume_factor = min(1.0, max(0.5, volume / (min_volume * 5)))  # 0.5 to 1.0
+        
+        # Rank factor (rank 1 = 1.0, rank 2 = 0.9)
+        rank_factor = 1.0 if rank == 1 else 0.9
+        
+        # Golden factor (golden = bonus confidence)
+        golden_factor = 1.1 if is_golden else 1.0  # 10% bonus for golden
+        golden_factor = min(1.0, golden_factor)  # Cap at 1.0
+        
+        # RSI factor (for longs: 50-65 = optimal)
+        rsi_factor = 1.0
+        if technical_indicators:
+            rsi = technical_indicators.get("rsi")
+            if rsi is not None:
+                # Optimal RSI range: 50-65 for longs
+                if 50 <= rsi <= 65:
+                    rsi_factor = 1.0  # Optimal
+                elif 45 <= rsi < 50 or 65 < rsi <= 70:
+                    rsi_factor = 0.9  # Good
+                elif 40 <= rsi < 45 or 70 < rsi <= 75:
+                    rsi_factor = 0.8  # Acceptable
+                else:
+                    rsi_factor = 0.7  # Less ideal
+        
+        # Weighted combination
+        confidence = (
+            momentum_normalized * 0.30 +  # 30% weight on momentum
+            recent_avg_factor * 0.25 +     # 25% weight on recent_avg distance
+            spread_factor * 0.20 +         # 20% weight on spread
+            volume_factor * 0.15 +         # 15% weight on volume
+            rank_factor * 0.05 +           # 5% weight on rank
+            rsi_factor * 0.05              # 5% weight on RSI
+        )
+        
+        # Apply golden bonus
+        confidence = confidence * golden_factor
+        
+        # Ensure result is between 0.0 and 1.0
+        return max(0.0, min(1.0, confidence))
+
+    @classmethod
     async def _process_ticker_entry(
         cls,
         ticker: str,
@@ -1684,6 +1791,20 @@ class MomentumIndicator(BaseTradingIndicator):
         technical_indicators_for_enter["spread_percent"] = spread_percent
         technical_indicators_for_enter["breakeven_price"] = breakeven_price
 
+        # Calculate confidence score (0.0 to 1.0)
+        recent_avg = cls._extract_recent_avg_from_reason(reason)
+        volume = technical_indicators_for_enter.get("volume", 0)
+        confidence_score = cls._calculate_confidence_score(
+            momentum_score=momentum_score,
+            recent_avg=recent_avg,
+            enter_price=enter_price,
+            spread_percent=spread_percent,
+            volume=volume,
+            rank=rank,
+            is_golden=is_golden,
+            technical_indicators=technical_indicators_for_enter,
+        )
+
         await send_signal_to_webhook(
             ticker=ticker,
             action=action,
@@ -1691,6 +1812,7 @@ class MomentumIndicator(BaseTradingIndicator):
             enter_reason=ranked_reason,
             enter_price=enter_price,
             technical_indicators=technical_indicators_for_enter,
+            confidence_score=confidence_score,
         )
 
         # Calculate dynamic stop loss
