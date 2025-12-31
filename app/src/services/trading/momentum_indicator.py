@@ -1411,7 +1411,6 @@ class MomentumIndicator(BaseTradingIndicator):
         return prices
 
     @classmethod
-    @classmethod
     def _extract_recent_avg_from_reason(cls, reason: str) -> Optional[float]:
         """
         Extract recent_avg price from reason string.
@@ -1484,6 +1483,7 @@ class MomentumIndicator(BaseTradingIndicator):
         
         return True  # Momentum still valid
 
+    @classmethod
     async def _process_ticker_entry(
         cls,
         ticker: str,
