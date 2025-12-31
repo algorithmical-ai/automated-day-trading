@@ -1187,6 +1187,77 @@ class PennyStocksIndicator(BaseTradingIndicator):
         return None
 
     @classmethod
+    def _extract_peak_price_from_reason(cls, reason: str) -> Optional[float]:
+        """
+        Extract peak price from reason string.
+        Reason format: "...peak=$X.XXXX, bottom=$Y.YYYY..."
+        """
+        import re
+        try:
+            # Pattern to match "peak=$X.XXXX"
+            match = re.search(r'peak=\$([\d.]+)', reason)
+            if match:
+                return float(match.group(1))
+        except (ValueError, AttributeError):
+            pass
+        return None
+
+    @classmethod
+    def _check_immediate_momentum(cls, bars: List[Dict[str, Any]], is_long: bool) -> bool:
+        """
+        Check if the most recent 2-3 bars still show momentum in the correct direction.
+        This catches reversals that happened between momentum calculation and entry.
+        
+        Args:
+            bars: List of price bars
+            is_long: True for long positions (check upward momentum), False for short
+            
+        Returns:
+            True if immediate momentum is valid, False if reversal detected
+        """
+        if not bars or len(bars) < 2:
+            return True  # If insufficient data, don't block entry
+        
+        # Get last 2-3 bars for immediate check
+        recent_bars = bars[-3:] if len(bars) >= 3 else bars[-2:]
+        prices = []
+        for bar in recent_bars:
+            try:
+                close_price = bar.get("c")
+                if close_price is not None:
+                    prices.append(float(close_price))
+            except (ValueError, TypeError):
+                continue
+        
+        if len(prices) < 2:
+            return True  # Insufficient data, don't block
+        
+        # Check if recent bars show continuation of trend
+        # For longs: recent prices should be generally flat or rising (not falling)
+        # For shorts: recent prices should be generally flat or falling (not rising)
+        if is_long:
+            # For longs: count how many bars show upward movement
+            up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
+            down_moves = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i-1])
+            
+            # If we have more down moves than up moves in recent bars, momentum may be reversing
+            # Allow if at least 50% are up moves or flat, or if net change is positive
+            net_change = prices[-1] - prices[0]
+            if net_change < 0 and down_moves > up_moves:
+                return False  # Reversal detected
+        else:
+            # For shorts: count how many bars show downward movement
+            up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
+            down_moves = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i-1])
+            
+            # If we have more up moves than down moves in recent bars, momentum may be reversing
+            net_change = prices[-1] - prices[0]
+            if net_change > 0 and up_moves > down_moves:
+                return False  # Reversal detected
+        
+        return True  # Momentum still valid
+
+    @classmethod
     async def _preempt_low_profit_trade(
         cls, new_ticker: str, new_momentum_score: float
     ) -> bool:
@@ -1472,6 +1543,44 @@ class PennyStocksIndicator(BaseTradingIndicator):
             return False
 
         logger.debug(f"{ticker} momentum confirmed: {confirm_reason}")
+
+        # NEW: Peak price validation - don't enter if current ASK is significantly above detected peak
+        # This prevents entering after momentum has already peaked
+        if is_long and ticker_bars:
+            peak_price = cls._extract_peak_price_from_reason(reason)
+            if peak_price and peak_price > 0:
+                # Calculate how much above peak the current ASK is
+                price_above_peak_percent = ((ask - peak_price) / peak_price) * 100
+                max_price_above_peak_percent = 1.5  # Max 1.5% above detected peak
+                
+                if price_above_peak_percent > max_price_above_peak_percent:
+                    logger.info(
+                        f"Skipping {ticker}: entry ASK ${ask:.4f} is {price_above_peak_percent:.2f}% above "
+                        f"detected peak ${peak_price:.4f} (max: {max_price_above_peak_percent}%) - momentum may have peaked"
+                    )
+                    await cls._log_selected_ticker_entry_failure(
+                        ticker,
+                        momentum_score,
+                        action,
+                        f"Entry price ${ask:.4f} too far above detected peak ${peak_price:.4f} ({price_above_peak_percent:.2f}%)",
+                    )
+                    return False
+
+        # NEW: Immediate momentum check - verify most recent 2-3 bars still show momentum
+        # This catches reversals that happened between momentum calculation and entry
+        if ticker_bars and len(ticker_bars) >= 3:
+            recent_momentum_valid = cls._check_immediate_momentum(ticker_bars, is_long)
+            if not recent_momentum_valid:
+                logger.info(
+                    f"Skipping {ticker}: immediate momentum check failed - recent bars show reversal"
+                )
+                await cls._log_selected_ticker_entry_failure(
+                    ticker,
+                    momentum_score,
+                    action,
+                    "Immediate momentum check failed - recent bars show reversal",
+                )
+                return False
 
         # CRITICAL: Mark ticker as traded BEFORE entry to prevent duplicate entries
         # This must happen before _enter_trade() to prevent race conditions

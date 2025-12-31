@@ -1411,6 +1411,79 @@ class MomentumIndicator(BaseTradingIndicator):
         return prices
 
     @classmethod
+    @classmethod
+    def _extract_recent_avg_from_reason(cls, reason: str) -> Optional[float]:
+        """
+        Extract recent_avg price from reason string.
+        Reason format: "Momentum: X% change, Y% trend (early_avg: A, recent_avg: B, ...)"
+        """
+        import re
+        try:
+            # Pattern to match "recent_avg: X.XX"
+            match = re.search(r'recent_avg:\s*([\d.]+)', reason)
+            if match:
+                return float(match.group(1))
+        except (ValueError, AttributeError):
+            pass
+        return None
+
+    @classmethod
+    def _check_immediate_momentum_for_entry(
+        cls, bars: List[Dict[str, Any]], is_long: bool
+    ) -> bool:
+        """
+        Check if the most recent 2-3 bars still show momentum in the correct direction.
+        This catches reversals that happened between momentum calculation and entry.
+        
+        Args:
+            bars: List of price bars with 'c' (close) key
+            is_long: True for long positions (check upward momentum), False for short
+            
+        Returns:
+            True if immediate momentum is valid, False if reversal detected
+        """
+        if not bars or len(bars) < 2:
+            return True  # If insufficient data, don't block entry
+        
+        # Get last 2-3 bars for immediate check
+        recent_bars = bars[-3:] if len(bars) >= 3 else bars[-2:]
+        prices = []
+        for bar in recent_bars:
+            try:
+                close_price = bar.get("c") or bar.get("close") or bar.get("close_price")
+                if close_price is not None:
+                    prices.append(float(close_price))
+            except (ValueError, TypeError):
+                continue
+        
+        if len(prices) < 2:
+            return True  # Insufficient data, don't block
+        
+        # Check if recent bars show continuation of trend
+        # For longs: recent prices should be generally flat or rising (not falling)
+        # For shorts: recent prices should be generally flat or falling (not rising)
+        if is_long:
+            # For longs: count how many bars show upward movement
+            up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
+            down_moves = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i-1])
+            
+            # If we have more down moves than up moves in recent bars, momentum may be reversing
+            # Allow if at least 50% are up moves or flat, or if net change is positive
+            net_change = prices[-1] - prices[0]
+            if net_change < 0 and down_moves > up_moves:
+                return False  # Reversal detected
+        else:
+            # For shorts: count how many bars show downward movement
+            up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
+            down_moves = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i-1])
+            
+            # If we have more up moves than down moves in recent bars, momentum may be reversing
+            net_change = prices[-1] - prices[0]
+            if net_change > 0 and up_moves > down_moves:
+                return False  # Reversal detected
+        
+        return True  # Momentum still valid
+
     async def _process_ticker_entry(
         cls,
         ticker: str,
@@ -1539,11 +1612,57 @@ class MomentumIndicator(BaseTradingIndicator):
         ask = ticker_quote.get("ap", 0.0)
         spread_percent = SpreadCalculator.calculate_spread_percent(bid, ask)
         
-        if spread_percent > cls.max_bid_ask_spread_percent:
+        # NEW: Stricter validation for ultra-low price stocks (< $0.20)
+        # These stocks have wider spreads and are more prone to manipulation
+        # Check this FIRST before general spread check to apply stricter rules
+        if enter_price < 0.20:
+            # For ultra-low price stocks, require tighter spread (2.0% vs 3.0% default)
+            ultra_low_price_max_spread = 2.0
+            if spread_percent > ultra_low_price_max_spread:
+                logger.info(
+                    f"Skipping {ticker}: ultra-low price stock (${enter_price:.4f}) with spread {spread_percent:.2f}% > "
+                    f"max {ultra_low_price_max_spread}% (stricter threshold for low-price stocks)"
+                )
+                return False
+        elif spread_percent > cls.max_bid_ask_spread_percent:
+            # General spread check for regular stocks
             logger.info(
                 f"Skipping {ticker}: bid-ask spread {spread_percent:.2f}% > max {cls.max_bid_ask_spread_percent}%"
             )
             return False
+
+        # NEW: Recent average peak validation - don't enter if current price is significantly above recent_avg
+        # This prevents entering after momentum has already peaked
+        # For PFSA case: recent_avg was 0.12, but entry was at 0.13 (8.3% above) - too late
+        if is_long:
+            recent_avg = cls._extract_recent_avg_from_reason(reason)
+            if recent_avg and recent_avg > 0:
+                # Calculate how much above recent_avg the current entry price is
+                price_above_recent_avg_percent = ((enter_price - recent_avg) / recent_avg) * 100
+                # Stricter threshold for ultra-low price stocks (< $0.20) - they're more volatile
+                max_price_above_recent_avg = 3.0 if enter_price < 0.20 else 5.0
+                
+                if price_above_recent_avg_percent > max_price_above_recent_avg:
+                    logger.info(
+                        f"Skipping {ticker}: entry price ${enter_price:.4f} is {price_above_recent_avg_percent:.2f}% above "
+                        f"recent_avg ${recent_avg:.4f} (max: {max_price_above_recent_avg}%) - momentum may have peaked"
+                    )
+                    return False
+
+        # NEW: Immediate momentum check - verify most recent bars still show momentum
+        # This catches reversals that happened between momentum calculation and entry
+        # Get bars data for immediate momentum validation
+        bars_data = await AlpacaClient.get_market_data(ticker, limit=50)
+        if bars_data:
+            bars_dict = bars_data.get("bars", {})
+            ticker_bars = bars_dict.get(ticker, [])
+            if ticker_bars and len(ticker_bars) >= 3:
+                recent_momentum_valid = cls._check_immediate_momentum_for_entry(ticker_bars, is_long)
+                if not recent_momentum_valid:
+                    logger.info(
+                        f"Skipping {ticker}: immediate momentum check failed - recent bars show reversal"
+                    )
+                    return False
 
         # IMPROVED: Calculate breakeven price accounting for spread
         breakeven_price = SpreadCalculator.calculate_breakeven_price(
