@@ -1233,18 +1233,32 @@ class PennyStocksIndicator(BaseTradingIndicator):
             return True  # Insufficient data, don't block
         
         # Check if recent bars show continuation of trend
-        # For longs: recent prices should be generally flat or rising (not falling)
-        # For shorts: recent prices should be generally flat or falling (not rising)
+        # STRICT: For longs, require clear upward movement (not just "not negative")
+        # For shorts, require clear downward movement
         if is_long:
             # For longs: count how many bars show upward movement
             up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
             down_moves = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i-1])
             
-            # If we have more down moves than up moves in recent bars, momentum may be reversing
-            # Allow if at least 50% are up moves or flat, or if net change is positive
+            # Calculate net change and percentage change
             net_change = prices[-1] - prices[0]
-            if net_change < 0 and down_moves > up_moves:
-                return False  # Reversal detected
+            net_change_percent = (net_change / prices[0]) * 100 if prices[0] > 0 else 0
+            
+            # STRICT: Require clear upward momentum
+            # 1. Net change must be positive and meaningful (> 0.3%)
+            # 2. At least 50% of moves must be upward (or equal up/down with positive net change)
+            # 3. Reject if net change is negative OR if down moves exceed up moves
+            if net_change <= 0:
+                return False  # Price is flat or declining - no momentum
+            
+            if net_change_percent < 0.3:
+                return False  # Net change too small (< 0.3%) - weak momentum
+            
+            if down_moves > up_moves:
+                return False  # More down moves than up moves - reversal detected
+            
+            # If equal moves, require positive net change (already checked above)
+            # This ensures we have clear upward momentum, not just sideways movement
         else:
             # For shorts: count how many bars show downward movement
             up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
@@ -1544,25 +1558,43 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         logger.debug(f"{ticker} momentum confirmed: {confirm_reason}")
 
-        # NEW: Peak price validation - don't enter if current ASK is significantly above detected peak
+        # NEW: Peak price validation - don't enter if current ASK is at, above, or too close to detected peak
         # This prevents entering after momentum has already peaked
+        # FIXED: Made stricter - reject entries at/above peak or too close to peak
         if is_long and ticker_bars:
             peak_price = cls._extract_peak_price_from_reason(reason)
             if peak_price and peak_price > 0:
-                # Calculate how much above peak the current ASK is
-                price_above_peak_percent = ((ask - peak_price) / peak_price) * 100
-                max_price_above_peak_percent = 1.5  # Max 1.5% above detected peak
+                # Calculate how much above/below peak the current ASK is
+                price_vs_peak_percent = ((ask - peak_price) / peak_price) * 100
                 
-                if price_above_peak_percent > max_price_above_peak_percent:
+                # STRICT: Reject if entry is at or above peak (within 0.5% tolerance for rounding)
+                # This prevents entering when momentum has already peaked
+                if price_vs_peak_percent >= -0.5:
                     logger.info(
-                        f"Skipping {ticker}: entry ASK ${ask:.4f} is {price_above_peak_percent:.2f}% above "
-                        f"detected peak ${peak_price:.4f} (max: {max_price_above_peak_percent}%) - momentum may have peaked"
+                        f"Skipping {ticker}: entry ASK ${ask:.4f} is at or above detected peak ${peak_price:.4f} "
+                        f"({price_vs_peak_percent:.2f}%) - momentum has already peaked"
                     )
                     await cls._log_selected_ticker_entry_failure(
                         ticker,
                         momentum_score,
                         action,
-                        f"Entry price ${ask:.4f} too far above detected peak ${peak_price:.4f} ({price_above_peak_percent:.2f}%)",
+                        f"Entry price ${ask:.4f} at or above detected peak ${peak_price:.4f} ({price_vs_peak_percent:.2f}%)",
+                    )
+                    return False
+                
+                # STRICT: Require entry to be meaningfully below peak (at least 1% below)
+                # This ensures we're entering during momentum build-up, not at the peak
+                min_below_peak_percent = 1.0  # Require at least 1% below peak
+                if price_vs_peak_percent > -min_below_peak_percent:
+                    logger.info(
+                        f"Skipping {ticker}: entry ASK ${ask:.4f} is only {abs(price_vs_peak_percent):.2f}% below "
+                        f"detected peak ${peak_price:.4f} (need at least {min_below_peak_percent}% below peak) - too close to peak"
+                    )
+                    await cls._log_selected_ticker_entry_failure(
+                        ticker,
+                        momentum_score,
+                        action,
+                        f"Entry price ${ask:.4f} too close to peak ${peak_price:.4f} (only {abs(price_vs_peak_percent):.2f}% below, need {min_below_peak_percent}%)",
                     )
                     return False
 
