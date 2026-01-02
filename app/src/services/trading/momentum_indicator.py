@@ -1738,21 +1738,32 @@ class MomentumIndicator(BaseTradingIndicator):
             )
             return False
 
-        # NEW: Recent average peak validation - don't enter if current price is significantly above recent_avg
+        # NEW: Recent average peak validation - don't enter if current price is at, above, or too close to recent_avg
         # This prevents entering after momentum has already peaked
-        # For PFSA case: recent_avg was 0.12, but entry was at 0.13 (8.3% above) - too late
+        # FIXED: Made stricter - reject entries at/above recent_avg or too close to recent_avg (like penny stocks)
         if is_long:
             recent_avg = cls._extract_recent_avg_from_reason(reason)
             if recent_avg and recent_avg > 0:
-                # Calculate how much above recent_avg the current entry price is
-                price_above_recent_avg_percent = ((enter_price - recent_avg) / recent_avg) * 100
-                # Stricter threshold for ultra-low price stocks (< $0.20) - they're more volatile
-                max_price_above_recent_avg = 3.0 if enter_price < 0.20 else 5.0
+                # Calculate how much above/below recent_avg the current entry price is
+                price_vs_recent_avg_percent = ((enter_price - recent_avg) / recent_avg) * 100
                 
-                if price_above_recent_avg_percent > max_price_above_recent_avg:
+                # STRICT: Reject if entry is at or above recent_avg (within 0.5% tolerance for rounding)
+                # This prevents entering when momentum has already peaked
+                if price_vs_recent_avg_percent >= -0.5:
                     logger.info(
-                        f"Skipping {ticker}: entry price ${enter_price:.4f} is {price_above_recent_avg_percent:.2f}% above "
-                        f"recent_avg ${recent_avg:.4f} (max: {max_price_above_recent_avg}%) - momentum may have peaked"
+                        f"Skipping {ticker}: entry price ${enter_price:.4f} is at or above recent_avg ${recent_avg:.4f} "
+                        f"({price_vs_recent_avg_percent:.2f}%) - momentum has already peaked"
+                    )
+                    return False
+                
+                # STRICT: Require entry to be meaningfully below recent_avg (at least 1% below)
+                # This ensures we're entering during momentum build-up, not at the peak
+                # Stricter for ultra-low price stocks (< $0.20)
+                min_below_recent_avg = 1.0 if enter_price < 0.20 else 1.0  # 1% for all stocks
+                if price_vs_recent_avg_percent > -min_below_recent_avg:
+                    logger.info(
+                        f"Skipping {ticker}: entry price ${enter_price:.4f} is only {abs(price_vs_recent_avg_percent):.2f}% below "
+                        f"recent_avg ${recent_avg:.4f} (need at least {min_below_recent_avg}% below recent_avg) - too close to peak"
                     )
                     return False
 
