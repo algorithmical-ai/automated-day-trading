@@ -568,3 +568,214 @@ class DailyPerformanceMetrics:
             "profit_factor": f"{self.profit_factor:.2f}",
             "spread_induced_losses": self.spread_induced_losses,
         }
+
+
+class EnhancedExitDecisionEngine(ExitDecisionEngine):
+    """Enhanced exit decision engine with tighter initial stop losses.
+    
+    Extends the base ExitDecisionEngine with:
+    - Tighter stop loss (-5%) during initial 3-minute period
+    - Early exit (-3% loss within first 2 minutes)
+    - Emergency exit during initial period (-5% within 3 minutes)
+    
+    Priority order:
+    1. Emergency exit on -8% loss (always active)
+    2. Early exit: -3% loss within first 2 minutes
+    3. Initial period stop: -5% loss within first 3 minutes
+    4. Standard ATR-based stop (after initial period)
+    5. Trailing stop for profitable trades
+    6. Trend reversal detection
+    """
+    
+    # Initial period configuration - tighter stops for quick reversals
+    INITIAL_PERIOD_SECONDS: int = 180  # 3 minutes
+    INITIAL_STOP_LOSS_PERCENT: float = -5.0  # Tighter stop during initial period
+    EARLY_EXIT_LOSS_PERCENT: float = -3.0  # Very early exit threshold
+    EARLY_EXIT_TIME_SECONDS: int = 120  # 2 minutes for early exit
+    
+    def __init__(self, config=None):
+        """Initialize with optional configuration.
+        
+        Args:
+            config: PeakDetectionConfig object (optional)
+        """
+        super().__init__()
+        
+        # Apply config if provided
+        if config:
+            self.INITIAL_PERIOD_SECONDS = config.initial_period_seconds
+            self.INITIAL_STOP_LOSS_PERCENT = config.initial_stop_loss_percent
+            self.EARLY_EXIT_LOSS_PERCENT = config.early_exit_loss_percent
+            self.EARLY_EXIT_TIME_SECONDS = config.early_exit_time_seconds
+            self.EMERGENCY_STOP_PERCENT = config.emergency_stop_percent
+    
+    def evaluate_exit(
+        self,
+        ticker: str,
+        entry_price: float,
+        breakeven_price: float,
+        current_price: float,
+        peak_price: float,
+        atr_stop_percent: float,
+        holding_seconds: float,
+        is_long: bool,
+        spread_percent: float,
+        recent_bars: Optional[List[Dict[str, Any]]] = None
+    ) -> ExitDecision:
+        """Enhanced exit evaluation with tighter initial stops.
+        
+        Priority order:
+        1. Emergency exit on -8% loss (always active)
+        2. Early exit: -3% loss within first 2 minutes
+        3. Initial period stop: -5% loss within first 3 minutes
+        4. Standard ATR-based stop (after initial period)
+        5. Trailing stop for profitable trades
+        6. Trend reversal detection
+        
+        Args:
+            ticker: Stock ticker symbol
+            entry_price: Original entry price
+            breakeven_price: Breakeven price accounting for spread
+            current_price: Current market price
+            peak_price: Peak price since entry
+            atr_stop_percent: ATR-based stop loss percentage (negative)
+            holding_seconds: Seconds since trade entry
+            is_long: True for long positions
+            spread_percent: Bid-ask spread at entry as percentage
+            recent_bars: Optional list of recent price bars
+            
+        Returns:
+            ExitDecision with should_exit, reason, exit_type, and is_spread_induced
+        """
+        profit_vs_entry = self._calc_profit(entry_price, current_price, is_long)
+        profit_vs_breakeven = self._calc_profit(breakeven_price, current_price, is_long)
+        
+        # PRIORITY 1: Emergency exit on significant loss (always active)
+        if profit_vs_entry <= self.EMERGENCY_STOP_PERCENT:
+            is_spread_induced = abs(profit_vs_entry) <= spread_percent * 1.5
+            return ExitDecision(
+                should_exit=True,
+                reason=f"Emergency stop: {profit_vs_entry:.2f}% loss",
+                exit_type='emergency',
+                is_spread_induced=is_spread_induced
+            )
+        
+        # PRIORITY 2: Early exit - very quick loss within first 2 minutes
+        # This catches trades that immediately reverse after entry
+        if holding_seconds < self.EARLY_EXIT_TIME_SECONDS:
+            if profit_vs_entry <= self.EARLY_EXIT_LOSS_PERCENT:
+                is_spread_induced = abs(profit_vs_entry) <= spread_percent * 1.5
+                return ExitDecision(
+                    should_exit=True,
+                    reason=f"Early exit: {profit_vs_entry:.2f}% loss within {holding_seconds:.0f}s (threshold: {self.EARLY_EXIT_LOSS_PERCENT}%)",
+                    exit_type='early_exit',
+                    is_spread_induced=is_spread_induced
+                )
+        
+        # PRIORITY 3: Initial period tight stop - tighter stop during first 3 minutes
+        if holding_seconds < self.INITIAL_PERIOD_SECONDS:
+            if profit_vs_entry <= self.INITIAL_STOP_LOSS_PERCENT:
+                is_spread_induced = abs(profit_vs_entry) <= spread_percent * 1.5
+                return ExitDecision(
+                    should_exit=True,
+                    reason=f"Initial period stop: {profit_vs_entry:.2f}% loss (threshold: {self.INITIAL_STOP_LOSS_PERCENT}%)",
+                    exit_type='initial_stop',
+                    is_spread_induced=is_spread_induced
+                )
+            
+            # During initial period, don't use ATR stop - use tighter initial stop
+            # But still allow trailing stops and trend reversal detection
+            
+            # Check trailing stop for profitable trades during initial period
+            if profit_vs_breakeven >= 0.5:
+                trailing_stop_price = TieredTrailingStop.get_trailing_stop_price(
+                    peak_price, profit_vs_breakeven, breakeven_price, is_long
+                )
+                if trailing_stop_price:
+                    triggered = (current_price <= trailing_stop_price) if is_long else (current_price >= trailing_stop_price)
+                    if triggered:
+                        locked_profit = self._calc_profit(breakeven_price, trailing_stop_price, is_long)
+                        return ExitDecision(
+                            should_exit=True,
+                            reason=f"Trailing stop (initial period): ${trailing_stop_price:.4f} (locking {locked_profit:.2f}%)",
+                            exit_type='trailing_stop'
+                        )
+            
+            # Not exiting during initial period
+            return ExitDecision(
+                should_exit=False,
+                reason=f"Initial period ({holding_seconds:.0f}s < {self.INITIAL_PERIOD_SECONDS}s), profit: {profit_vs_entry:.2f}%",
+                exit_type='none'
+            )
+        
+        # PRIORITY 4: After initial period - use standard ATR-based stop
+        if profit_vs_breakeven <= atr_stop_percent:
+            self.consecutive_loss_checks[ticker] = self.consecutive_loss_checks.get(ticker, 0) + 1
+            
+            if self.consecutive_loss_checks[ticker] >= self.CONSECUTIVE_CHECKS_REQUIRED:
+                is_spread_induced = abs(profit_vs_entry) <= spread_percent * 1.5
+                self.consecutive_loss_checks[ticker] = 0
+                return ExitDecision(
+                    should_exit=True,
+                    reason=f"ATR stop loss: {profit_vs_breakeven:.2f}% (threshold: {atr_stop_percent:.2f}%)",
+                    exit_type='stop_loss',
+                    is_spread_induced=is_spread_induced
+                )
+            else:
+                return ExitDecision(
+                    should_exit=False,
+                    reason=f"Loss warning {self.consecutive_loss_checks[ticker]}/{self.CONSECUTIVE_CHECKS_REQUIRED}",
+                    exit_type='none'
+                )
+        else:
+            self.consecutive_loss_checks[ticker] = 0
+        
+        # PRIORITY 5: Trailing stop for profitable trades
+        if profit_vs_breakeven >= 0.5:
+            trailing_stop_price = TieredTrailingStop.get_trailing_stop_price(
+                peak_price, profit_vs_breakeven, breakeven_price, is_long
+            )
+            if trailing_stop_price:
+                triggered = (current_price <= trailing_stop_price) if is_long else (current_price >= trailing_stop_price)
+                if triggered:
+                    locked_profit = self._calc_profit(breakeven_price, trailing_stop_price, is_long)
+                    return ExitDecision(
+                        should_exit=True,
+                        reason=f"Trailing stop triggered at ${trailing_stop_price:.4f} (locking in {locked_profit:.2f}% profit)",
+                        exit_type='trailing_stop'
+                    )
+        
+        # PRIORITY 6: Trend reversal detection (for profitable trades)
+        if profit_vs_breakeven >= 1.0 and recent_bars and len(recent_bars) >= self.TREND_REVERSAL_BARS:
+            is_reversing = self._detect_trend_reversal(recent_bars, is_long, peak_price, current_price)
+            if is_reversing:
+                drop_from_peak = self._calc_profit(peak_price, current_price, is_long)
+                if drop_from_peak <= -self.TREND_REVERSAL_THRESHOLD:
+                    return ExitDecision(
+                        should_exit=True,
+                        reason=f"Trend reversal: dropped {abs(drop_from_peak):.2f}% from peak (locking {profit_vs_breakeven:.2f}%)",
+                        exit_type='trend_reversal'
+                    )
+        
+        return ExitDecision(
+            should_exit=False,
+            reason=f"Holding: profit {profit_vs_breakeven:.2f}%",
+            exit_type='none'
+        )
+    
+    def get_effective_stop_loss(self, holding_seconds: float, atr_stop_percent: float) -> float:
+        """Get the effective stop loss percentage based on holding time.
+        
+        Args:
+            holding_seconds: Seconds since trade entry
+            atr_stop_percent: ATR-based stop loss percentage
+            
+        Returns:
+            Effective stop loss percentage (negative)
+        """
+        if holding_seconds < self.EARLY_EXIT_TIME_SECONDS:
+            return self.EARLY_EXIT_LOSS_PERCENT
+        elif holding_seconds < self.INITIAL_PERIOD_SECONDS:
+            return self.INITIAL_STOP_LOSS_PERCENT
+        else:
+            return atr_stop_percent

@@ -34,9 +34,19 @@ from app.src.services.trading.penny_stock_utils import (
     ATRCalculator,
     TieredTrailingStop,
     ExitDecisionEngine,
+    EnhancedExitDecisionEngine,
     ExitDecision,
     DailyPerformanceMetrics,
 )
+from app.src.services.trading.peak_detection_config import PeakDetectionConfig, DEFAULT_CONFIG
+from app.src.services.trading.enhanced_validation_pipeline import (
+    EnhancedValidationPipeline,
+    get_validation_pipeline,
+)
+from app.src.services.trading.dynamic_position_sizer import DynamicPositionSizer
+from app.src.services.trading.peak_detector import PeakDetector
+from app.src.services.trading.volume_analyzer import VolumeAnalyzer
+from app.src.services.trading.momentum_acceleration_analyzer import MomentumAccelerationAnalyzer
 
 
 class PennyStocksIndicator(BaseTradingIndicator):
@@ -137,7 +147,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
     _traded_tickers_today: set = set()  # Tickers that have been traded today (win or lose)
 
     # Exit decision engine instance (shared across exit cycles)
-    _exit_engine: Optional[ExitDecisionEngine] = None
+    _exit_engine: Optional[EnhancedExitDecisionEngine] = None
 
     # Daily performance metrics
     _daily_metrics: Optional[DailyPerformanceMetrics] = None
@@ -329,17 +339,14 @@ class PennyStocksIndicator(BaseTradingIndicator):
         collector: RejectionCollector,
     ) -> bool:
         """
-        Validate ticker using SIMPLIFIED validation for penny stocks.
+        Validate ticker using ENHANCED validation for penny stocks.
 
-        PHILOSOPHY: Alpaca's gainers/most_actives ARE the momentum signal.
-        We trust that signal and only do minimal validation:
+        IMPROVED VALIDATION (Jan 2026):
         1. Have at least 3 bars (minimal data quality)
         2. Valid bid/ask spread (can actually trade)
         3. Continuation score meets minimum threshold (avoids entering at trend peaks)
-
-        We DON'T over-filter with:
-        - Complex momentum thresholds (Alpaca already screened for momentum)
-        - Price extreme rules (penny stocks are volatile by nature)
+        4. NEW: Peak detection - reject if price is at/near local peak
+        5. NEW: Momentum deceleration - reject if momentum is slowing down
 
         Args:
             ticker: Stock ticker symbol
@@ -426,7 +433,49 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 )
                 return False
 
-        # PASSED - Trust Alpaca's gainer/most_active signal
+        # 5. NEW: Peak detection - reject if price is at/near local peak
+        # This prevents entering trades like BTTC and CCHH that immediately reversed
+        current_price = (quote_data.bid + quote_data.ask) / 2.0
+        should_reject_peak, peak_reason, peak_result = PeakDetector.should_reject_entry(
+            bars=bars,
+            current_price=current_price,
+            config=DEFAULT_CONFIG,
+        )
+        if should_reject_peak:
+            collector.add_rejection(
+                ticker=ticker,
+                indicator=cls.indicator_name(),
+                reason_long=peak_reason if trend_metrics and trend_metrics.momentum_score > 0 else None,
+                reason_short=peak_reason if trend_metrics and trend_metrics.momentum_score < 0 else None,
+                technical_indicators={
+                    **(trend_metrics.to_dict() if trend_metrics else {}),
+                    "peak_proximity_score": peak_result.peak_proximity_score,
+                    "peak_price": peak_result.peak_price,
+                },
+            )
+            return False
+
+        # 6. NEW: Momentum deceleration - reject if momentum is slowing down
+        # This catches trades at the end of a move before they reverse
+        should_reject_decel, decel_reason, accel_result = MomentumAccelerationAnalyzer.should_reject_entry(
+            bars=bars,
+            config=DEFAULT_CONFIG,
+        )
+        if should_reject_decel:
+            collector.add_rejection(
+                ticker=ticker,
+                indicator=cls.indicator_name(),
+                reason_long=decel_reason if trend_metrics and trend_metrics.momentum_score > 0 else None,
+                reason_short=decel_reason if trend_metrics and trend_metrics.momentum_score < 0 else None,
+                technical_indicators={
+                    **(trend_metrics.to_dict() if trend_metrics else {}),
+                    "momentum_acceleration": accel_result.acceleration,
+                    "is_decelerating": accel_result.is_decelerating,
+                },
+            )
+            return False
+
+        # PASSED - All enhanced validation checks passed
         return True
 
     @classmethod
@@ -1735,16 +1784,75 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 "atr": atr if atr else 0.0,
             }
 
-        # Calculate confidence score (0.0 to 1.0)
+        # Calculate confidence score using ENHANCED calculator (0.0 to 1.0)
+        # This incorporates peak proximity, volume confirmation, and momentum acceleration
         peak_price = cls._extract_peak_price_from_reason(reason)
-        confidence_score = cls._calculate_confidence_score(
-            momentum_score=momentum_score,
-            peak_price=peak_price,
-            enter_price=enter_price,
-            spread_percent=spread_percent,
-            volume=technical_indicators.get("volume", 0),
-            rank=rank,
+        
+        # Get peak detection result for enhanced confidence
+        peak_result = PeakDetector.detect_peak(
+            bars=ticker_bars,
+            current_price=enter_price,
+            config=DEFAULT_CONFIG,
         )
+        
+        # Get volume confirmation result
+        volume_result = VolumeAnalyzer.analyze_volume(
+            bars=ticker_bars,
+            config=DEFAULT_CONFIG,
+        )
+        
+        # Get momentum acceleration result
+        accel_result = MomentumAccelerationAnalyzer.analyze_acceleration(
+            bars=ticker_bars,
+            config=DEFAULT_CONFIG,
+        )
+        
+        # Calculate enhanced confidence score
+        from app.src.services.trading.enhanced_confidence_calculator import EnhancedConfidenceCalculator
+        confidence_result = EnhancedConfidenceCalculator.calculate_confidence(
+            momentum_score=momentum_score,
+            peak_proximity_score=peak_result.peak_proximity_score,
+            volume_confirmation_score=volume_result.volume_confirmation_score,
+            momentum_acceleration=accel_result.normalized_acceleration,
+            config=DEFAULT_CONFIG,
+        )
+        confidence_score = confidence_result.confidence_score
+        
+        # Check if confidence is too low - reject entry
+        if confidence_result.rejection_reason:
+            logger.info(f"Skipping {ticker}: {confidence_result.rejection_reason}")
+            await cls._log_selected_ticker_entry_failure(
+                ticker,
+                momentum_score,
+                action,
+                confidence_result.rejection_reason,
+            )
+            return False
+        
+        # Calculate position size based on confidence
+        # Use a standard position size of $500 for penny stocks
+        STANDARD_POSITION_SIZE = 500.0
+        position_result = DynamicPositionSizer.calculate_position_size(
+            standard_position_size=STANDARD_POSITION_SIZE,
+            confidence_score=confidence_score,
+            config=DEFAULT_CONFIG,
+        )
+        
+        # Check if position sizing rejected (shouldn't happen if confidence check passed)
+        if position_result.position_size_dollars == 0:
+            logger.info(f"Skipping {ticker}: {position_result.reason}")
+            await cls._log_selected_ticker_entry_failure(
+                ticker,
+                momentum_score,
+                action,
+                position_result.reason,
+            )
+            return False
+        
+        # Add position sizing info to technical indicators
+        technical_indicators["position_size_dollars"] = position_result.position_size_dollars
+        technical_indicators["position_size_percent"] = position_result.position_size_percent
+        technical_indicators["confidence_components"] = confidence_result.components.to_dict()
 
         await send_signal_to_webhook(
             ticker=ticker,
@@ -1897,7 +2005,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         # Initialize exit engine and daily metrics if needed
         if cls._exit_engine is None:
-            cls._exit_engine = ExitDecisionEngine()
+            cls._exit_engine = EnhancedExitDecisionEngine(config=DEFAULT_CONFIG)
         if cls._daily_metrics is None:
             cls._daily_metrics = DailyPerformanceMetrics()
 
