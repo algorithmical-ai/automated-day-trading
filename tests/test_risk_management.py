@@ -18,20 +18,20 @@ class TestStopLossCalculation:
     def test_stop_loss_penny_stock_within_bounds(self):
         """Test stop loss for penny stock with ATR resulting in value within bounds"""
         # Entry price: $3.00, ATR: $0.15 (5% of price)
-        # 2.0x ATR = 10%, should be capped to -8% (max for penny stocks)
+        # 2.0x ATR = 10%, should be capped to -2% (max for penny stocks)
         result = RiskManagement.calculate_stop_loss(
             entry_price=3.0, atr=0.15, is_penny_stock=True
         )
-        assert result == -8.0
+        assert result == -2.0
 
     def test_stop_loss_penny_stock_below_min(self):
         """Test stop loss for penny stock with low ATR"""
         # Entry price: $4.00, ATR: $0.04 (1% of price)
-        # 2.0x ATR = 2%, should be capped to -4% (min for penny stocks)
+        # 2.0x ATR = 2%, should be capped to -2% (min for penny stocks)
         result = RiskManagement.calculate_stop_loss(
             entry_price=4.0, atr=0.04, is_penny_stock=True
         )
-        assert result == -4.0
+        assert result == -2.0
 
     def test_stop_loss_standard_stock_within_bounds(self):
         """Test stop loss for standard stock"""
@@ -55,7 +55,7 @@ class TestStopLossCalculation:
         """Test automatic penny stock detection"""
         # Price < $5 should be detected as penny stock
         result = RiskManagement.calculate_stop_loss(entry_price=3.0, atr=0.15)
-        assert -8.0 <= result <= -4.0
+        assert result == -2.0  # Now fixed at 2% for penny stocks
 
     def test_stop_loss_auto_detect_standard_stock(self):
         """Test automatic standard stock detection"""
@@ -239,30 +239,22 @@ class TestPricingLogic:
 
     def test_get_entry_price_long(self):
         """Test entry price for long position (should use ask)"""
-        price = RiskManagement.get_entry_price(
-            direction="long", bid=100.0, ask=100.5
-        )
+        price = RiskManagement.get_entry_price(direction="long", bid=100.0, ask=100.5)
         assert price == 100.5  # Ask price
 
     def test_get_entry_price_short(self):
         """Test entry price for short position (should use bid)"""
-        price = RiskManagement.get_entry_price(
-            direction="short", bid=100.0, ask=100.5
-        )
+        price = RiskManagement.get_entry_price(direction="short", bid=100.0, ask=100.5)
         assert price == 100.0  # Bid price
 
     def test_get_exit_price_long(self):
         """Test exit price for long position (should use bid)"""
-        price = RiskManagement.get_exit_price(
-            direction="long", bid=100.0, ask=100.5
-        )
+        price = RiskManagement.get_exit_price(direction="long", bid=100.0, ask=100.5)
         assert price == 100.0  # Bid price
 
     def test_get_exit_price_short(self):
         """Test exit price for short position (should use ask)"""
-        price = RiskManagement.get_exit_price(
-            direction="short", bid=100.0, ask=100.5
-        )
+        price = RiskManagement.get_exit_price(direction="short", bid=100.0, ask=100.5)
         assert price == 100.5  # Ask price
 
     def test_get_entry_price_case_insensitive(self):

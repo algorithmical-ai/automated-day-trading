@@ -77,17 +77,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
     max_stock_price: float = 5.0  # Only trade stocks < $5
     min_stock_price: float = 0.75  # INCREASED: Avoid ultra-low penny stocks (was 0.50)
 
-    # MUCH WIDER STOPS - penny stocks swing 3-5% routinely
-    trailing_stop_percent: float = 2.0  # WIDENED: Base trailing stop (was 1.0%)
-    profit_threshold: float = (
-        2.5  # INCREASED: Exit at 2.5% profit (was 1.5%) - need bigger wins
-    )
-    immediate_loss_exit_threshold: float = (
-        -2.0
-    )  # TIGHTENED: Emergency stop at -2.0% to limit losses
-    default_atr_stop_percent: float = (
-        -2.0
-    )  # TIGHTENED: Default ATR-based stop loss to limit losses
+    # SIMPLE TRAILING STOP - exits when price drops 2% from peak
+    # This handles both profit-taking (when price reverses from high) and stop loss (2% from entry)
+    # Since entry price is the initial peak, a 2% drop from peak = 2% stop loss from entry
+    trailing_stop_percent: float = 2.0  # Exit when price drops 2% from peak
 
     top_k: int = 1  # Only top 1 ticker to reduce exposure
     min_momentum_threshold: float = (
@@ -137,13 +130,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
     )
     recent_bars_for_trend: int = 5  # Use last 5 bars to determine trend
 
-    # ATR configuration for volatility-based stops - MUCH WIDER for penny stocks
-    atr_period: int = 14  # Period for ATR calculation
-    atr_multiplier: float = (
-        3.5  # INCREASED: ATR multiplier (was 3.0) - penny stocks need MORE room
-    )
-    atr_stop_min: float = -2.0  # TIGHTENED: Minimum stop loss - FLOOR at 2%
-    atr_stop_max: float = -2.0  # TIGHTENED: Maximum stop loss - CAP at 2%
+    # No longer using ATR-based stops - simple 2% trailing stop handles everything
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
@@ -2232,41 +2219,39 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     ),
                 )
 
-            # IMPROVED: Get recent bars for trend reversal detection
-            bars_data_for_exit = await AlpacaClient.get_market_data(
-                ticker, limit=cls.recent_bars_for_trend + 5
-            )
-            recent_bars = []
-            if bars_data_for_exit:
-                bars_dict = bars_data_for_exit.get("bars", {})
-                ticker_bars = bars_dict.get(ticker, [])
-                if ticker_bars:
-                    recent_bars = (
-                        ticker_bars[-cls.recent_bars_for_trend :]
-                        if len(ticker_bars) >= cls.recent_bars_for_trend
-                        else ticker_bars
-                    )
-
-            # Use ExitDecisionEngine for exit decision with trend reversal detection
-            exit_decision: ExitDecision = cls._exit_engine.evaluate_exit(
-                ticker=ticker,
-                entry_price=enter_price,
-                breakeven_price=breakeven_price,
-                current_price=current_price,
-                peak_price=peak_price,
-                atr_stop_percent=atr_stop_percent,
-                holding_seconds=holding_seconds,
-                is_long=is_long,
-                spread_percent=spread_percent,
-                recent_bars=recent_bars,  # IMPROVED: Pass recent bars for trend reversal detection
-            )
-
             # Calculate current profit for logging and tracking
             profit_percent = cls._calculate_profit_percent(
                 enter_price, current_price, original_action
             )
 
-            if not exit_decision.should_exit:
+            # SIMPLE TRAILING STOP LOGIC
+            # Exit when price drops 2% from peak
+            # Since entry price is the initial peak, this also acts as 2% stop loss
+            should_exit = False
+            exit_reason = ""
+
+            if is_long:
+                # For longs: exit when price drops 2% below peak
+                trailing_stop_price = peak_price * (1 - cls.trailing_stop_percent / 100)
+                if current_price <= trailing_stop_price:
+                    should_exit = True
+                    drop_from_peak = ((peak_price - current_price) / peak_price) * 100
+                    exit_reason = (
+                        f"Trailing stop: price ${current_price:.4f} dropped "
+                        f"{drop_from_peak:.2f}% from peak ${peak_price:.4f}"
+                    )
+            else:
+                # For shorts: exit when price rises 2% above peak (lowest price)
+                trailing_stop_price = peak_price * (1 + cls.trailing_stop_percent / 100)
+                if current_price >= trailing_stop_price:
+                    should_exit = True
+                    rise_from_peak = ((current_price - peak_price) / peak_price) * 100
+                    exit_reason = (
+                        f"Trailing stop: price ${current_price:.4f} rose "
+                        f"{rise_from_peak:.2f}% from peak ${peak_price:.4f}"
+                    )
+
+            if not should_exit:
                 # Update peak profit in database
                 new_peak = max(peak_profit_percent, profit_percent)
                 await DynamoDBClient.update_momentum_trade_trailing_stop(
@@ -2274,18 +2259,19 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     indicator=cls.indicator_name(),
                     trailing_stop=cls.trailing_stop_percent,
                     peak_profit_percent=new_peak,
-                    skipped_exit_reason=exit_decision.reason,
+                    skipped_exit_reason=f"Holding: profit {profit_percent:.2f}%",
                 )
                 logger.debug(
-                    f"{ticker}: {exit_decision.reason} (profit: {profit_percent:.2f}%)"
+                    f"{ticker}: Holding (profit: {profit_percent:.2f}%, "
+                    f"peak: ${peak_price:.4f}, stop: ${trailing_stop_price:.4f})"
                 )
                 continue
 
             # Exit triggered
             exit_emoji = "💰" if profit_percent >= 0 else "🚨"
             logger.info(
-                f"{exit_emoji} Exit signal for {ticker}: {exit_decision.reason} "
-                f"(enter: ${enter_price:.4f}, current: ${current_price:.4f}, profit: {profit_percent:.2f}%)"
+                f"{exit_emoji} Exit signal for {ticker}: {exit_reason} "
+                f"(enter: ${enter_price:.4f}, profit: {profit_percent:.2f}%)"
             )
 
             # Get latest quote right before exit
@@ -2301,10 +2287,8 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 enter_price, exit_price, original_action
             )
 
-            # Record metrics
-            cls._daily_metrics.record_trade(
-                final_profit_percent, exit_decision.is_spread_induced
-            )
+            # Record metrics (trailing stop is not spread-induced)
+            cls._daily_metrics.record_trade(final_profit_percent, False)
 
             # IMPROVED: Mark ticker as traded (already done on entry, but ensure it's marked)
             cls._traded_tickers_today.add(ticker)
@@ -2312,13 +2296,8 @@ class PennyStocksIndicator(BaseTradingIndicator):
             # If trade ended in loss, mark ticker as losing for today
             if final_profit_percent < 0:
                 cls._losing_tickers_today.add(ticker)
-                loss_type = (
-                    "spread-induced"
-                    if exit_decision.is_spread_induced
-                    else "price movement"
-                )
                 logger.warning(
-                    f"📛 Marked {ticker} as losing ticker ({loss_type} loss: {final_profit_percent:.2f}%) - "
+                    f"📛 Marked {ticker} as losing ticker (loss: {final_profit_percent:.2f}%) - "
                     f"excluded from MAB selection for rest of day"
                 )
             else:
@@ -2331,29 +2310,24 @@ class PennyStocksIndicator(BaseTradingIndicator):
             bars_data = await AlpacaClient.get_market_data(
                 ticker, limit=cls.recent_bars_for_trend + 5
             )
-            technical_indicators_exit = {}
+            technical_indicators_exit = {
+                "exit_type": "trailing_stop",
+                "holding_seconds": holding_seconds,
+            }
             if bars_data:
                 bars_dict = bars_data.get("bars", {})
                 ticker_bars = bars_dict.get(ticker, [])
                 if ticker_bars:
                     latest_bar = ticker_bars[-1]
-                    technical_indicators_exit = {
-                        "close_price": latest_bar.get("c", 0.0),
-                        "volume": latest_bar.get("v", 0),
-                        "exit_type": exit_decision.exit_type,
-                        "is_spread_induced": exit_decision.is_spread_induced,
-                        "holding_seconds": holding_seconds,
-                    }
-
-            # Reset exit engine state for this ticker
-            cls._exit_engine.reset_ticker(ticker)
+                    technical_indicators_exit["close_price"] = latest_bar.get("c", 0.0)
+                    technical_indicators_exit["volume"] = latest_bar.get("v", 0)
 
             await cls._exit_trade(
                 ticker=ticker,
                 original_action=original_action,
                 enter_price=enter_price,
                 exit_price=exit_price,
-                exit_reason=exit_decision.reason,
+                exit_reason=exit_reason,
                 technical_indicators_enter=tech_indicators_enter,
                 technical_indicators_exit=technical_indicators_exit,
             )

@@ -12,7 +12,9 @@ from app.src.common.loguru_logger import logger
 from app.src.common.utils import measure_latency
 from app.src.common.memory_monitor import MemoryMonitor
 from app.src.common.alpaca import AlpacaClient
-from app.src.services.technical_analysis.technical_analysis_lib import TechnicalAnalysisLib
+from app.src.services.technical_analysis.technical_analysis_lib import (
+    TechnicalAnalysisLib,
+)
 from app.src.services.market_data.market_data_service import MarketDataService
 from app.src.services.mab.mab_service import MABService
 from app.src.db.dynamodb_client import DynamoDBClient
@@ -30,17 +32,11 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
     exceptional_entry_score: float = (
         0.75  # Exceptional entry score for golden tickers (lowered from 0.90)
     )
-    
-    # Penny stock trailing stop configuration
-    max_stock_price_for_penny_treatment: float = (
-        5.0  # Stocks under $5 get special handling (tight trailing stops)
-    )
-    penny_stock_trailing_stop_percent: float = (
-        1.0  # Exit penny stocks when profit drops 1.0% from peak (take profit quickly)
-    )
-    penny_stock_trailing_stop_activation_profit: float = (
-        0.5  # Activate trailing stop after +0.5% profit for penny stocks
-    )
+
+    # SIMPLE TRAILING STOP - exits when price drops 2% from peak
+    # This handles both profit-taking (when price reverses from high) and stop loss (2% from entry)
+    # Since entry price is the initial peak, a 2% drop from peak = 2% stop loss from entry
+    trailing_stop_percent: float = 2.0  # Exit when price drops 2% from peak
 
     @classmethod
     def indicator_name(cls) -> str:
@@ -51,45 +47,47 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
         """Adjust entry threshold based on market conditions"""
         # Get market-wide data (simplified - could use VIX or other indicators)
         base_threshold = 0.70
-        
+
         # During first/last hour, require stronger signals (more noise)
         est_tz = pytz.timezone("America/New_York")
         current_hour = datetime.now(est_tz).hour
         if current_hour == 9 or current_hour >= 15:
             base_threshold += 0.05
-        
+
         # Could add VIX-based adjustment here if VIX data is available
         # market_tide = await cls._get_market_volatility_index()
         # if market_tide.get("vix_level", 20) > 25:
         #     base_threshold += 0.05
         # elif market_tide.get("vix_level", 20) < 15:
         #     base_threshold -= 0.03
-        
+
         return min(0.85, max(0.60, base_threshold))
 
     @classmethod
     async def _check_portfolio_correlation(
-        cls,
-        new_ticker: str,
-        action: str,
-        active_trades: List[Dict]
+        cls, new_ticker: str, action: str, active_trades: List[Dict]
     ) -> Tuple[bool, str]:
         """Prevent over-concentration in correlated assets"""
         if not active_trades:
             return True, "First position"
-        
+
         # Simplified correlation check - count same-direction trades
         # In a full implementation, you'd check sectors, industries, etc.
         same_direction_count = sum(
-            1 for trade in active_trades
-            if trade.get("action") == action
+            1 for trade in active_trades if trade.get("action") == action
         )
-        
+
         max_same_direction = 3  # Max 3 positions in same direction
         if same_direction_count >= max_same_direction:
-            return False, f"Already have {same_direction_count} {action} positions (max: {max_same_direction})"
-        
-        return True, f"Correlation check passed ({same_direction_count} same-direction positions)"
+            return (
+                False,
+                f"Already have {same_direction_count} {action} positions (max: {max_same_direction})",
+            )
+
+        return (
+            True,
+            f"Correlation check passed ({same_direction_count} same-direction positions)",
+        )
 
     @classmethod
     def _is_golden_ticker(
@@ -245,21 +243,38 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             # Get current entry score to detect degradation
             market_data = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
             if market_data:
-                current_action, current_signal, _, _ = await cls._evaluate_ticker_for_entry(ticker, market_data)
-                
+                current_action, current_signal, _, _ = (
+                    await cls._evaluate_ticker_for_entry(ticker, market_data)
+                )
+
                 # Signal reversal detection
                 if current_signal:
                     current_score = current_signal.get("entry_score", 0)
-                    
+
                     # If entry score has dropped significantly, consider exiting
-                    if entry_score and current_score < entry_score * 0.5:  # Score dropped by 50%+
-                        return True, f"Entry score degraded: {entry_score:.2f} -> {current_score:.2f}", {"degradation": True}
-                    
+                    if (
+                        entry_score and current_score < entry_score * 0.5
+                    ):  # Score dropped by 50%+
+                        return (
+                            True,
+                            f"Entry score degraded: {entry_score:.2f} -> {current_score:.2f}",
+                            {"degradation": True},
+                        )
+
                     # If opposite signal now qualifies
-                    opposite_action = "sell_to_open" if action == "buy_to_open" else "buy_to_open"
-                    if current_action == opposite_action and current_score >= cls.min_entry_score:
-                        return True, f"Reversal signal detected: {opposite_action} score {current_score:.2f}", {"reversal": True}
-            
+                    opposite_action = (
+                        "sell_to_open" if action == "buy_to_open" else "buy_to_open"
+                    )
+                    if (
+                        current_action == opposite_action
+                        and current_score >= cls.min_entry_score
+                    ):
+                        return (
+                            True,
+                            f"Reversal signal detected: {opposite_action} score {current_score:.2f}",
+                            {"reversal": True},
+                        )
+
             # Fall back to MarketDataService exit logic
             # Convert action to exit action
             if action == "buy_to_open":
@@ -404,8 +419,10 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 if entry_score >= dynamic_threshold:
                     # Check portfolio correlation before adding to candidates
                     active_trades = await cls._get_active_trades()
-                    correlation_ok, correlation_reason = await cls._check_portfolio_correlation(
-                        ticker, action, active_trades
+                    correlation_ok, correlation_reason = (
+                        await cls._check_portfolio_correlation(
+                            ticker, action, active_trades
+                        )
                     )
                     if not correlation_ok:
                         stats["no_entry_signal"] += 1  # Reuse this stat
@@ -414,13 +431,21 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                             {
                                 "ticker": ticker,
                                 "indicator": cls.indicator_name(),
-                                "reason_not_to_enter_long": correlation_reason if action == "buy_to_open" else None,
-                                "reason_not_to_enter_short": correlation_reason if action == "sell_to_open" else None,
+                                "reason_not_to_enter_long": (
+                                    correlation_reason
+                                    if action == "buy_to_open"
+                                    else None
+                                ),
+                                "reason_not_to_enter_short": (
+                                    correlation_reason
+                                    if action == "sell_to_open"
+                                    else None
+                                ),
                                 "technical_indicators": technical_analysis,
                             }
                         )
                         continue
-                    
+
                     stats["passed"] += 1
                     ticker_candidates.append(
                         (ticker, entry_score, action, signal_data, reason)
@@ -636,16 +661,20 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             quote_response = await AlpacaClient.quote(ticker)
             enter_price = None
             quote_source = "none"
-            
+
             if quote_response:
                 quote_data = quote_response.get("quote", {})
                 quotes = quote_data.get("quotes", {})
                 ticker_quote = quotes.get(ticker, {})
                 is_long = action == "buy_to_open"
                 if is_long:
-                    enter_price = ticker_quote.get("ap", 0.0)  # Ask price for long entry
+                    enter_price = ticker_quote.get(
+                        "ap", 0.0
+                    )  # Ask price for long entry
                 else:
-                    enter_price = ticker_quote.get("bp", 0.0)  # Bid price for short entry
+                    enter_price = ticker_quote.get(
+                        "bp", 0.0
+                    )  # Bid price for short entry
                 quote_source = "alpaca"
 
             if enter_price is None or enter_price <= 0:
@@ -655,9 +684,7 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 long_entries_blocked["quote_failed"] += 1
                 continue
 
-            logger.debug(
-                f"Using Alpaca quote for {ticker} entry: ${enter_price:.4f}"
-            )
+            logger.debug(f"Using Alpaca quote for {ticker} entry: ${enter_price:.4f}")
 
             # Use the is_golden from daily limit check, or check signal_data if not already set
             if not is_golden:
@@ -770,16 +797,20 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
             quote_response = await AlpacaClient.quote(ticker)
             enter_price = None
             quote_source = "none"
-            
+
             if quote_response:
                 quote_data = quote_response.get("quote", {})
                 quotes = quote_data.get("quotes", {})
                 ticker_quote = quotes.get(ticker, {})
                 is_long = action == "buy_to_open"
                 if is_long:
-                    enter_price = ticker_quote.get("ap", 0.0)  # Ask price for long entry
+                    enter_price = ticker_quote.get(
+                        "ap", 0.0
+                    )  # Ask price for long entry
                 else:
-                    enter_price = ticker_quote.get("bp", 0.0)  # Bid price for short entry
+                    enter_price = ticker_quote.get(
+                        "bp", 0.0
+                    )  # Bid price for short entry
                 quote_source = "alpaca"
 
             if enter_price is None or enter_price <= 0:
@@ -910,189 +941,114 @@ class DeepAnalyzerIndicator(BaseTradingIndicator):
                 logger.warning(f"Invalid Deep Analyzer trade data: {trade}")
                 continue
 
-            # Get entry score from trade record if available
-            entry_score = None
-            if "entry_score" in trade:
-                entry_score = trade.get("entry_score")
-            elif "technical_indicators_for_enter" in trade:
-                # Try to extract from technical indicators
-                tech_indicators = trade.get("technical_indicators_for_enter", {})
-                if isinstance(tech_indicators, dict):
-                    entry_score = tech_indicators.get("entry_score")
-            
-            # Check penny stock trailing stop before MarketDataService evaluation
-            is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
+            # Get current price using Alpaca API
+            quote_response = await AlpacaClient.quote(ticker)
+            current_price = None
+            is_long = original_action == "buy_to_open"
+
+            if quote_response:
+                quote_data = quote_response.get("quote", {})
+                quotes = quote_data.get("quotes", {})
+                ticker_quote = quotes.get(ticker, {})
+                if is_long:
+                    current_price = ticker_quote.get("bp", 0.0)
+                else:
+                    current_price = ticker_quote.get("ap", 0.0)
+
+            if not current_price or current_price <= 0:
+                logger.warning(f"Failed to get quote for {ticker}")
+                continue
+
+            # Calculate current profit
+            profit_percent = cls._calculate_profit_percent(
+                enter_price, current_price, original_action
+            )
+
+            # Get peak profit from trade record
+            peak_profit_percent = float(trade.get("peak_profit_percent", 0.0))
+
+            # Track peak price for trailing stop
+            if is_long:
+                peak_price = max(
+                    enter_price,
+                    current_price,
+                    (
+                        enter_price * (1 + peak_profit_percent / 100)
+                        if peak_profit_percent > 0
+                        else enter_price
+                    ),
+                )
+            else:
+                peak_price = min(
+                    enter_price,
+                    current_price,
+                    (
+                        enter_price * (1 - peak_profit_percent / 100)
+                        if peak_profit_percent > 0
+                        else enter_price
+                    ),
+                )
+
+            # SIMPLE TRAILING STOP LOGIC
+            # Exit when price drops 2% from peak
             should_exit = False
             exit_reason = None
-            exit_data = None
-            
-            if is_penny_stock:
-                # Get current price for penny stock trailing stop check using Alpaca API
-                quote_response = await AlpacaClient.quote(ticker)
-                current_price = None
-                quote_source = "none"
-                
-                if quote_response:
-                    quote_data = quote_response.get("quote", {})
-                    quotes = quote_data.get("quotes", {})
-                    ticker_quote = quotes.get(ticker, {})
-                    is_long = original_action == "buy_to_open"
-                    if is_long:
-                        current_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
-                    else:
-                        current_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
-                    quote_source = "alpaca"
-                
-                if current_price and current_price > 0:
-                    # Calculate current profit
-                    profit_percent = cls._calculate_profit_percent(
-                        enter_price, current_price, original_action
+
+            if is_long:
+                trailing_stop_price = peak_price * (1 - cls.trailing_stop_percent / 100)
+                if current_price <= trailing_stop_price:
+                    should_exit = True
+                    drop = ((peak_price - current_price) / peak_price) * 100
+                    exit_reason = (
+                        f"Trailing stop: price ${current_price:.4f} dropped "
+                        f"{drop:.2f}% from peak ${peak_price:.4f}"
                     )
-                    
-                    # Get peak profit from trade record or use current as initial peak
-                    peak_profit_percent = float(trade.get("peak_profit_percent", profit_percent))
-                    if profit_percent > peak_profit_percent:
-                        peak_profit_percent = profit_percent
-                    
-                    # Check if trailing stop should activate (after +0.5% profit)
-                    if peak_profit_percent >= cls.penny_stock_trailing_stop_activation_profit:
-                        # Get latest quote right before trailing stop trigger check using Alpaca API
-                        quote_response = await AlpacaClient.quote(ticker)
-                        final_price = None
-                        final_quote_source = "none"
-                        
-                        if quote_response:
-                            quote_data = quote_response.get("quote", {})
-                            quotes = quote_data.get("quotes", {})
-                            ticker_quote = quotes.get(ticker, {})
-                            is_long = original_action == "buy_to_open"
-                            if is_long:
-                                final_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
-                            else:
-                                final_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
-                            final_quote_source = "alpaca"
-                        
-                        if final_price and final_price > 0:
-                            current_price = final_price  # Update to latest quote
-                            # Recalculate profit with latest price for trailing stop check
-                            profit_percent = cls._calculate_profit_percent(
-                                enter_price, current_price, original_action
-                            )
-                        
-                        # Check if profit dropped by 1% from peak
-                        drop_from_peak = peak_profit_percent - profit_percent
-                        if drop_from_peak >= cls.penny_stock_trailing_stop_percent:
-                            should_exit = True
-                            exit_reason = (
-                                f"Penny stock trailing stop triggered: profit dropped {drop_from_peak:.2f}% "
-                                f"from peak of {peak_profit_percent:.2f}% (current: {profit_percent:.2f}%, "
-                                f"trailing stop: {cls.penny_stock_trailing_stop_percent:.2f}%)"
-                            )
-                            exit_data = {"current_price": current_price}
-                            logger.info(
-                                f"Penny stock {ticker} (${enter_price:.2f}): {exit_reason} "
-                                f"(using {final_quote_source or quote_source} quote)"
-                            )
-            
-            # If penny stock trailing stop didn't trigger, evaluate with MarketDataService
+            else:
+                trailing_stop_price = peak_price * (1 + cls.trailing_stop_percent / 100)
+                if current_price >= trailing_stop_price:
+                    should_exit = True
+                    rise = ((current_price - peak_price) / peak_price) * 100
+                    exit_reason = (
+                        f"Trailing stop: price ${current_price:.4f} rose "
+                        f"{rise:.2f}% from peak ${peak_price:.4f}"
+                    )
+
             if not should_exit:
-                should_exit, exit_reason, exit_data = await cls._evaluate_ticker_for_exit(
+                # Update peak profit in database
+                new_peak = max(peak_profit_percent, profit_percent)
+                await DynamoDBClient.update_momentum_trade_trailing_stop(
                     ticker=ticker,
-                    enter_price=enter_price,
-                    action=original_action,
-                    entry_score=entry_score,
+                    indicator=cls.indicator_name(),
+                    trailing_stop=cls.trailing_stop_percent,
+                    peak_profit_percent=new_peak,
+                    skipped_exit_reason=f"Holding: profit {profit_percent:.2f}%",
                 )
-
-            if should_exit:
-                # Get current price from exit_data
-                exit_price = exit_data.get("current_price", 0.0) if exit_data else 0.0
-
-                if exit_price <= 0:
-                    # Fallback: get current price using Alpaca API
-                    quote_response = await AlpacaClient.quote(ticker)
-                    exit_price = None
-                    exit_quote_source = "none"
-                    
-                    if quote_response:
-                        quote_data = quote_response.get("quote", {})
-                        quotes = quote_data.get("quotes", {})
-                        ticker_quote = quotes.get(ticker, {})
-                        is_long = original_action == "buy_to_open"
-                        if is_long:
-                            exit_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
-                        else:
-                            exit_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
-                        exit_quote_source = "alpaca"
-
-                if exit_price is None or exit_price <= 0:
-                    logger.warning(f"Failed to get valid exit price for {ticker}")
-                    continue
-
-                logger.info(
-                    f"Exit signal for {ticker} - {exit_reason} "
-                    f"(enter: {enter_price}, exit: {exit_price})"
+                logger.debug(
+                    f"{ticker}: Holding (profit: {profit_percent:.2f}%, "
+                    f"peak: ${peak_price:.4f}, stop: ${trailing_stop_price:.4f})"
                 )
+                continue
 
-                # Get technical indicators for exit
-                technical_indicators_for_enter = trade.get(
-                    "technical_indicators_for_enter"
-                )
+            # Exit triggered - use current_price as exit_price
+            exit_price = current_price
+            exit_emoji = "💰" if profit_percent >= 0 else "🚨"
+            logger.info(
+                f"{exit_emoji} Exit signal for {ticker}: {exit_reason} "
+                f"(enter: ${enter_price:.4f}, profit: {profit_percent:.2f}%)"
+            )
 
-                technical_indicators_for_exit = None
-                if exit_data:
-                    # Extract indicators from exit_data if available
-                    indicators = exit_data.get("indicators", {})
-                    if indicators:
-                        technical_indicators_for_exit = indicators
+            # Get technical indicators for exit
+            technical_indicators_for_enter = trade.get("technical_indicators_for_enter")
+            technical_indicators_for_exit = {"exit_type": "trailing_stop"}
 
-                if not technical_indicators_for_exit:
-                    # Fallback: get from technical analysis directly
-                    market_data_response = await TechnicalAnalysisLib.calculate_all_indicators(ticker)
-                    if market_data_response:
-                        # TechnicalAnalysisLib returns indicators directly, not nested in "technical_analysis"
-                        technical_indicators_for_exit = market_data_response.copy()
-                        if "datetime_price" in technical_indicators_for_exit:
-                            technical_indicators_for_exit = {
-                                k: v
-                                for k, v in technical_indicators_for_exit.items()
-                                if k != "datetime_price"
-                            }
-
-                # Get latest quote right before exit using Alpaca API
-                quote_response = await AlpacaClient.quote(ticker)
-                latest_exit_price = None
-                latest_exit_quote_source = "none"
-                
-                if quote_response:
-                    quote_data = quote_response.get("quote", {})
-                    quotes = quote_data.get("quotes", {})
-                    ticker_quote = quotes.get(ticker, {})
-                    is_long = original_action == "buy_to_open"
-                    if is_long:
-                        latest_exit_price = ticker_quote.get("bp", 0.0)  # Bid price for long exit
-                    else:
-                        latest_exit_price = ticker_quote.get("ap", 0.0)  # Ask price for short exit
-                    latest_exit_quote_source = "alpaca"
-
-                if latest_exit_price and latest_exit_price > 0:
-                    exit_price = latest_exit_price  # Update to latest quote
-                    logger.debug(
-                        f"Using Alpaca quote for {ticker} exit: ${exit_price:.4f}"
-                    )
-                else:
-                    logger.warning(
-                        f"Failed to get latest exit quote for {ticker} from {latest_exit_quote_source}, "
-                        f"using previously fetched price ${exit_price:.4f}"
-                    )
-
-                await cls._exit_trade(
-                    ticker=ticker,
-                    original_action=original_action,
-                    enter_price=enter_price,
-                    exit_price=exit_price,
-                    exit_reason=exit_reason or "MarketDataService exit signal",
-                    technical_indicators_enter=technical_indicators_for_enter,
-                    technical_indicators_exit=technical_indicators_for_exit,
-                )
+            await cls._exit_trade(
+                ticker=ticker,
+                original_action=original_action,
+                enter_price=enter_price,
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                technical_indicators_enter=technical_indicators_for_enter,
+                technical_indicators_exit=technical_indicators_for_exit,
+            )
 
         await asyncio.sleep(cls.exit_cycle_seconds)
