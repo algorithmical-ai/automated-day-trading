@@ -442,11 +442,23 @@ class PennyStocksIndicator(BaseTradingIndicator):
             config=DEFAULT_CONFIG,
         )
         if should_reject_peak:
+            # Ensure at least one reason is provided
+            if trend_metrics and trend_metrics.momentum_score > 0:
+                reason_long = peak_reason
+                reason_short = None
+            elif trend_metrics and trend_metrics.momentum_score < 0:
+                reason_long = None
+                reason_short = peak_reason
+            else:
+                # If momentum is unclear, provide reason for both directions
+                reason_long = peak_reason
+                reason_short = peak_reason
+            
             collector.add_rejection(
                 ticker=ticker,
                 indicator=cls.indicator_name(),
-                reason_long=peak_reason if trend_metrics and trend_metrics.momentum_score > 0 else None,
-                reason_short=peak_reason if trend_metrics and trend_metrics.momentum_score < 0 else None,
+                reason_long=reason_long,
+                reason_short=reason_short,
                 technical_indicators={
                     **(trend_metrics.to_dict() if trend_metrics else {}),
                     "peak_proximity_score": peak_result.peak_proximity_score,
@@ -462,11 +474,23 @@ class PennyStocksIndicator(BaseTradingIndicator):
             config=DEFAULT_CONFIG,
         )
         if should_reject_decel:
+            # Ensure at least one reason is provided
+            if trend_metrics and trend_metrics.momentum_score > 0:
+                reason_long = decel_reason
+                reason_short = None
+            elif trend_metrics and trend_metrics.momentum_score < 0:
+                reason_long = None
+                reason_short = decel_reason
+            else:
+                # If momentum is unclear, provide reason for both directions
+                reason_long = decel_reason
+                reason_short = decel_reason
+            
             collector.add_rejection(
                 ticker=ticker,
                 indicator=cls.indicator_name(),
-                reason_long=decel_reason if trend_metrics and trend_metrics.momentum_score > 0 else None,
-                reason_short=decel_reason if trend_metrics and trend_metrics.momentum_score < 0 else None,
+                reason_long=reason_long,
+                reason_short=reason_short,
                 technical_indicators={
                     **(trend_metrics.to_dict() if trend_metrics else {}),
                     "momentum_acceleration": accel_result.acceleration,
