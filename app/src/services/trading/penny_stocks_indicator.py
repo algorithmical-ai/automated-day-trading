@@ -38,7 +38,10 @@ from app.src.services.trading.penny_stock_utils import (
     ExitDecision,
     DailyPerformanceMetrics,
 )
-from app.src.services.trading.peak_detection_config import PeakDetectionConfig, DEFAULT_CONFIG
+from app.src.services.trading.peak_detection_config import (
+    PeakDetectionConfig,
+    DEFAULT_CONFIG,
+)
 from app.src.services.trading.enhanced_validation_pipeline import (
     EnhancedValidationPipeline,
     get_validation_pipeline,
@@ -46,7 +49,9 @@ from app.src.services.trading.enhanced_validation_pipeline import (
 from app.src.services.trading.dynamic_position_sizer import DynamicPositionSizer
 from app.src.services.trading.peak_detector import PeakDetector
 from app.src.services.trading.volume_analyzer import VolumeAnalyzer
-from app.src.services.trading.momentum_acceleration_analyzer import MomentumAccelerationAnalyzer
+from app.src.services.trading.momentum_acceleration_analyzer import (
+    MomentumAccelerationAnalyzer,
+)
 
 
 class PennyStocksIndicator(BaseTradingIndicator):
@@ -78,11 +83,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
         2.5  # INCREASED: Exit at 2.5% profit (was 1.5%) - need bigger wins
     )
     immediate_loss_exit_threshold: float = (
-        -7.0
-    )  # WIDENED: Emergency stop at -7.0% (was -3.0%)
+        -2.0
+    )  # TIGHTENED: Emergency stop at -2.0% to limit losses
     default_atr_stop_percent: float = (
-        -4.0
-    )  # WIDENED: Default ATR-based stop loss (was -2.5%)
+        -2.0
+    )  # TIGHTENED: Default ATR-based stop loss to limit losses
 
     top_k: int = 1  # Only top 1 ticker to reduce exposure
     min_momentum_threshold: float = (
@@ -137,14 +142,16 @@ class PennyStocksIndicator(BaseTradingIndicator):
     atr_multiplier: float = (
         3.5  # INCREASED: ATR multiplier (was 3.0) - penny stocks need MORE room
     )
-    atr_stop_min: float = -4.0  # WIDENED: Minimum stop loss (was -3.0%) - FLOOR at 4%
-    atr_stop_max: float = -8.0  # WIDENED: Maximum stop loss (was -6.0%) - CAP at 8%
+    atr_stop_min: float = -2.0  # TIGHTENED: Minimum stop loss - FLOOR at 2%
+    atr_stop_max: float = -2.0  # TIGHTENED: Maximum stop loss - CAP at 2%
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
-    
+
     # IMPROVED: Track ALL traded tickers for the day (one entry per ticker per day)
-    _traded_tickers_today: set = set()  # Tickers that have been traded today (win or lose)
+    _traded_tickers_today: set = (
+        set()
+    )  # Tickers that have been traded today (win or lose)
 
     # Exit decision engine instance (shared across exit cycles)
     _exit_engine: Optional[EnhancedExitDecisionEngine] = None
@@ -292,10 +299,16 @@ class PennyStocksIndicator(BaseTradingIndicator):
             except Exception as e:
                 logger.warning(f"Failed to get memory config, using default: {e}")
                 max_concurrent = 10
-        
+
         # Ensure max_concurrent is a valid integer
-        if max_concurrent is None or not isinstance(max_concurrent, int) or max_concurrent <= 0:
-            logger.warning(f"Invalid max_concurrent value: {max_concurrent}, using default 10")
+        if (
+            max_concurrent is None
+            or not isinstance(max_concurrent, int)
+            or max_concurrent <= 0
+        ):
+            logger.warning(
+                f"Invalid max_concurrent value: {max_concurrent}, using default 10"
+            )
             max_concurrent = 10
 
         async def fetch_one(ticker: str) -> Tuple[str, Any]:
@@ -414,7 +427,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     indicator=cls.indicator_name(),
                     reason_long=reason,
                     reason_short=None,  # Short entry not applicable for upward trend
-                    technical_indicators=trend_metrics.to_dict() if trend_metrics else None,
+                    technical_indicators=(
+                        trend_metrics.to_dict() if trend_metrics else None
+                    ),
                 )
                 return False
         elif trend_metrics and trend_metrics.momentum_score < 0:
@@ -429,7 +444,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     indicator=cls.indicator_name(),
                     reason_long=None,  # Long entry not applicable for downward trend
                     reason_short=reason,
-                    technical_indicators=trend_metrics.to_dict() if trend_metrics else None,
+                    technical_indicators=(
+                        trend_metrics.to_dict() if trend_metrics else None
+                    ),
                 )
                 return False
 
@@ -453,7 +470,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 # If momentum is unclear, provide reason for both directions
                 reason_long = peak_reason
                 reason_short = peak_reason
-            
+
             collector.add_rejection(
                 ticker=ticker,
                 indicator=cls.indicator_name(),
@@ -469,9 +486,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         # 6. NEW: Momentum deceleration - reject if momentum is slowing down
         # This catches trades at the end of a move before they reverse
-        should_reject_decel, decel_reason, accel_result = MomentumAccelerationAnalyzer.should_reject_entry(
-            bars=bars,
-            config=DEFAULT_CONFIG,
+        should_reject_decel, decel_reason, accel_result = (
+            MomentumAccelerationAnalyzer.should_reject_entry(
+                bars=bars,
+                config=DEFAULT_CONFIG,
+            )
         )
         if should_reject_decel:
             # Ensure at least one reason is provided
@@ -485,7 +504,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 # If momentum is unclear, provide reason for both directions
                 reason_long = decel_reason
                 reason_short = decel_reason
-            
+
             collector.add_rejection(
                 ticker=ticker,
                 indicator=cls.indicator_name(),
@@ -681,7 +700,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
             cls._losing_tickers_today = set()
             cls._traded_tickers_today = set()  # IMPROVED: Reset all traded tickers
             cls._losing_tickers_date = today
-            logger.info("🔄 Reset losing tickers and traded tickers lists for new trading day")
+            logger.info(
+                "🔄 Reset losing tickers and traded tickers lists for new trading day"
+            )
 
         # Check daily limit
         daily_limit_reached = await cls._has_reached_daily_trade_limit()
@@ -705,12 +726,13 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         logger.info(f"Current active trades: {active_count}/{cls.max_active_trades}")
 
-        # IMPROVED: Filter out active tickers, those in cooldown, special securities, 
+        # IMPROVED: Filter out active tickers, those in cooldown, special securities,
         # losing tickers, AND all previously traded tickers (one entry per ticker per day)
         # Also check database to ensure persistence across restarts
         from datetime import date as date_class
+
         today_str = date_class.today().isoformat()
-        
+
         # Pre-filter using in-memory set (fast)
         candidates_to_fetch = [
             ticker
@@ -718,26 +740,28 @@ class PennyStocksIndicator(BaseTradingIndicator):
             if ticker not in active_ticker_set
             and not cls._is_ticker_in_cooldown(ticker)
             and not cls._is_special_security(ticker)
-            and ticker not in cls._losing_tickers_today  # Exclude tickers that showed loss today
-            and ticker not in cls._traded_tickers_today  # IMPROVED: Exclude all previously traded tickers
+            and ticker
+            not in cls._losing_tickers_today  # Exclude tickers that showed loss today
+            and ticker
+            not in cls._traded_tickers_today  # IMPROVED: Exclude all previously traded tickers
         ]
-        
+
         # Additional check: verify against database (prevents duplicate entries after restarts)
         # This is a safety check - the in-memory set should catch most cases
         verified_candidates = []
         for ticker in candidates_to_fetch:
             was_traded = await DynamoDBClient.was_ticker_traded_today(
-                date=today_str,
-                indicator=cls.indicator_name(),
-                ticker=ticker
+                date=today_str, indicator=cls.indicator_name(), ticker=ticker
             )
             if was_traded:
-                logger.debug(f"Excluding {ticker}: already traded today (found in database)")
+                logger.debug(
+                    f"Excluding {ticker}: already traded today (found in database)"
+                )
                 # Add to in-memory set to avoid checking again
                 cls._traded_tickers_today.add(ticker)
             else:
                 verified_candidates.append(ticker)
-        
+
         candidates_to_fetch = verified_candidates
 
         if cls._losing_tickers_today:
@@ -745,7 +769,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 f"Excluding {len(cls._losing_tickers_today)} losing tickers from today's selection: "
                 f"{list(cls._losing_tickers_today)[:10]}"  # Show first 10
             )
-        
+
         if cls._traded_tickers_today:
             logger.info(
                 f"Excluding {len(cls._traded_tickers_today)} previously traded tickers (one entry per ticker per day): "
@@ -1266,9 +1290,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
         Reason format: "...peak=$X.XXXX, bottom=$Y.YYYY..."
         """
         import re
+
         try:
             # Pattern to match "peak=$X.XXXX"
-            match = re.search(r'peak=\$([\d.]+)', reason)
+            match = re.search(r"peak=\$([\d.]+)", reason)
             if match:
                 return float(match.group(1))
         except (ValueError, AttributeError):
@@ -1276,21 +1301,23 @@ class PennyStocksIndicator(BaseTradingIndicator):
         return None
 
     @classmethod
-    def _check_immediate_momentum(cls, bars: List[Dict[str, Any]], is_long: bool) -> bool:
+    def _check_immediate_momentum(
+        cls, bars: List[Dict[str, Any]], is_long: bool
+    ) -> bool:
         """
         Check if the most recent 2-3 bars still show momentum in the correct direction.
         This catches reversals that happened between momentum calculation and entry.
-        
+
         Args:
             bars: List of price bars
             is_long: True for long positions (check upward momentum), False for short
-            
+
         Returns:
             True if immediate momentum is valid, False if reversal detected
         """
         if not bars or len(bars) < 2:
             return True  # If insufficient data, don't block entry
-        
+
         # Get last 2-3 bars for immediate check
         recent_bars = bars[-3:] if len(bars) >= 3 else bars[-2:]
         prices = []
@@ -1301,47 +1328,55 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     prices.append(float(close_price))
             except (ValueError, TypeError):
                 continue
-        
+
         if len(prices) < 2:
             return True  # Insufficient data, don't block
-        
+
         # Check if recent bars show continuation of trend
         # STRICT: For longs, require clear upward movement (not just "not negative")
         # For shorts, require clear downward movement
         if is_long:
             # For longs: count how many bars show upward movement
-            up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
-            down_moves = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i-1])
-            
+            up_moves = sum(
+                1 for i in range(1, len(prices)) if prices[i] > prices[i - 1]
+            )
+            down_moves = sum(
+                1 for i in range(1, len(prices)) if prices[i] < prices[i - 1]
+            )
+
             # Calculate net change and percentage change
             net_change = prices[-1] - prices[0]
             net_change_percent = (net_change / prices[0]) * 100 if prices[0] > 0 else 0
-            
+
             # STRICT: Require clear upward momentum
             # 1. Net change must be positive and meaningful (> 0.3%)
             # 2. At least 50% of moves must be upward (or equal up/down with positive net change)
             # 3. Reject if net change is negative OR if down moves exceed up moves
             if net_change <= 0:
                 return False  # Price is flat or declining - no momentum
-            
+
             if net_change_percent < 0.3:
                 return False  # Net change too small (< 0.3%) - weak momentum
-            
+
             if down_moves > up_moves:
                 return False  # More down moves than up moves - reversal detected
-            
+
             # If equal moves, require positive net change (already checked above)
             # This ensures we have clear upward momentum, not just sideways movement
         else:
             # For shorts: count how many bars show downward movement
-            up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
-            down_moves = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i-1])
-            
+            up_moves = sum(
+                1 for i in range(1, len(prices)) if prices[i] > prices[i - 1]
+            )
+            down_moves = sum(
+                1 for i in range(1, len(prices)) if prices[i] < prices[i - 1]
+            )
+
             # If we have more up moves than down moves in recent bars, momentum may be reversing
             net_change = prices[-1] - prices[0]
             if net_change > 0 and up_moves > down_moves:
                 return False  # Reversal detected
-        
+
         return True  # Momentum still valid
 
     @classmethod
@@ -1356,14 +1391,14 @@ class PennyStocksIndicator(BaseTradingIndicator):
     ) -> float:
         """
         Calculate confidence score (0.0 to 1.0) for penny stock entry.
-        
+
         Factors considered:
         1. Momentum score (higher = higher confidence)
         2. Distance from peak (further below peak = higher confidence)
         3. Spread (lower spread = higher confidence)
         4. Volume (higher volume = higher confidence)
         5. Rank (lower rank = higher confidence)
-        
+
         Args:
             momentum_score: Momentum score from trend calculation
             peak_price: Detected peak price (None if unavailable)
@@ -1371,7 +1406,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             spread_percent: Bid-ask spread percentage
             volume: Trading volume
             rank: Ranking of this ticker (1 = best)
-            
+
         Returns:
             Confidence score between 0.0 and 1.0
         """
@@ -1379,8 +1414,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # Penny stocks: min_momentum_threshold = 5.0%, max reasonable = 20.0%
         min_momentum = cls.min_momentum_threshold  # 5.0%
         max_momentum = 20.0  # Use 20% as reasonable max for normalization
-        momentum_normalized = min(1.0, max(0.0, (momentum_score - min_momentum) / (max_momentum - min_momentum)))
-        
+        momentum_normalized = min(
+            1.0,
+            max(0.0, (momentum_score - min_momentum) / (max_momentum - min_momentum)),
+        )
+
         # Peak distance factor (further below peak = higher confidence)
         peak_factor = 1.0
         if peak_price and peak_price > 0:
@@ -1398,29 +1436,29 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 peak_factor = 0.9
             else:
                 peak_factor = 0.8  # Too far below peak
-        
+
         # Spread factor (lower spread = higher confidence)
         # max_bid_ask_spread_percent = 0.75% for penny stocks
         max_spread = cls.max_bid_ask_spread_percent  # 0.75%
         spread_factor = max(0.5, 1.0 - (spread_percent / max_spread))  # 0.5 to 1.0
-        
+
         # Volume factor (normalize volume, higher = better)
         # Use min_volume as baseline (10,000)
         min_volume = cls.min_volume  # 10,000
         volume_factor = min(1.0, max(0.5, volume / (min_volume * 2)))  # 0.5 to 1.0
-        
+
         # Rank factor (rank 1 = 1.0, rank 2 = 0.9, rank 3+ = 0.8)
         rank_factor = 1.0 if rank == 1 else (0.9 if rank == 2 else 0.8)
-        
+
         # Weighted combination
         confidence = (
-            momentum_normalized * 0.35 +  # 35% weight on momentum
-            peak_factor * 0.25 +            # 25% weight on peak distance
-            spread_factor * 0.20 +          # 20% weight on spread
-            volume_factor * 0.15 +          # 15% weight on volume
-            rank_factor * 0.05              # 5% weight on rank
+            momentum_normalized * 0.35  # 35% weight on momentum
+            + peak_factor * 0.25  # 25% weight on peak distance
+            + spread_factor * 0.20  # 20% weight on spread
+            + volume_factor * 0.15  # 15% weight on volume
+            + rank_factor * 0.05  # 5% weight on rank
         )
-        
+
         # Ensure result is between 0.0 and 1.0
         return max(0.0, min(1.0, confidence))
 
@@ -1719,7 +1757,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             if peak_price and peak_price > 0:
                 # Calculate how much above/below peak the current ASK is
                 price_vs_peak_percent = ((ask - peak_price) / peak_price) * 100
-                
+
                 # STRICT: Reject if entry is at or above peak (within 0.5% tolerance for rounding)
                 # This prevents entering when momentum has already peaked
                 if price_vs_peak_percent >= -0.5:
@@ -1734,7 +1772,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                         f"Entry price ${ask:.4f} at or above detected peak ${peak_price:.4f} ({price_vs_peak_percent:.2f}%)",
                     )
                     return False
-                
+
                 # STRICT: Require entry to be meaningfully below peak (at least 1% below)
                 # This ensures we're entering during momentum build-up, not at the peak
                 min_below_peak_percent = 1.0  # Require at least 1% below peak
@@ -1770,7 +1808,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # CRITICAL: Mark ticker as traded BEFORE entry to prevent duplicate entries
         # This must happen before _enter_trade() to prevent race conditions
         cls._traded_tickers_today.add(ticker)
-        logger.debug(f"Marked {ticker} as traded (before entry) to prevent duplicate entries")
+        logger.debug(
+            f"Marked {ticker} as traded (before entry) to prevent duplicate entries"
+        )
 
         # IMPROVED: Calculate breakeven price accounting for spread
         breakeven_price = SpreadCalculator.calculate_breakeven_price(
@@ -1811,28 +1851,31 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # Calculate confidence score using ENHANCED calculator (0.0 to 1.0)
         # This incorporates peak proximity, volume confirmation, and momentum acceleration
         peak_price = cls._extract_peak_price_from_reason(reason)
-        
+
         # Get peak detection result for enhanced confidence
         peak_result = PeakDetector.detect_peak(
             bars=ticker_bars,
             current_price=enter_price,
             config=DEFAULT_CONFIG,
         )
-        
+
         # Get volume confirmation result
         volume_result = VolumeAnalyzer.analyze_volume(
             bars=ticker_bars,
             config=DEFAULT_CONFIG,
         )
-        
+
         # Get momentum acceleration result
         accel_result = MomentumAccelerationAnalyzer.analyze_acceleration(
             bars=ticker_bars,
             config=DEFAULT_CONFIG,
         )
-        
+
         # Calculate enhanced confidence score
-        from app.src.services.trading.enhanced_confidence_calculator import EnhancedConfidenceCalculator
+        from app.src.services.trading.enhanced_confidence_calculator import (
+            EnhancedConfidenceCalculator,
+        )
+
         confidence_result = EnhancedConfidenceCalculator.calculate_confidence(
             momentum_score=momentum_score,
             peak_proximity_score=peak_result.peak_proximity_score,
@@ -1841,7 +1884,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             config=DEFAULT_CONFIG,
         )
         confidence_score = confidence_result.confidence_score
-        
+
         # Check if confidence is too low - reject entry
         if confidence_result.rejection_reason:
             logger.info(f"Skipping {ticker}: {confidence_result.rejection_reason}")
@@ -1852,7 +1895,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 confidence_result.rejection_reason,
             )
             return False
-        
+
         # Calculate position size based on confidence
         # Use a standard position size of $500 for penny stocks
         STANDARD_POSITION_SIZE = 500.0
@@ -1861,7 +1904,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             confidence_score=confidence_score,
             config=DEFAULT_CONFIG,
         )
-        
+
         # Check if position sizing rejected (shouldn't happen if confidence check passed)
         if position_result.position_size_dollars == 0:
             logger.info(f"Skipping {ticker}: {position_result.reason}")
@@ -1872,11 +1915,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 position_result.reason,
             )
             return False
-        
+
         # Add position sizing info to technical indicators
-        technical_indicators["position_size_dollars"] = position_result.position_size_dollars
-        technical_indicators["position_size_percent"] = position_result.position_size_percent
-        technical_indicators["confidence_components"] = confidence_result.components.to_dict()
+        technical_indicators["position_size_dollars"] = (
+            position_result.position_size_dollars
+        )
+        technical_indicators["position_size_percent"] = (
+            position_result.position_size_percent
+        )
+        technical_indicators["confidence_components"] = (
+            confidence_result.components.to_dict()
+        )
 
         await send_signal_to_webhook(
             ticker=ticker,
@@ -2192,7 +2241,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 bars_dict = bars_data_for_exit.get("bars", {})
                 ticker_bars = bars_dict.get(ticker, [])
                 if ticker_bars:
-                    recent_bars = ticker_bars[-cls.recent_bars_for_trend:] if len(ticker_bars) >= cls.recent_bars_for_trend else ticker_bars
+                    recent_bars = (
+                        ticker_bars[-cls.recent_bars_for_trend :]
+                        if len(ticker_bars) >= cls.recent_bars_for_trend
+                        else ticker_bars
+                    )
 
             # Use ExitDecisionEngine for exit decision with trend reversal detection
             exit_decision: ExitDecision = cls._exit_engine.evaluate_exit(
@@ -2255,7 +2308,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
             # IMPROVED: Mark ticker as traded (already done on entry, but ensure it's marked)
             cls._traded_tickers_today.add(ticker)
-            
+
             # If trade ended in loss, mark ticker as losing for today
             if final_profit_percent < 0:
                 cls._losing_tickers_today.add(ticker)
