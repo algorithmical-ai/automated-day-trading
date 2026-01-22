@@ -81,6 +81,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
     # This handles both profit-taking (when price reverses from high) and stop loss (2% from entry)
     # Since entry price is the initial peak, a 2% drop from peak = 2% stop loss from entry
     trailing_stop_percent: float = 2.0  # Exit when price drops 2% from peak
+    atr_period: int = 14  # ATR calculation period for entry analysis
 
     top_k: int = 1  # Only top 1 ticker to reduce exposure
     min_momentum_threshold: float = (
