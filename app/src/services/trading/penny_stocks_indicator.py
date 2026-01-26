@@ -81,6 +81,12 @@ class PennyStocksIndicator(BaseTradingIndicator):
     # This handles both profit-taking (when price reverses from high) and stop loss (2% from entry)
     # Since entry price is the initial peak, a 2% drop from peak = 2% stop loss from entry
     trailing_stop_percent: float = 2.0  # Exit when price drops 2% from peak
+    profit_threshold: float = (
+        2.5  # INCREASED: Exit at 2.5% profit (was 1.5%) - need bigger wins
+    )
+    immediate_loss_exit_threshold: float = (
+        -7.0
+    )  # WIDENED: Emergency stop at -7.0% (was -3.0%)
     atr_period: int = 14  # ATR calculation period for entry analysis
 
     top_k: int = 1  # Only top 1 ticker to reduce exposure
@@ -131,7 +137,15 @@ class PennyStocksIndicator(BaseTradingIndicator):
     )
     recent_bars_for_trend: int = 5  # Use last 5 bars to determine trend
 
-    # No longer using ATR-based stops - simple 2% trailing stop handles everything
+    # ATR configuration for volatility-based stops - MUCH WIDER for penny stocks
+    atr_multiplier: float = (
+        3.5  # INCREASED: ATR multiplier (was 3.0) - penny stocks need MORE room
+    )
+    atr_stop_min: float = -4.0  # WIDENED: Minimum stop loss (was -3.0%) - FLOOR at 4%
+    atr_stop_max: float = -8.0  # WIDENED: Maximum stop loss (was -6.0%) - CAP at 8%
+    default_atr_stop_percent: float = (
+        -4.0
+    )  # WIDENED: Default ATR-based stop loss (was -2.5%)
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
