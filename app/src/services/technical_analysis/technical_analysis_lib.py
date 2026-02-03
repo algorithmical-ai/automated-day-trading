@@ -288,13 +288,13 @@ class TechnicalAnalysisLib:
     async def get_cache_stats(cls) -> Dict[str, Any]:
         """Get indicator cache statistics."""
         return await _indicator_cache.stats()
-    
+
     @classmethod
     async def clear_cache(cls) -> None:
         """Clear the indicator cache."""
         await _indicator_cache.clear()
         gc.collect()
-    
+
     @classmethod
     async def cleanup_cache(cls) -> int:
         """Cleanup expired cache entries and run garbage collection."""
@@ -321,7 +321,7 @@ class TechnicalAnalysisLib:
             if cached is not None:
                 logger.debug(f"Using cached indicators for {ticker}")
                 return cached
-        
+
         # Get market data from Alpaca API
         # BASIC DYNO: Only 50 bars to minimize memory (minimum needed for indicators)
         bars_data = await AlpacaClient.get_market_data(ticker, limit=50)
@@ -340,7 +340,7 @@ class TechnicalAnalysisLib:
             ticker_bars = bars_dict.get(ticker, [])
 
         if not ticker_bars or len(ticker_bars) < 5:
-            logger.warning(
+            logger.debug(
                 f"Insufficient bars data for {ticker}: {len(ticker_bars) if ticker_bars else 0} bars"
             )
             return await cls._create_default_indicators(ticker)
@@ -349,7 +349,7 @@ class TechnicalAnalysisLib:
         prices = cls._bars_to_dataframe(ticker_bars, ticker)
 
         if prices.empty or len(prices) < 5:
-            logger.warning(
+            logger.debug(
                 f"Insufficient data after conversion: {len(prices)} rows for {ticker}"
             )
             return await cls._create_default_indicators(ticker)
@@ -555,15 +555,15 @@ class TechnicalAnalysisLib:
                 "close_price": float(close[-1]),
                 "datetime_price": datetime_price,
             }
-            
+
             # Cache the result before returning
             if use_cache:
                 await _indicator_cache.put(ticker, result)
-            
+
             # Explicitly delete large objects to help GC
             del prices, processed_prices, recent_prices
             del high, low, close, volume, open_
-            
+
             return result
 
         except Exception as e:
