@@ -42,6 +42,7 @@ from app.src.services.trading.penny_stock_utils import (
     ExitDecision,
     DailyPerformanceMetrics,
 )
+from app.src.services.trading.market_direction_filter import MarketDirectionFilter
 
 
 class MomentumIndicator(BaseTradingIndicator):
@@ -64,13 +65,13 @@ class MomentumIndicator(BaseTradingIndicator):
     trailing_stop_short_multiplier: float = 1.5  # Wider trailing stop for shorts (3-4%)
     min_adx_threshold: float = 20.0
     rsi_min_for_long: float = 45.0  # Not oversold (avoiding catching falling knives)
-    
+
     # IMPROVED: Max bid-ask spread for entry (reject high spread tickers)
     max_bid_ask_spread_percent: float = 3.0  # INCREASED from 2.0% to 3.0%
-    
+
     # Exit decision engine instance (shared across exit cycles)
     _exit_engine: Optional[ExitDecisionEngine] = None
-    
+
     # Daily performance metrics
     _daily_metrics: Optional[DailyPerformanceMetrics] = None
     rsi_max_for_long: float = 70.0  # Not overbought (avoiding tops)
@@ -83,10 +84,14 @@ class MomentumIndicator(BaseTradingIndicator):
         0.5  # Activate trailing stop after +0.5% profit (tiered system)
     )
     max_entry_hour_et: int = 15  # No entries after 3:00 PM ET (15:00)
-    max_entry_minute_et: int = 55  # No entries after XX:55 (5 min buffer before cutoff hour ends)
-    
+    max_entry_minute_et: int = (
+        55  # No entries after XX:55 (5 min buffer before cutoff hour ends)
+    )
+
     # MFI (Money Flow Index) filters - avoid extreme conditions
-    mfi_min_for_long: float = 20.0  # Don't buy into extreme selling pressure (MFI < 20 = oversold/falling knife)
+    mfi_min_for_long: float = (
+        20.0  # Don't buy into extreme selling pressure (MFI < 20 = oversold/falling knife)
+    )
     mfi_max_for_long: float = 80.0  # Don't buy at extreme buying exhaustion
     mfi_min_for_short: float = 20.0  # Don't short already oversold stocks
     mfi_max_for_short: float = 80.0  # Don't short into extreme buying (squeeze)
@@ -108,7 +113,9 @@ class MomentumIndicator(BaseTradingIndicator):
     max_atr_percent_for_entry: float = (
         5.0  # Maximum ATR% to allow entry (5% = very volatile)
     )
-    max_volatility_for_low_price: float = 50.0  # Allow high volatility for penny stocks - we bank on it! (was 4.0)
+    max_volatility_for_low_price: float = (
+        50.0  # Allow high volatility for penny stocks - we bank on it! (was 4.0)
+    )
     # NOTE: max_bid_ask_spread_percent is defined above (3.0%) - removed duplicate here
     trailing_stop_penny_stock_multiplier: float = (
         1.5  # Wider trailing stop for penny stocks (legacy, now overridden)
@@ -196,7 +203,7 @@ class MomentumIndicator(BaseTradingIndicator):
         Check if current time is after the entry cutoff time.
         No new entries allowed after 3:55 PM ET to avoid late-day volatility
         and ensure trades have time to develop before market close.
-        
+
         Returns:
             True if entries should be blocked, False if entries are allowed
         """
@@ -204,66 +211,69 @@ class MomentumIndicator(BaseTradingIndicator):
         current_time_est = datetime.now(est_tz)
         current_hour = current_time_est.hour
         current_minute = current_time_est.minute
-        
+
         # Block entries after max_entry_hour_et (e.g., after 3PM = hour 16+)
         if current_hour > cls.max_entry_hour_et:
             return True
-        
+
         # Block entries in the last 5 minutes of the allowed hour (e.g., 3:55-3:59 PM)
-        if current_hour == cls.max_entry_hour_et and current_minute >= cls.max_entry_minute_et:
+        if (
+            current_hour == cls.max_entry_hour_et
+            and current_minute >= cls.max_entry_minute_et
+        ):
             return True
-        
+
         return False
 
     @classmethod
     def _filter_bars_after_entry(
-        cls,
-        bars: List[Dict[str, Any]],
-        created_at: str
+        cls, bars: List[Dict[str, Any]], created_at: str
     ) -> List[Dict[str, Any]]:
         """
         Filter bars to only include those with timestamps after trade entry.
-        
+
         Args:
             bars: List of bar dictionaries with 't' (timestamp) and 'c' (close) keys
             created_at: ISO timestamp string when trade was created
-            
+
         Returns:
             List of bars with timestamps after created_at
         """
         if not bars or not created_at:
             return []
-        
+
         try:
             # Parse the entry timestamp
             entry_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
             if entry_time.tzinfo is None:
                 entry_time = entry_time.replace(tzinfo=timezone.utc)
-            
+
             filtered_bars = []
             for bar in bars:
                 if not isinstance(bar, dict):
                     continue
-                
+
                 bar_timestamp_str = bar.get("t")
                 if not bar_timestamp_str:
                     continue
-                
+
                 try:
                     # Parse bar timestamp
                     if isinstance(bar_timestamp_str, str):
-                        bar_time = datetime.fromisoformat(bar_timestamp_str.replace("Z", "+00:00"))
+                        bar_time = datetime.fromisoformat(
+                            bar_timestamp_str.replace("Z", "+00:00")
+                        )
                         if bar_time.tzinfo is None:
                             bar_time = bar_time.replace(tzinfo=timezone.utc)
                     else:
                         continue
-                    
+
                     # Only include bars AFTER entry time
                     if bar_time > entry_time:
                         filtered_bars.append(bar)
                 except (ValueError, TypeError):
                     continue
-            
+
             return filtered_bars
         except (ValueError, TypeError) as e:
             logger.warning(f"Error parsing entry timestamp '{created_at}': {e}")
@@ -279,26 +289,26 @@ class MomentumIndicator(BaseTradingIndicator):
     ) -> Tuple[bool, str]:
         """
         Determine if profit-taking exit should trigger.
-        
+
         This method implements the fixed exit logic that prevents premature exits:
         1. Requires positive profit (profit_from_entry > 0)
         2. Requires minimum profit threshold (>= 0.5%)
         3. Requires minimum holding time (>= 60 seconds)
         4. Uses wider dip/rise threshold (1.0% instead of 0.5%)
-        
+
         Args:
             profit_from_entry: Current profit percentage from entry price
             dip_or_rise_percent: Percentage dip from peak (long) or rise from bottom (short)
                                  Should be positive for dip (long) and positive for rise (short)
             holding_seconds: Seconds since trade entry
             is_long: True for long trades, False for short trades
-            
+
         Returns:
             Tuple of (should_exit: bool, reason: str)
         """
         direction = "long" if is_long else "short"
         exit_type = "dip from peak" if is_long else "rise from bottom"
-        
+
         # Check 1: Must have positive profit
         if profit_from_entry <= 0:
             reason = (
@@ -307,7 +317,7 @@ class MomentumIndicator(BaseTradingIndicator):
             )
             logger.debug(reason)
             return False, reason
-        
+
         # Check 2: Must meet minimum profit threshold
         if profit_from_entry < cls.min_profit_for_profit_taking_exit:
             reason = (
@@ -317,7 +327,7 @@ class MomentumIndicator(BaseTradingIndicator):
             )
             logger.debug(reason)
             return False, reason
-        
+
         # Check 3: Must meet minimum holding time
         if holding_seconds < cls.min_holding_seconds_for_profit_taking:
             reason = (
@@ -327,7 +337,7 @@ class MomentumIndicator(BaseTradingIndicator):
             )
             logger.debug(reason)
             return False, reason
-        
+
         # Check 4: Dip/rise must exceed threshold (1.0%)
         if dip_or_rise_percent < cls.dip_rise_threshold_percent:
             reason = (
@@ -337,7 +347,7 @@ class MomentumIndicator(BaseTradingIndicator):
             )
             logger.debug(reason)
             return False, reason
-        
+
         # All checks passed - trigger exit
         reason = (
             f"💰 PROFIT EXIT ({direction}): {exit_type} {dip_or_rise_percent:.2f}% "
@@ -783,24 +793,24 @@ class MomentumIndicator(BaseTradingIndicator):
         # Reject if price is too far from moving averages (likely to snap back)
         ema_fast = technical_analysis.get("ema_fast", 0.0)
         ema_slow = technical_analysis.get("ema_slow", 0.0)
-        
+
         if ema_fast > 0 and current_price > 0:
             ema_deviation_percent = ((current_price - ema_fast) / ema_fast) * 100
-            
+
             # For SHORTS: Reject if price is >10% ABOVE EMA (parabolic squeeze, will keep running)
             if momentum_score < 0 and ema_deviation_percent > 10.0:
                 return (
                     True,
                     f"Parabolic extension for short: price ${current_price:.2f} is {ema_deviation_percent:.1f}% above EMA ${ema_fast:.2f} (squeeze in progress, don't short)",
                 )
-            
+
             # For LONGS: Reject if price is >10% ABOVE EMA (chasing extended move)
             if momentum_score > 0 and ema_deviation_percent > 10.0:
                 return (
                     True,
                     f"Extended move for long: price ${current_price:.2f} is {ema_deviation_percent:.1f}% above EMA ${ema_fast:.2f} (too extended, wait for pullback)",
                 )
-            
+
             # For LONGS: Reject if price is >5% BELOW EMA (falling knife)
             if momentum_score > 0 and ema_deviation_percent < -5.0:
                 return (
@@ -892,14 +902,14 @@ class MomentumIndicator(BaseTradingIndicator):
         else:
             stoch_k = 50.0
             stoch_d = 50.0
-        
+
         # Reject if stochastic is exactly 0 or 100 (likely broken data)
         if stoch_k == 0 and stoch_d == 0:
             return (
                 False,
                 f"Stochastic data appears broken (K={stoch_k}, D={stoch_d}) - skipping",
             )
-        
+
         # Reject if Bollinger bands are flat (no volatility data)
         bollinger = technical_analysis.get("bollinger", {})
         if isinstance(bollinger, dict):
@@ -912,7 +922,7 @@ class MomentumIndicator(BaseTradingIndicator):
             bb_lower = bollinger[2] if bollinger[2] is not None else 0
         else:
             bb_upper = bb_lower = bb_middle = 0
-        
+
         if bb_upper > 0 and bb_lower > 0 and abs(bb_upper - bb_lower) < 0.001:
             return (
                 False,
@@ -948,7 +958,7 @@ class MomentumIndicator(BaseTradingIndicator):
                 False,
                 f"RSI too low for short: {rsi:.2f} < {cls.rsi_min_for_short} (may be oversold, risk of bounce)",
             )
-        
+
         # MFI (Money Flow Index) filter - avoid extreme money flow conditions
         # MFI < 20 = extreme selling pressure (falling knife for longs)
         # MFI > 80 = extreme buying pressure (exhaustion for longs, squeeze for shorts)
@@ -963,7 +973,7 @@ class MomentumIndicator(BaseTradingIndicator):
                     False,
                     f"MFI too high for long: {mfi:.1f} > {cls.mfi_max_for_long} (buying exhaustion, likely reversal)",
                 )
-        
+
         if is_short:
             if mfi < cls.mfi_min_for_short:
                 return (
@@ -1008,7 +1018,7 @@ class MomentumIndicator(BaseTradingIndicator):
                     False,
                     f"Stochastic not bearish for short: K={stoch_k:.2f} > D={stoch_d:.2f} (upward momentum still present)",
                 )
-        
+
         if is_long:
             # Don't buy if stochastic is overbought (K > 80) - likely at a top
             # This prevents buying into exhausted rallies
@@ -1090,24 +1100,28 @@ class MomentumIndicator(BaseTradingIndicator):
     def _calculate_momentum(cls, datetime_price: Any) -> Tuple[float, str]:
         """
         Calculate price momentum score from datetime_price.
-        
+
         Args:
             datetime_price: Either a dict mapping timestamp strings to prices,
                           or a list of entries (legacy format)
-        
+
         Returns:
             Tuple of (momentum_score, reason_string)
         """
-        logger.debug(f"_calculate_momentum called with type: {type(datetime_price).__name__}, empty: {not datetime_price}")
-        
+        logger.debug(
+            f"_calculate_momentum called with type: {type(datetime_price).__name__}, empty: {not datetime_price}"
+        )
+
         if not datetime_price:
             return 0.0, "Insufficient price data"
 
         prices = []
-        
+
         # Handle dictionary format (current format from TechnicalAnalysisLib)
         if isinstance(datetime_price, dict):
-            logger.debug(f"Processing datetime_price as dictionary with {len(datetime_price)} entries")
+            logger.debug(
+                f"Processing datetime_price as dictionary with {len(datetime_price)} entries"
+            )
             try:
                 # Extract (timestamp, price) pairs and sort by timestamp
                 timestamp_price_pairs = []
@@ -1115,42 +1129,57 @@ class MomentumIndicator(BaseTradingIndicator):
                     try:
                         # Parse ISO timestamp
                         from datetime import datetime
+
                         if isinstance(timestamp_str, str):
                             # Handle various timestamp formats
-                            if timestamp_str.endswith('Z'):
-                                dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                            if timestamp_str.endswith("Z"):
+                                dt = datetime.fromisoformat(
+                                    timestamp_str.replace("Z", "+00:00")
+                                )
                             else:
                                 dt = datetime.fromisoformat(timestamp_str)
                         else:
-                            logger.debug(f"Skipping non-string timestamp key: {type(timestamp_str)}")
+                            logger.debug(
+                                f"Skipping non-string timestamp key: {type(timestamp_str)}"
+                            )
                             continue
-                        
+
                         # Validate price
-                        if price is not None and isinstance(price, (int, float)) and price > 0:
+                        if (
+                            price is not None
+                            and isinstance(price, (int, float))
+                            and price > 0
+                        ):
                             timestamp_price_pairs.append((dt, float(price)))
                         else:
                             logger.debug(f"Skipping invalid price: {price}")
                     except (ValueError, TypeError) as e:
-                        logger.debug(f"Skipping invalid timestamp/price pair: {timestamp_str}={price}, error: {e}")
+                        logger.debug(
+                            f"Skipping invalid timestamp/price pair: {timestamp_str}={price}, error: {e}"
+                        )
                         continue
-                
+
                 # Sort by timestamp (chronological order)
                 timestamp_price_pairs.sort(key=lambda x: x[0])
-                
+
                 # Extract prices in chronological order
                 prices = [price for _, price in timestamp_price_pairs]
-                
-                logger.debug(f"Extracted {len(prices)} valid prices from dictionary in chronological order")
+
+                logger.debug(
+                    f"Extracted {len(prices)} valid prices from dictionary in chronological order"
+                )
                 if prices:
                     logger.debug(f"Price range: {min(prices):.4f} to {max(prices):.4f}")
-                
+
             except Exception as e:
                 logger.warning(f"Error processing datetime_price dictionary: {e}")
                 return 0.0, f"Error processing datetime_price dictionary: {str(e)}"
-        
+
         # Handle list format (legacy format)
         elif isinstance(datetime_price, list):
-            logger.debug(f"Processing datetime_price as list with {len(datetime_price)} entries")
+            logger.debug(
+                f"Processing datetime_price as list with {len(datetime_price)} entries"
+            )
             for entry in datetime_price:
                 try:
                     if isinstance(entry, list):
@@ -1166,27 +1195,38 @@ class MomentumIndicator(BaseTradingIndicator):
                             prices.append(float(price))
                 except (ValueError, TypeError, KeyError, IndexError):
                     continue
-        
+
         # Handle tuple format (legacy or default indicators)
         elif isinstance(datetime_price, tuple):
-            logger.debug(f"Processing datetime_price as tuple with {len(datetime_price)} entries")
+            logger.debug(
+                f"Processing datetime_price as tuple with {len(datetime_price)} entries"
+            )
             for entry in datetime_price:
                 try:
                     if isinstance(entry, (list, tuple)) and len(entry) >= 2:
                         price = entry[1]
-                        if price is not None and isinstance(price, (int, float)) and price > 0:
+                        if (
+                            price is not None
+                            and isinstance(price, (int, float))
+                            and price > 0
+                        ):
                             prices.append(float(price))
                 except (ValueError, TypeError, IndexError):
                     continue
-        
+
         # Handle unexpected format
         else:
             logger.warning(f"Unexpected datetime_price format: {type(datetime_price)}")
-            return 0.0, f"Invalid datetime_price format: {type(datetime_price).__name__}"
+            return (
+                0.0,
+                f"Invalid datetime_price format: {type(datetime_price).__name__}",
+            )
 
         # Check if we have enough data
         if len(prices) < 3:
-            logger.debug(f"Insufficient price data: only {len(prices)} prices available (need at least 3)")
+            logger.debug(
+                f"Insufficient price data: only {len(prices)} prices available (need at least 3)"
+            )
             return 0.0, "Insufficient price data"
 
         # Calculate momentum using early vs recent average comparison
@@ -1211,22 +1251,28 @@ class MomentumIndicator(BaseTradingIndicator):
         momentum_score = (0.7 * change_percent) + (0.3 * trend_percent)
 
         reason = f"Momentum: {change_percent:.2f}% change, {trend_percent:.2f}% trend (early_avg: {early_avg:.2f}, recent_avg: {recent_avg:.2f}, n={n}, early_prices_count={len(early_prices)}, recent_prices_count={len(recent_prices)})"
-        
+
         logger.debug(f"Momentum calculation: {reason}")
-        logger.debug(f"Early prices sample: {early_prices[:3] if len(early_prices) > 0 else 'empty'}")
-        logger.debug(f"Recent prices sample: {recent_prices[-3:] if len(recent_prices) > 0 else 'empty'}")
+        logger.debug(
+            f"Early prices sample: {early_prices[:3] if len(early_prices) > 0 else 'empty'}"
+        )
+        logger.debug(
+            f"Recent prices sample: {recent_prices[-3:] if len(recent_prices) > 0 else 'empty'}"
+        )
 
         return momentum_score, reason
 
     # Minimum holding time before a trade can be preempted (in seconds)
-    min_holding_before_preempt_seconds: int = 60  # Don't preempt trades held less than 60 seconds
-    
+    min_holding_before_preempt_seconds: int = (
+        60  # Don't preempt trades held less than 60 seconds
+    )
+
     @classmethod
     async def _find_lowest_profitable_trade(
         cls, active_trades: List[Dict[str, Any]]
     ) -> Optional[Tuple[Dict[str, Any], float]]:
         """Find the lowest profitable trade from active trades that can be preempted.
-        
+
         Only considers trades that:
         1. Are currently profitable (>= profit_threshold)
         2. Have been held for at least min_holding_before_preempt_seconds
@@ -1242,7 +1288,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
             if not ticker or enter_price is None or enter_price <= 0:
                 continue
-            
+
             # Check minimum holding time before allowing preemption
             # This prevents preempting trades that just entered (like ENVB after 2 seconds)
             passed_min_hold, holding_minutes = cls._check_holding_period(
@@ -1417,9 +1463,10 @@ class MomentumIndicator(BaseTradingIndicator):
         Reason format: "Momentum: X% change, Y% trend (early_avg: A, recent_avg: B, ...)"
         """
         import re
+
         try:
             # Pattern to match "recent_avg: X.XX"
-            match = re.search(r'recent_avg:\s*([\d.]+)', reason)
+            match = re.search(r"recent_avg:\s*([\d.]+)", reason)
             if match:
                 return float(match.group(1))
         except (ValueError, AttributeError):
@@ -1433,17 +1480,17 @@ class MomentumIndicator(BaseTradingIndicator):
         """
         Check if the most recent 2-3 bars still show momentum in the correct direction.
         This catches reversals that happened between momentum calculation and entry.
-        
+
         Args:
             bars: List of price bars with 'c' (close) key
             is_long: True for long positions (check upward momentum), False for short
-            
+
         Returns:
             True if immediate momentum is valid, False if reversal detected
         """
         if not bars or len(bars) < 2:
             return True  # If insufficient data, don't block entry
-        
+
         # Get last 2-3 bars for immediate check
         recent_bars = bars[-3:] if len(bars) >= 3 else bars[-2:]
         prices = []
@@ -1454,18 +1501,22 @@ class MomentumIndicator(BaseTradingIndicator):
                     prices.append(float(close_price))
             except (ValueError, TypeError):
                 continue
-        
+
         if len(prices) < 2:
             return True  # Insufficient data, don't block
-        
+
         # Check if recent bars show continuation of trend
         # For longs: recent prices should be generally flat or rising (not falling)
         # For shorts: recent prices should be generally flat or falling (not rising)
         if is_long:
             # For longs: count how many bars show upward movement
-            up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
-            down_moves = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i-1])
-            
+            up_moves = sum(
+                1 for i in range(1, len(prices)) if prices[i] > prices[i - 1]
+            )
+            down_moves = sum(
+                1 for i in range(1, len(prices)) if prices[i] < prices[i - 1]
+            )
+
             # If we have more down moves than up moves in recent bars, momentum may be reversing
             # Allow if at least 50% are up moves or flat, or if net change is positive
             net_change = prices[-1] - prices[0]
@@ -1473,14 +1524,18 @@ class MomentumIndicator(BaseTradingIndicator):
                 return False  # Reversal detected
         else:
             # For shorts: count how many bars show downward movement
-            up_moves = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
-            down_moves = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i-1])
-            
+            up_moves = sum(
+                1 for i in range(1, len(prices)) if prices[i] > prices[i - 1]
+            )
+            down_moves = sum(
+                1 for i in range(1, len(prices)) if prices[i] < prices[i - 1]
+            )
+
             # If we have more up moves than down moves in recent bars, momentum may be reversing
             net_change = prices[-1] - prices[0]
             if net_change > 0 and up_moves > down_moves:
                 return False  # Reversal detected
-        
+
         return True  # Momentum still valid
 
     @classmethod
@@ -1497,7 +1552,7 @@ class MomentumIndicator(BaseTradingIndicator):
     ) -> float:
         """
         Calculate confidence score (0.0 to 1.0) for momentum trading entry.
-        
+
         Factors considered:
         1. Momentum score (higher = higher confidence)
         2. Distance from recent_avg (further below = higher confidence)
@@ -1506,7 +1561,7 @@ class MomentumIndicator(BaseTradingIndicator):
         5. Rank (lower rank = higher confidence)
         6. Golden status (golden = higher confidence)
         7. RSI (for longs: 50-65 = optimal, overbought/oversold = lower confidence)
-        
+
         Args:
             momentum_score: Momentum score from calculation
             recent_avg: Recent average price (None if unavailable)
@@ -1516,7 +1571,7 @@ class MomentumIndicator(BaseTradingIndicator):
             rank: Ranking of this ticker (1 = best)
             is_golden: Whether this is a golden/exceptional ticker
             technical_indicators: Optional technical indicators dict
-            
+
         Returns:
             Confidence score between 0.0 and 1.0
         """
@@ -1524,12 +1579,20 @@ class MomentumIndicator(BaseTradingIndicator):
         # Momentum: min_momentum_threshold = 1.5%, max_momentum_threshold = 15.0%
         min_momentum = cls.min_momentum_threshold  # 1.5%
         max_momentum = cls.max_momentum_threshold  # 15.0%
-        momentum_normalized = min(1.0, max(0.0, (abs(momentum_score) - min_momentum) / (max_momentum - min_momentum)))
-        
+        momentum_normalized = min(
+            1.0,
+            max(
+                0.0,
+                (abs(momentum_score) - min_momentum) / (max_momentum - min_momentum),
+            ),
+        )
+
         # Recent average distance factor (further below = higher confidence)
         recent_avg_factor = 1.0
         if recent_avg and recent_avg > 0:
-            price_below_recent_avg_percent = ((recent_avg - enter_price) / recent_avg) * 100
+            price_below_recent_avg_percent = (
+                (recent_avg - enter_price) / recent_avg
+            ) * 100
             # Optimal: 1-3% below recent_avg = high confidence (1.0)
             # Too close (< 0.5%) = lower confidence (0.7)
             # Far below (> 5%) = lower confidence (0.8)
@@ -1543,22 +1606,22 @@ class MomentumIndicator(BaseTradingIndicator):
                 recent_avg_factor = 0.9
             else:
                 recent_avg_factor = 0.8  # Too far below
-        
+
         # Spread factor (lower spread = higher confidence)
         max_spread = cls.max_bid_ask_spread_percent  # 3.0%
         spread_factor = max(0.5, 1.0 - (spread_percent / max_spread))  # 0.5 to 1.0
-        
+
         # Volume factor (normalize volume, higher = better)
         min_volume = cls.min_daily_volume  # 1000
         volume_factor = min(1.0, max(0.5, volume / (min_volume * 5)))  # 0.5 to 1.0
-        
+
         # Rank factor (rank 1 = 1.0, rank 2 = 0.9)
         rank_factor = 1.0 if rank == 1 else 0.9
-        
+
         # Golden factor (golden = bonus confidence)
         golden_factor = 1.1 if is_golden else 1.0  # 10% bonus for golden
         golden_factor = min(1.0, golden_factor)  # Cap at 1.0
-        
+
         # RSI factor (for longs: 50-65 = optimal)
         rsi_factor = 1.0
         if technical_indicators:
@@ -1573,20 +1636,20 @@ class MomentumIndicator(BaseTradingIndicator):
                     rsi_factor = 0.8  # Acceptable
                 else:
                     rsi_factor = 0.7  # Less ideal
-        
+
         # Weighted combination
         confidence = (
-            momentum_normalized * 0.30 +  # 30% weight on momentum
-            recent_avg_factor * 0.25 +     # 25% weight on recent_avg distance
-            spread_factor * 0.20 +         # 20% weight on spread
-            volume_factor * 0.15 +         # 15% weight on volume
-            rank_factor * 0.05 +           # 5% weight on rank
-            rsi_factor * 0.05              # 5% weight on RSI
+            momentum_normalized * 0.30  # 30% weight on momentum
+            + recent_avg_factor * 0.25  # 25% weight on recent_avg distance
+            + spread_factor * 0.20  # 20% weight on spread
+            + volume_factor * 0.15  # 15% weight on volume
+            + rank_factor * 0.05  # 5% weight on rank
+            + rsi_factor * 0.05  # 5% weight on RSI
         )
-        
+
         # Apply golden bonus
         confidence = confidence * golden_factor
-        
+
         # Ensure result is between 0.0 and 1.0
         return max(0.0, min(1.0, confidence))
 
@@ -1679,6 +1742,18 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 return False
 
+        # MARKET DIRECTION FILTER - Check QQQ trend before allowing trades
+        should_allow, market_reason, trend_details = (
+            await MarketDirectionFilter.should_allow_trade(
+                action=action, indicator_name=cls.indicator_name()
+            )
+        )
+        if not should_allow:
+            logger.warning(
+                f"Market direction filter blocked {ticker} {action}: {market_reason}"
+            )
+            return False
+
         # Get entry price using Alpaca API
         quote_response = await AlpacaClient.quote(ticker)
         if not quote_response:
@@ -1702,11 +1777,19 @@ class MomentumIndicator(BaseTradingIndicator):
 
         # NEW: Validate entry price vs technical analysis close price
         # Reject if there's significant divergence (stale data or bad quote)
-        ta_close_price = market_data_response.get("close_price", 0.0) if market_data_response else 0.0
+        ta_close_price = (
+            market_data_response.get("close_price", 0.0)
+            if market_data_response
+            else 0.0
+        )
         if ta_close_price > 0 and enter_price > 0:
-            price_divergence_percent = abs((enter_price - ta_close_price) / ta_close_price) * 100
+            price_divergence_percent = (
+                abs((enter_price - ta_close_price) / ta_close_price) * 100
+            )
             # Allow up to 5% divergence for penny stocks, 3% for regular stocks
-            max_divergence = 5.0 if enter_price < cls.max_stock_price_for_penny_treatment else 3.0
+            max_divergence = (
+                5.0 if enter_price < cls.max_stock_price_for_penny_treatment else 3.0
+            )
             if price_divergence_percent > max_divergence:
                 logger.warning(
                     f"Skipping {ticker}: entry price ${enter_price:.4f} diverges {price_divergence_percent:.1f}% "
@@ -1718,7 +1801,7 @@ class MomentumIndicator(BaseTradingIndicator):
         bid = ticker_quote.get("bp", 0.0)
         ask = ticker_quote.get("ap", 0.0)
         spread_percent = SpreadCalculator.calculate_spread_percent(bid, ask)
-        
+
         # NEW: Stricter validation for ultra-low price stocks (< $0.20)
         # These stocks have wider spreads and are more prone to manipulation
         # Check this FIRST before general spread check to apply stricter rules
@@ -1745,8 +1828,10 @@ class MomentumIndicator(BaseTradingIndicator):
             recent_avg = cls._extract_recent_avg_from_reason(reason)
             if recent_avg and recent_avg > 0:
                 # Calculate how much above/below recent_avg the current entry price is
-                price_vs_recent_avg_percent = ((enter_price - recent_avg) / recent_avg) * 100
-                
+                price_vs_recent_avg_percent = (
+                    (enter_price - recent_avg) / recent_avg
+                ) * 100
+
                 # STRICT: Reject if entry is at or above recent_avg (within 0.5% tolerance for rounding)
                 # This prevents entering when momentum has already peaked
                 if price_vs_recent_avg_percent >= -0.5:
@@ -1755,11 +1840,13 @@ class MomentumIndicator(BaseTradingIndicator):
                         f"({price_vs_recent_avg_percent:.2f}%) - momentum has already peaked"
                     )
                     return False
-                
+
                 # STRICT: Require entry to be meaningfully below recent_avg (at least 1% below)
                 # This ensures we're entering during momentum build-up, not at the peak
                 # Stricter for ultra-low price stocks (< $0.20)
-                min_below_recent_avg = 1.0 if enter_price < 0.20 else 1.0  # 1% for all stocks
+                min_below_recent_avg = (
+                    1.0 if enter_price < 0.20 else 1.0
+                )  # 1% for all stocks
                 if price_vs_recent_avg_percent > -min_below_recent_avg:
                     logger.info(
                         f"Skipping {ticker}: entry price ${enter_price:.4f} is only {abs(price_vs_recent_avg_percent):.2f}% below "
@@ -1775,7 +1862,9 @@ class MomentumIndicator(BaseTradingIndicator):
             bars_dict = bars_data.get("bars", {})
             ticker_bars = bars_dict.get(ticker, [])
             if ticker_bars and len(ticker_bars) >= 3:
-                recent_momentum_valid = cls._check_immediate_momentum_for_entry(ticker_bars, is_long)
+                recent_momentum_valid = cls._check_immediate_momentum_for_entry(
+                    ticker_bars, is_long
+                )
                 if not recent_momentum_valid:
                     logger.info(
                         f"Skipping {ticker}: immediate momentum check failed - recent bars show reversal"
@@ -1793,11 +1882,13 @@ class MomentumIndicator(BaseTradingIndicator):
         ranked_reason = f"{golden_prefix}{reason} (ranked #{rank} {direction} momentum)"
 
         # market_data_response IS the technical analysis dict (from calculate_all_indicators)
-        technical_indicators = market_data_response if isinstance(market_data_response, dict) else {}
+        technical_indicators = (
+            market_data_response if isinstance(market_data_response, dict) else {}
+        )
         technical_indicators_for_enter = {
             k: v for k, v in technical_indicators.items() if k != "datetime_price"
         }
-        
+
         # IMPROVED: Store spread and breakeven info for exit logic
         technical_indicators_for_enter["spread_percent"] = spread_percent
         technical_indicators_for_enter["breakeven_price"] = breakeven_price
@@ -1856,7 +1947,7 @@ class MomentumIndicator(BaseTradingIndicator):
             logger.debug("Market is closed, skipping momentum entry logic")
             await asyncio.sleep(cls.entry_cycle_seconds)
             return
-        
+
         # Check entry cutoff time - no new entries after 3:55 PM ET
         # This prevents late-day entries that don't have time to develop
         if cls._is_after_entry_cutoff():
@@ -1946,21 +2037,34 @@ class MomentumIndicator(BaseTradingIndicator):
                 continue
 
             # market_data_response IS the technical analysis dict (from calculate_all_indicators)
-            technical_analysis = market_data_response if isinstance(market_data_response, dict) else {}
+            technical_analysis = (
+                market_data_response if isinstance(market_data_response, dict) else {}
+            )
 
             # Use datetime_price for momentum calculation
             datetime_price_for_momentum = technical_analysis.get("datetime_price", {})
-            
+
             # Check if datetime_price is empty (dict or list)
             is_empty = (
-                (isinstance(datetime_price_for_momentum, dict) and len(datetime_price_for_momentum) == 0) or
-                (isinstance(datetime_price_for_momentum, list) and len(datetime_price_for_momentum) == 0) or
-                (not datetime_price_for_momentum and datetime_price_for_momentum is not None)
+                (
+                    isinstance(datetime_price_for_momentum, dict)
+                    and len(datetime_price_for_momentum) == 0
+                )
+                or (
+                    isinstance(datetime_price_for_momentum, list)
+                    and len(datetime_price_for_momentum) == 0
+                )
+                or (
+                    not datetime_price_for_momentum
+                    and datetime_price_for_momentum is not None
+                )
             )
-            
+
             if is_empty:
                 stats["no_datetime_price"] += 1
-                logger.debug(f"No datetime_price data for {ticker} (type: {type(datetime_price_for_momentum).__name__}, len: {len(datetime_price_for_momentum) if hasattr(datetime_price_for_momentum, '__len__') else 'N/A'})")
+                logger.debug(
+                    f"No datetime_price data for {ticker} (type: {type(datetime_price_for_momentum).__name__}, len: {len(datetime_price_for_momentum) if hasattr(datetime_price_for_momentum, '__len__') else 'N/A'})"
+                )
                 inactive_ticker_logs.append(
                     {
                         "ticker": ticker,
@@ -1972,7 +2076,9 @@ class MomentumIndicator(BaseTradingIndicator):
                 )
                 continue
             else:
-                logger.debug(f"Using MCP datetime_price for {ticker} momentum (type: {type(datetime_price_for_momentum).__name__}, len: {len(datetime_price_for_momentum) if hasattr(datetime_price_for_momentum, '__len__') else 'N/A'})")
+                logger.debug(
+                    f"Using MCP datetime_price for {ticker} momentum (type: {type(datetime_price_for_momentum).__name__}, len: {len(datetime_price_for_momentum) if hasattr(datetime_price_for_momentum, '__len__') else 'N/A'})"
+                )
 
             momentum_score, reason = cls._calculate_momentum(
                 datetime_price_for_momentum
@@ -1983,10 +2089,13 @@ class MomentumIndicator(BaseTradingIndicator):
             # For penny stocks, we need a much higher threshold to filter out noise/spread
             current_price = technical_analysis.get("close_price", 0.0)
             required_momentum = cls.min_momentum_threshold
-            
-            if current_price > 0 and current_price < cls.max_stock_price_for_penny_treatment:
+
+            if (
+                current_price > 0
+                and current_price < cls.max_stock_price_for_penny_treatment
+            ):
                 required_momentum = 5.0  # Require 5% momentum for stocks under $5
-                
+
             if abs_momentum < required_momentum:
                 stats["low_momentum"] += 1
                 logger.debug(
@@ -2067,7 +2176,7 @@ class MomentumIndicator(BaseTradingIndicator):
                         else:
                             reason_long = f"Not evaluated (momentum is negative {momentum_score:.2f}%, would evaluate trend structure on positive momentum for long entry)"
                             reason_short = f"Trend structure failed: {structure_reason}"
-                        
+
                         inactive_ticker_logs.append(
                             {
                                 "ticker": ticker,
@@ -2090,22 +2199,26 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"❌ {ticker} failed quality filter: {filter_reason} "
                     f"(momentum: {momentum_score:.2f}%)"
                 )
-                
+
                 # Determine which direction(s) this filter applies to
                 # Most filters apply to both directions, but some are direction-specific
                 is_long = momentum_score > 0
                 is_short = momentum_score < 0
-                
+
                 # Check if filter reason indicates direction-specific failure
                 reason_lower = filter_reason.lower()
                 is_direction_specific = (
-                    "rsi" in reason_lower and ("long" in reason_lower or "short" in reason_lower)
-                ) or (
-                    "stochastic" in reason_lower and "short" in reason_lower
-                ) or (
-                    "bollinger" in reason_lower and ("long" in reason_lower or "short" in reason_lower)
+                    (
+                        "rsi" in reason_lower
+                        and ("long" in reason_lower or "short" in reason_lower)
+                    )
+                    or ("stochastic" in reason_lower and "short" in reason_lower)
+                    or (
+                        "bollinger" in reason_lower
+                        and ("long" in reason_lower or "short" in reason_lower)
+                    )
                 )
-                
+
                 if is_direction_specific:
                     # Direction-specific filter (RSI, Stochastic, Bollinger)
                     if is_long:
@@ -2144,16 +2257,22 @@ class MomentumIndicator(BaseTradingIndicator):
 
         # Batch write all inactive ticker reasons in parallel
         if inactive_ticker_logs:
-            logger.debug(f"Logging {len(inactive_ticker_logs)} inactive tickers to DynamoDB")
+            logger.debug(
+                f"Logging {len(inactive_ticker_logs)} inactive tickers to DynamoDB"
+            )
 
             async def log_one(log_data):
                 try:
                     result = await DynamoDBClient.log_inactive_ticker_reason(**log_data)
                     if not result:
-                        logger.debug(f"Failed to log inactive ticker {log_data.get('ticker')}")
+                        logger.debug(
+                            f"Failed to log inactive ticker {log_data.get('ticker')}"
+                        )
                     return result
                 except Exception as e:
-                    logger.error(f"Error logging inactive ticker {log_data.get('ticker')}: {str(e)}")
+                    logger.error(
+                        f"Error logging inactive ticker {log_data.get('ticker')}: {str(e)}"
+                    )
                     return False
 
             # Write in batches using memory-optimized batch size
@@ -2165,7 +2284,9 @@ class MomentumIndicator(BaseTradingIndicator):
                     *[log_one(log_data) for log_data in batch], return_exceptions=True
                 )
                 successful = sum(1 for r in results if r is True)
-                logger.debug(f"Batch {i//batch_size + 1}: {successful}/{len(batch)} inactive tickers logged successfully")
+                logger.debug(
+                    f"Batch {i//batch_size + 1}: {successful}/{len(batch)} inactive tickers logged successfully"
+                )
 
         logger.info(
             f"Calculated momentum scores for {len(ticker_momentum_scores)} tickers "
@@ -2174,7 +2295,7 @@ class MomentumIndicator(BaseTradingIndicator):
             f"{stats['low_momentum']} low momentum, "
             f"{stats['failed_quality_filters']} failed quality filters)"
         )
-        
+
         # Enhanced diagnostics: log if no tickers passed all filters
         if len(ticker_momentum_scores) == 0:
             logger.info(
@@ -2216,7 +2337,7 @@ class MomentumIndicator(BaseTradingIndicator):
             f"MAB selected {len(top_upward)} upward momentum tickers and "
             f"{len(top_downward)} downward momentum tickers (top_k={cls.top_k})"
         )
-        
+
         # Log selected tickers for visibility
         if top_upward:
             logger.debug(
@@ -2258,48 +2379,64 @@ class MomentumIndicator(BaseTradingIndicator):
             )
 
         # Log MAB-rejected tickers (passed validation but not selected by MAB)
-        selected_tickers_list = [t[0] for t in top_upward] + [t[0] for t in top_downward]
-        
+        selected_tickers_list = [t[0] for t in top_upward] + [
+            t[0] for t in top_downward
+        ]
+
         # Get rejection reasons for all rejected tickers
         all_candidates = upward_tickers + downward_tickers
         rejected_info = await MABService.get_rejected_tickers_with_reasons(
             indicator=cls.indicator_name(),
             ticker_candidates=all_candidates,
-            selected_tickers=selected_tickers_list
+            selected_tickers=selected_tickers_list,
         )
-        
+
         if rejected_info:
-            logger.debug(f"Logging {len(rejected_info)} tickers rejected by MAB to InactiveTickersForDayTrading")
+            logger.debug(
+                f"Logging {len(rejected_info)} tickers rejected by MAB to InactiveTickersForDayTrading"
+            )
             for ticker, rejection_data in rejected_info.items():
                 try:
                     market_data_response = market_data_dict.get(ticker)
                     technical_indicators = {}
                     if market_data_response:
-                        technical_indicators = market_data_response.get("technical_analysis", {})
-                        technical_indicators["momentum_score"] = rejection_data.get('momentum_score', 0.0)
-                    
-                    reason_long = rejection_data.get('reason_long', '')
-                    reason_short = rejection_data.get('reason_short', '')
-                    
+                        technical_indicators = market_data_response.get(
+                            "technical_analysis", {}
+                        )
+                        technical_indicators["momentum_score"] = rejection_data.get(
+                            "momentum_score", 0.0
+                        )
+
+                    reason_long = rejection_data.get("reason_long", "")
+                    reason_short = rejection_data.get("reason_short", "")
+
                     # Ensure at least one reason is populated
                     if not reason_long and not reason_short:
-                        logger.warning(f"No rejection reason for {ticker}, skipping MAB rejection log")
+                        logger.warning(
+                            f"No rejection reason for {ticker}, skipping MAB rejection log"
+                        )
                         continue
-                    
+
                     result = await DynamoDBClient.log_inactive_ticker(
                         ticker=ticker,
                         indicator=cls.indicator_name(),
                         reason_not_to_enter_long=reason_long,
                         reason_not_to_enter_short=reason_short,
-                        technical_indicators=technical_indicators
+                        technical_indicators=technical_indicators,
                     )
-                    
+
                     if not result:
-                        logger.warning(f"Failed to log MAB rejection for {ticker} to InactiveTickersForDayTrading")
+                        logger.warning(
+                            f"Failed to log MAB rejection for {ticker} to InactiveTickersForDayTrading"
+                        )
                     else:
-                        logger.debug(f"Logged MAB rejection for {ticker}: long={bool(reason_long)}, short={bool(reason_short)}")
+                        logger.debug(
+                            f"Logged MAB rejection for {ticker}: long={bool(reason_long)}, short={bool(reason_short)}"
+                        )
                 except Exception as e:
-                    logger.warning(f"Error logging MAB rejection for {ticker}: {str(e)}")
+                    logger.warning(
+                        f"Error logging MAB rejection for {ticker}: {str(e)}"
+                    )
 
         # Process long entries
         for rank, (ticker, momentum_score, reason) in enumerate(top_upward, start=1):
@@ -2413,7 +2550,9 @@ class MomentumIndicator(BaseTradingIndicator):
             return ticker_quote.get("ap", 0.0)  # Ask price for short exit
 
     @classmethod
-    def _check_holding_period(cls, created_at: Optional[str], min_holding_seconds: Optional[int] = None) -> Tuple[bool, float]:
+    def _check_holding_period(
+        cls, created_at: Optional[str], min_holding_seconds: Optional[int] = None
+    ) -> Tuple[bool, float]:
         """
         Check if trade has passed minimum holding period.
 
@@ -2590,11 +2729,20 @@ class MomentumIndicator(BaseTradingIndicator):
         for trade in active_trades:
             created_at = trade.get("created_at")
             enter_price = trade.get("enter_price", 0.0)
-            is_penny_stock = enter_price > 0 and enter_price < cls.max_stock_price_for_penny_treatment
-            
+            is_penny_stock = (
+                enter_price > 0
+                and enter_price < cls.max_stock_price_for_penny_treatment
+            )
+
             # Use shorter holding period for penny stocks
-            min_holding = cls.min_holding_period_penny_stocks_seconds if is_penny_stock else cls.min_holding_period_seconds
-            passed, holding_minutes = cls._check_holding_period(created_at, min_holding_seconds=min_holding)
+            min_holding = (
+                cls.min_holding_period_penny_stocks_seconds
+                if is_penny_stock
+                else cls.min_holding_period_seconds
+            )
+            passed, holding_minutes = cls._check_holding_period(
+                created_at, min_holding_seconds=min_holding
+            )
 
             if not passed:
                 ticker = trade.get("ticker")
@@ -2670,22 +2818,28 @@ class MomentumIndicator(BaseTradingIndicator):
 
             # Get recent bars for peak/bottom tracking
             bars_data_for_exit = await AlpacaClient.get_market_data(ticker, limit=50)
-            
+
             # Track peak price (for long) and bottom price (for short) since entry
             # FIXED: Only consider bars AFTER trade entry to avoid using pre-entry prices
             peak_price_since_entry = None
             bottom_price_since_entry = None
-            
+
             if bars_data_for_exit:
                 bars_dict = bars_data_for_exit.get("bars", {})
                 ticker_bars = bars_dict.get(ticker, [])
                 if ticker_bars:
                     # Filter bars to only include those AFTER trade entry
-                    filtered_bars = cls._filter_bars_after_entry(ticker_bars, created_at)
-                    
+                    filtered_bars = cls._filter_bars_after_entry(
+                        ticker_bars, created_at
+                    )
+
                     if filtered_bars:
                         # Get prices from filtered (post-entry) bars only
-                        prices_since_entry = [bar.get("c", 0.0) for bar in filtered_bars if bar.get("c", 0.0) > 0]
+                        prices_since_entry = [
+                            bar.get("c", 0.0)
+                            for bar in filtered_bars
+                            if bar.get("c", 0.0) > 0
+                        ]
                         if prices_since_entry:
                             peak_price_since_entry = max(prices_since_entry)
                             bottom_price_since_entry = min(prices_since_entry)
@@ -2693,16 +2847,22 @@ class MomentumIndicator(BaseTradingIndicator):
                         # No post-entry bars yet - use entry price as initial peak/bottom
                         peak_price_since_entry = float(enter_price)
                         bottom_price_since_entry = float(enter_price)
-                        logger.debug(f"No post-entry bars for {ticker}, using entry price as initial peak/bottom")
+                        logger.debug(
+                            f"No post-entry bars for {ticker}, using entry price as initial peak/bottom"
+                        )
 
             # Calculate holding time for profit-taking exit checks
             holding_seconds = 0.0
             if created_at:
                 try:
-                    entry_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    entry_time = datetime.fromisoformat(
+                        created_at.replace("Z", "+00:00")
+                    )
                     if entry_time.tzinfo is None:
                         entry_time = entry_time.replace(tzinfo=timezone.utc)
-                    holding_seconds = (datetime.now(timezone.utc) - entry_time).total_seconds()
+                    holding_seconds = (
+                        datetime.now(timezone.utc) - entry_time
+                    ).total_seconds()
                 except (ValueError, TypeError):
                     holding_seconds = 0.0
 
@@ -2716,7 +2876,9 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"Max holding time exceeded: {holding_minutes:.0f} min "
                     f"(limit: {MAX_HOLDING_MINUTES} min, profit: {profit_percent:.2f}%)"
                 )
-                logger.warning(f"⏰ Force exit for {ticker}: held too long - {exit_reason}")
+                logger.warning(
+                    f"⏰ Force exit for {ticker}: held too long - {exit_reason}"
+                )
 
             # PRIORITY 1: Exit on profitable trend reversal (BOOK PROFIT QUICKLY)
             # FIXED: Now requires positive profit, minimum profit threshold, and minimum holding time
@@ -2725,18 +2887,25 @@ class MomentumIndicator(BaseTradingIndicator):
                 # For LONG: Exit if price starts dipping from peak
                 if peak_price_since_entry and peak_price_since_entry > 0:
                     # Calculate dip from peak (negative value means price dropped)
-                    dip_from_peak_percent = ((peak_price_since_entry - current_price) / peak_price_since_entry) * 100
+                    dip_from_peak_percent = (
+                        (peak_price_since_entry - current_price)
+                        / peak_price_since_entry
+                    ) * 100
                     # Calculate profit from entry
-                    profit_from_entry = ((current_price - float(enter_price)) / float(enter_price)) * 100
-                    
+                    profit_from_entry = (
+                        (current_price - float(enter_price)) / float(enter_price)
+                    ) * 100
+
                     # Use new helper method with all safety checks
-                    should_trigger, trigger_reason = cls._should_trigger_profit_taking_exit(
-                        profit_from_entry=profit_from_entry,
-                        dip_or_rise_percent=dip_from_peak_percent,
-                        holding_seconds=holding_seconds,
-                        is_long=True,
+                    should_trigger, trigger_reason = (
+                        cls._should_trigger_profit_taking_exit(
+                            profit_from_entry=profit_from_entry,
+                            dip_or_rise_percent=dip_from_peak_percent,
+                            holding_seconds=holding_seconds,
+                            is_long=True,
+                        )
                     )
-                    
+
                     if should_trigger:
                         should_exit = True
                         exit_reason = (
@@ -2747,18 +2916,25 @@ class MomentumIndicator(BaseTradingIndicator):
                 # For SHORT: Exit if price starts rising from bottom
                 if bottom_price_since_entry and bottom_price_since_entry > 0:
                     # Calculate rise from bottom (positive value means price rose)
-                    rise_from_bottom_percent = ((current_price - bottom_price_since_entry) / bottom_price_since_entry) * 100
+                    rise_from_bottom_percent = (
+                        (current_price - bottom_price_since_entry)
+                        / bottom_price_since_entry
+                    ) * 100
                     # Calculate profit from entry (for shorts, profit = entry - current)
-                    profit_from_entry = ((float(enter_price) - current_price) / float(enter_price)) * 100
-                    
+                    profit_from_entry = (
+                        (float(enter_price) - current_price) / float(enter_price)
+                    ) * 100
+
                     # Use new helper method with all safety checks
-                    should_trigger, trigger_reason = cls._should_trigger_profit_taking_exit(
-                        profit_from_entry=profit_from_entry,
-                        dip_or_rise_percent=rise_from_bottom_percent,
-                        holding_seconds=holding_seconds,
-                        is_long=False,
+                    should_trigger, trigger_reason = (
+                        cls._should_trigger_profit_taking_exit(
+                            profit_from_entry=profit_from_entry,
+                            dip_or_rise_percent=rise_from_bottom_percent,
+                            holding_seconds=holding_seconds,
+                            is_long=False,
+                        )
                     )
-                    
+
                     if should_trigger:
                         should_exit = True
                         exit_reason = (
@@ -2773,17 +2949,23 @@ class MomentumIndicator(BaseTradingIndicator):
                 # Initialize exit engine if needed
                 if cls._exit_engine is None:
                     cls._exit_engine = ExitDecisionEngine()
-                
+
                 # Track consecutive loss checks
-                consecutive_checks = cls._exit_engine.consecutive_loss_checks.get(ticker, 0) + 1
+                consecutive_checks = (
+                    cls._exit_engine.consecutive_loss_checks.get(ticker, 0) + 1
+                )
                 cls._exit_engine.consecutive_loss_checks[ticker] = consecutive_checks
-                
+
                 # PATIENT: Require 12 consecutive checks (60 seconds at 5s intervals)
                 # This gives the trade a full minute to recover from a dip
                 # Only exit immediately on catastrophic loss
-                CONSECUTIVE_CHECKS_REQUIRED = 6  # 30 seconds of confirmation (reduced from 60s)
-                CATASTROPHIC_FLOOR = -8.0  # HARD FLOOR: Never let a trade lose more than 8%
-                
+                CONSECUTIVE_CHECKS_REQUIRED = (
+                    6  # 30 seconds of confirmation (reduced from 60s)
+                )
+                CATASTROPHIC_FLOOR = (
+                    -8.0
+                )  # HARD FLOOR: Never let a trade lose more than 8%
+
                 # Catastrophic threshold is the HIGHER (less negative) of:
                 # - 2x the dynamic stop loss
                 # - Hard floor of -8%
@@ -2791,7 +2973,7 @@ class MomentumIndicator(BaseTradingIndicator):
                 dynamic_catastrophic = stop_loss_threshold * 2.0
                 catastrophic_threshold = max(dynamic_catastrophic, CATASTROPHIC_FLOOR)
                 is_catastrophic = profit_percent < catastrophic_threshold
-                
+
                 if is_catastrophic:
                     # Catastrophic loss - exit immediately
                     should_exit = True
@@ -2812,19 +2994,26 @@ class MomentumIndicator(BaseTradingIndicator):
                         f"{' (dynamic)' if dynamic_stop_loss is not None else ''}, "
                         f"confirmed after {wait_seconds}s of waiting)"
                     )
-                    logger.info(f"Exit signal for {ticker} - stop loss after patience: {profit_percent:.2f}%")
+                    logger.info(
+                        f"Exit signal for {ticker} - stop loss after patience: {profit_percent:.2f}%"
+                    )
                     cls._exit_engine.consecutive_loss_checks[ticker] = 0
                 else:
                     # Still waiting - log progress
                     wait_seconds = consecutive_checks * cls.exit_cycle_seconds
-                    remaining_seconds = (CONSECUTIVE_CHECKS_REQUIRED - consecutive_checks) * cls.exit_cycle_seconds
+                    remaining_seconds = (
+                        CONSECUTIVE_CHECKS_REQUIRED - consecutive_checks
+                    ) * cls.exit_cycle_seconds
                     logger.debug(
                         f"Stop loss warning for {ticker}: {profit_percent:.2f}% "
                         f"(waited {wait_seconds}s, {remaining_seconds}s remaining before exit)"
                     )
             elif profit_percent >= stop_loss_threshold:
                 # Reset consecutive loss counter if not in loss territory
-                if cls._exit_engine is not None and ticker in cls._exit_engine.consecutive_loss_checks:
+                if (
+                    cls._exit_engine is not None
+                    and ticker in cls._exit_engine.consecutive_loss_checks
+                ):
                     cls._exit_engine.consecutive_loss_checks[ticker] = 0
 
             # PRIORITY 3: Force exit before market close ONLY if trade is profitable
@@ -2848,14 +3037,19 @@ class MomentumIndicator(BaseTradingIndicator):
             if not should_exit:
                 # For penny stocks: QUICK PROFIT EXIT - bank on volatility, get out fast!
                 is_penny_stock = enter_price < cls.max_stock_price_for_penny_treatment
-                if is_penny_stock and profit_percent >= cls.penny_stock_quick_profit_target:
+                if (
+                    is_penny_stock
+                    and profit_percent >= cls.penny_stock_quick_profit_target
+                ):
                     should_exit = True
                     exit_reason = (
                         f"Penny stock quick profit target reached: {profit_percent:.2f}% profit "
                         f"(target: {cls.penny_stock_quick_profit_target:.2f}% - banking on volatility, quick exit)"
                     )
-                    logger.info(f"Quick profit exit for penny stock {ticker}: {exit_reason}")
-                
+                    logger.info(
+                        f"Quick profit exit for penny stock {ticker}: {exit_reason}"
+                    )
+
                 if not should_exit:
                     # Calculate dynamic profit target: 2x stop distance as recommended
                     # If stop loss is -3%, profit target should be +6%
@@ -2947,52 +3141,68 @@ class MomentumIndicator(BaseTradingIndicator):
                     "technical_indicators_for_enter"
                 )
                 # technical_analysis IS the indicators dict (from calculate_all_indicators)
-                technical_indicators_for_exit = technical_analysis.copy() if isinstance(technical_analysis, dict) else {}
+                technical_indicators_for_exit = (
+                    technical_analysis.copy()
+                    if isinstance(technical_analysis, dict)
+                    else {}
+                )
                 if "datetime_price" in technical_indicators_for_exit:
                     technical_indicators_for_exit = {
                         k: v
                         for k, v in technical_indicators_for_exit.items()
                         if k != "datetime_price"
                     }
-                
+
                 # IMPROVED: Add exit metadata
                 technical_indicators_for_exit["holding_seconds"] = holding_seconds
-                
+
                 # Calculate final profit for metrics
                 final_profit_percent = cls._calculate_profit_percent(
                     enter_price, exit_price, original_action
                 )
-                
+
                 # IMPROVED: Track daily performance metrics
                 if cls._daily_metrics is None:
                     cls._daily_metrics = DailyPerformanceMetrics()
-                
+
                 # Check if we need to reset daily metrics
                 today = datetime.now().strftime("%Y-%m-%d")
                 if cls._daily_metrics.date != today:
-                    logger.info(f"📊 End of day metrics: {cls._daily_metrics.to_dict()}")
+                    logger.info(
+                        f"📊 End of day metrics: {cls._daily_metrics.to_dict()}"
+                    )
                     cls._daily_metrics.reset()
-                
+
                 # Determine if loss was spread-induced
                 # Handle case where technical_indicators_for_enter might be a string or dict
                 if isinstance(technical_indicators_for_enter, str):
                     import json
+
                     try:
-                        technical_indicators_for_enter = json.loads(technical_indicators_for_enter)
+                        technical_indicators_for_enter = json.loads(
+                            technical_indicators_for_enter
+                        )
                     except (json.JSONDecodeError, TypeError):
                         technical_indicators_for_enter = {}
-                
-                spread_percent = float(technical_indicators_for_enter.get("spread_percent", 1.0)) if isinstance(technical_indicators_for_enter, dict) else 1.0
-                is_spread_induced = final_profit_percent < 0 and abs(final_profit_percent) <= spread_percent * 1.5
-                
+
+                spread_percent = (
+                    float(technical_indicators_for_enter.get("spread_percent", 1.0))
+                    if isinstance(technical_indicators_for_enter, dict)
+                    else 1.0
+                )
+                is_spread_induced = (
+                    final_profit_percent < 0
+                    and abs(final_profit_percent) <= spread_percent * 1.5
+                )
+
                 cls._daily_metrics.record_trade(final_profit_percent, is_spread_induced)
-                
+
                 if is_spread_induced:
                     logger.warning(
                         f"📛 Spread-induced loss for {ticker}: {final_profit_percent:.2f}% "
                         f"(spread was {spread_percent:.2f}%)"
                     )
-                
+
                 # Reset consecutive loss counter for this ticker
                 if cls._exit_engine is not None:
                     cls._exit_engine.reset_ticker(ticker)

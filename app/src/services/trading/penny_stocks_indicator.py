@@ -47,6 +47,7 @@ from app.src.services.trading.enhanced_validation_pipeline import (
     get_validation_pipeline,
 )
 from app.src.services.trading.dynamic_position_sizer import DynamicPositionSizer
+from app.src.services.trading.market_direction_filter import MarketDirectionFilter
 from app.src.services.trading.peak_detector import PeakDetector
 from app.src.services.trading.volume_analyzer import VolumeAnalyzer
 from app.src.services.trading.momentum_acceleration_analyzer import (
@@ -1625,6 +1626,21 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     "Ticker is not shortable according to Alpaca API",
                 )
                 return False
+
+        # MARKET DIRECTION FILTER - Check QQQ trend before allowing trades
+        should_allow, market_reason, trend_details = (
+            await MarketDirectionFilter.should_allow_trade(
+                action=action, indicator_name=cls.indicator_name()
+            )
+        )
+        if not should_allow:
+            logger.warning(
+                f"Market direction filter blocked {ticker} {action}: {market_reason}"
+            )
+            await cls._log_selected_ticker_entry_failure(
+                ticker, momentum_score, action, market_reason
+            )
+            return False
 
         # Get entry price using Alpaca API
         quote_response = await AlpacaClient.quote(ticker)
