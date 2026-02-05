@@ -54,10 +54,9 @@ class AlpacaClient:
                     limit_per_host=10,  # Per host connection limit
                     ttl_dns_cache=300,  # DNS cache TTL (5 minutes)
                     use_dns_cache=True,
-                    keepalive_timeout=30,  # Keep connections alive
                     enable_cleanup_closed=True,  # Clean up closed connections
-                    force_close=False,  # Don't force close connections
-                    ssl=True,  # Enable SSL verification (was causing auth issues)
+                    force_close=True,  # Force close connections to prevent SSL issues
+                    ssl=True,  # Enable SSL verification
                 )
 
                 # Configure timeout for better reliability
