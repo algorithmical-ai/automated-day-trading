@@ -50,15 +50,15 @@ class AlpacaClient:
             if cls._session is None or cls._session.closed:
                 # Create optimized connector for Alpaca API
                 connector = aiohttp.TCPConnector(
-                    limit=20,  # Total connection pool limit
-                    limit_per_host=10,  # Per host connection limit
+                    limit=3,  # Reduce total connection pool limit
+                    limit_per_host=2,  # Reduce per host connection limit
                     ttl_dns_cache=300,  # DNS cache TTL (5 minutes)
                     use_dns_cache=True,
+                    keepalive_timeout=30,  # Keep connections alive
                     enable_cleanup_closed=True,  # Clean up closed connections
-                    force_close=True,  # Force close connections to prevent SSL issues
+                    force_close=False,  # Allow connection reuse
                     ssl=True,  # Enable SSL verification
                 )
-
                 # Configure timeout for better reliability
                 timeout = aiohttp.ClientTimeout(
                     total=5,  # Total timeout
