@@ -343,8 +343,9 @@ class BaseTradingIndicator(ABC):
                 logger.warning(f"Unknown action: {original_action} for {ticker}")
                 return False
 
-            # Calculate profit/loss using $2000 position size
-            # Buy $2000 worth of shares at enter_price, sell all at exit_price
+            # Calculate profit/loss using position size
+            # Use the position size stored at entry if available (from DynamicPositionSizer),
+            # otherwise fall back to the class default
             if enter_price <= 0:
                 logger.warning(
                     f"Invalid enter_price ({enter_price}) for {ticker}, setting profit_or_loss to 0"
@@ -355,8 +356,15 @@ class BaseTradingIndicator(ABC):
                 enter_price = float(enter_price)
                 exit_price = float(exit_price)
 
-                # Calculate number of shares bought with $2000
-                number_of_shares = cls.position_size_dollars / enter_price
+                # Use actual position size from entry if stored, otherwise use class default
+                actual_position_size = cls.position_size_dollars
+                if technical_indicators_enter and isinstance(technical_indicators_enter, dict):
+                    stored_size = technical_indicators_enter.get("position_size_dollars")
+                    if stored_size is not None and float(stored_size) > 0:
+                        actual_position_size = float(stored_size)
+
+                # Calculate number of shares bought with actual position size
+                number_of_shares = actual_position_size / enter_price
 
                 if original_action == "buy_to_open":
                     # Long trade: buy at enter_price, sell at exit_price
@@ -371,7 +379,7 @@ class BaseTradingIndicator(ABC):
 
                 logger.debug(
                     f"Profit/loss calculation for {ticker}: "
-                    f"position_size=${cls.position_size_dollars:.2f}, "
+                    f"position_size=${actual_position_size:.2f}, "
                     f"shares={number_of_shares:.4f}, "
                     f"enter=${enter_price:.4f}, exit=${exit_price:.4f}, "
                     f"profit/loss=${profit_or_loss:.2f}"

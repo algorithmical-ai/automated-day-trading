@@ -131,10 +131,11 @@ class MABService:
                 table_name=self.MAB_STATS_TABLE, item=stats.to_dict()
             )
 
+        new_total = total_trades if current_stats else 1
         if result:
             logger.info(
                 f"Updated MAB stats for {indicator}#{ticker}: "
-                f"success={success}, new_total={total_trades if current_stats else 1}"
+                f"success={success}, new_total={new_total}"
             )
         else:
             logger.error(f"Failed to update MAB stats for {indicator}#{ticker}")

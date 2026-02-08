@@ -133,17 +133,17 @@ def test_property_79_stop_loss_bounds_consistency(
     Validates: Requirements 19.3
     """
     if is_penny_stock:
-        # Penny stock bounds - now fixed at 2% for simple trailing stop
+        # Penny stock bounds - ATR-based, consistent with PennyStocksIndicator
         min_bound = PENNY_STOCK_STOP_LOSS_MIN
         max_bound = PENNY_STOCK_STOP_LOSS_MAX
 
-        # Verify standardized values (both set to -2% for simple trailing stop)
+        # Verify standardized values: MIN=-8% (widest), MAX=-4% (tightest)
         assert (
-            min_bound == -2.0
-        ), f"Penny stock stop loss min should be -2.0, got {min_bound}"
+            min_bound == -8.0
+        ), f"Penny stock stop loss min should be -8.0, got {min_bound}"
         assert (
-            max_bound == -2.0
-        ), f"Penny stock stop loss max should be -2.0, got {max_bound}"
+            max_bound == -4.0
+        ), f"Penny stock stop loss max should be -4.0, got {max_bound}"
     else:
         # Standard stock bounds
         min_bound = STANDARD_STOCK_STOP_LOSS_MIN
@@ -275,8 +275,8 @@ def test_all_indicators_import_from_trading_config():
     # Verify all constants are defined and have expected values
     assert ATR_STOP_LOSS_MULTIPLIER == 2.5
     assert ATR_TRAILING_STOP_MULTIPLIER == 1.5
-    assert PENNY_STOCK_STOP_LOSS_MIN == -2.0  # Updated for 2% trailing stop
-    assert PENNY_STOCK_STOP_LOSS_MAX == -2.0  # Updated for 2% trailing stop
+    assert PENNY_STOCK_STOP_LOSS_MIN == -8.0  # Widest: -8% (cap for volatile penny stocks)
+    assert PENNY_STOCK_STOP_LOSS_MAX == -4.0  # Tightest: -4% (floor)
     assert STANDARD_STOCK_STOP_LOSS_MIN == -6.0
     assert STANDARD_STOCK_STOP_LOSS_MAX == -4.0
     assert BASE_TRAILING_STOP_PERCENT == 2.0

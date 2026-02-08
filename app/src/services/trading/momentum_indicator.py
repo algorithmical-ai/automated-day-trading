@@ -33,6 +33,10 @@ from app.src.services.trading.trading_config import (
     BASE_TRAILING_STOP_PERCENT,
     TRAILING_STOP_SHORT_MULTIPLIER,
     MAX_TRAILING_STOP_SHORT,
+    PENNY_STOCK_STOP_LOSS_MIN,
+    PENNY_STOCK_STOP_LOSS_MAX,
+    STANDARD_STOCK_STOP_LOSS_MIN,
+    STANDARD_STOCK_STOP_LOSS_MAX,
 )
 from app.src.services.trading.penny_stock_utils import (
     SpreadCalculator,
@@ -105,7 +109,7 @@ class MomentumIndicator(BaseTradingIndicator):
 
     # Volatility and low-priced stock filters
     min_stock_price: float = (
-        0.10  # Minimum stock price to trade (avoid extreme penny stocks)
+        5.0  # Minimum stock price to trade (penny stocks handled by PennyStocksIndicator)
     )
     max_stock_price_for_penny_treatment: float = (
         5.0  # Stocks under $5 get special handling (tight trailing stops)
@@ -523,14 +527,12 @@ class MomentumIndicator(BaseTradingIndicator):
                 dynamic_stop_loss = -(atr_percent * ATR_STOP_LOSS_MULTIPLIER)
 
                 # Cap at reasonable levels to prevent excessive risk
-                # For low-priced stocks, allow wider stops
+                # Uses centralized bounds from trading_config.py
                 is_low_price = enter_price < cls.max_stock_price_for_penny_treatment
                 if is_low_price:
-                    # Cap between -4.0% and -8.0% for penny stocks
-                    dynamic_stop_loss = max(-8.0, min(-4.0, dynamic_stop_loss))
+                    dynamic_stop_loss = max(PENNY_STOCK_STOP_LOSS_MIN, min(PENNY_STOCK_STOP_LOSS_MAX, dynamic_stop_loss))
                 else:
-                    # Cap between -4.0% and -8.0% for regular stocks (WIDENED from -2.5%/-6.0%)
-                    dynamic_stop_loss = max(-8.0, min(-4.0, dynamic_stop_loss))
+                    dynamic_stop_loss = max(STANDARD_STOCK_STOP_LOSS_MIN, min(STANDARD_STOCK_STOP_LOSS_MAX, dynamic_stop_loss))
 
                 logger.info(
                     f"ATR-based stop loss (2x ATR) for {ticker}: {dynamic_stop_loss:.2f}% "
@@ -986,13 +988,9 @@ class MomentumIndicator(BaseTradingIndicator):
                     f"MFI too high for short: {mfi:.1f} > {cls.mfi_max_for_short} (parabolic squeeze in progress)",
                 )
 
-        # NEW: For shorts, reject if RSI is extremely overbought (>75) - parabolic squeeze in progress
-        # These stocks often keep running higher before reversing
-        if is_short and rsi > 75.0:
-            return (
-                False,
-                f"RSI too high for short: {rsi:.2f} > 75 (parabolic squeeze in progress, wait for exhaustion)",
-            )
+        # NOTE: RSI > 75 filter for shorts removed — overbought stocks ARE good short candidates.
+        # The MFI > 80 filter (above) already catches parabolic squeezes via money flow.
+        # Rejecting RSI > 75 shorts was contradictory: high RSI means overbought = short opportunity.
 
         # Check stochastic confirmation (prevent entering during wrong momentum phase)
         stoch = technical_analysis.get("stoch", {})
@@ -1618,9 +1616,8 @@ class MomentumIndicator(BaseTradingIndicator):
         # Rank factor (rank 1 = 1.0, rank 2 = 0.9)
         rank_factor = 1.0 if rank == 1 else 0.9
 
-        # Golden factor (golden = bonus confidence)
+        # Golden factor (golden = bonus confidence, applied after weighted sum)
         golden_factor = 1.1 if is_golden else 1.0  # 10% bonus for golden
-        golden_factor = min(1.0, golden_factor)  # Cap at 1.0
 
         # RSI factor (for longs: 50-65 = optimal)
         rsi_factor = 1.0
@@ -1907,22 +1904,12 @@ class MomentumIndicator(BaseTradingIndicator):
             technical_indicators=technical_indicators_for_enter,
         )
 
-        await send_signal_to_webhook(
-            ticker=ticker,
-            action=action,
-            indicator=cls.indicator_name(),
-            enter_reason=ranked_reason,
-            enter_price=enter_price,
-            technical_indicators=technical_indicators_for_enter,
-            confidence_score=confidence_score,
-        )
-
         # Calculate dynamic stop loss
         dynamic_stop_loss = await cls._calculate_dynamic_stop_loss(
             ticker, enter_price, technical_indicators_for_enter, action=action
         )
 
-        # Enter trade
+        # Enter trade FIRST, then send webhook only on success
         entry_success = await cls._enter_trade(
             ticker=ticker,
             action=action,
@@ -1935,6 +1922,21 @@ class MomentumIndicator(BaseTradingIndicator):
         if not entry_success:
             logger.error(f"Failed to enter trade for {ticker}")
             return False
+
+        # Send webhook AFTER successful entry to prevent orphaned signals
+        webhook_success = await send_signal_to_webhook(
+            ticker=ticker,
+            action=action,
+            indicator=cls.indicator_name(),
+            enter_reason=ranked_reason,
+            enter_price=enter_price,
+            technical_indicators=technical_indicators_for_enter,
+            confidence_score=confidence_score,
+        )
+        if not webhook_success:
+            logger.warning(
+                f"Webhook failed for {ticker} {action} entry, but trade is tracked in DB"
+            )
 
         return True
 

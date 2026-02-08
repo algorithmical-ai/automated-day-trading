@@ -18,20 +18,20 @@ class TestStopLossCalculation:
     def test_stop_loss_penny_stock_within_bounds(self):
         """Test stop loss for penny stock with ATR resulting in value within bounds"""
         # Entry price: $3.00, ATR: $0.15 (5% of price)
-        # 2.0x ATR = 10%, should be capped to -2% (max for penny stocks)
+        # 2.5x ATR = 12.5%, stop_loss = -12.5%, clamped to -8.0 (min bound)
         result = RiskManagement.calculate_stop_loss(
             entry_price=3.0, atr=0.15, is_penny_stock=True
         )
-        assert result == -2.0
+        assert result == -8.0
 
     def test_stop_loss_penny_stock_below_min(self):
         """Test stop loss for penny stock with low ATR"""
         # Entry price: $4.00, ATR: $0.04 (1% of price)
-        # 2.0x ATR = 2%, should be capped to -2% (min for penny stocks)
+        # 2.5x ATR = 2.5%, stop_loss = -2.5%, clamped to -4.0 (max/tightest bound)
         result = RiskManagement.calculate_stop_loss(
             entry_price=4.0, atr=0.04, is_penny_stock=True
         )
-        assert result == -2.0
+        assert result == -4.0
 
     def test_stop_loss_standard_stock_within_bounds(self):
         """Test stop loss for standard stock"""
@@ -54,8 +54,9 @@ class TestStopLossCalculation:
     def test_stop_loss_auto_detect_penny_stock(self):
         """Test automatic penny stock detection"""
         # Price < $5 should be detected as penny stock
+        # Entry price: $3.00, ATR: $0.15 → ATR%=5%, 2.5x ATR = -12.5%, clamped to -8.0
         result = RiskManagement.calculate_stop_loss(entry_price=3.0, atr=0.15)
-        assert result == -2.0  # Now fixed at 2% for penny stocks
+        assert result == -8.0  # Clamped to penny stock min bound
 
     def test_stop_loss_auto_detect_standard_stock(self):
         """Test automatic standard stock detection"""

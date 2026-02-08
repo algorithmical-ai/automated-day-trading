@@ -27,9 +27,11 @@ ATR_STOP_LOSS_MULTIPLIER_VOLATILITY_UTILS = 3.0
 # Stop Loss Bounds
 # =============================================================================
 
-# Penny stock stop loss bounds
-PENNY_STOCK_STOP_LOSS_MIN = -2.0  # Tightened from -8.0 to limit max loss
-PENNY_STOCK_STOP_LOSS_MAX = -2.0  # Tightened from -4.0 to enforce 2% stop
+# Penny stock stop loss bounds (ATR-based, consistent with PennyStocksIndicator)
+# Usage: max(MIN, min(MAX, stop_loss)) — clamps between MIN (widest) and MAX (tightest)
+# For negative values: MIN is more negative (widest stop), MAX is less negative (tightest stop)
+PENNY_STOCK_STOP_LOSS_MIN = -8.0  # Widest: -8% (cap for volatile penny stocks)
+PENNY_STOCK_STOP_LOSS_MAX = -4.0  # Tightest: -4% (floor)
 
 # Standard stock stop loss bounds
 STANDARD_STOCK_STOP_LOSS_MIN = -6.0

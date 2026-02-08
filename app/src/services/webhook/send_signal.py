@@ -30,8 +30,12 @@ async def send_signal_to_webhook(
     exit_price: Optional[float] = None,
     technical_indicators: Optional[dict] = None,
     confidence_score: Optional[float] = None,
-) -> None:
-    """Send buy/sell signal to webhook and manage DynamoDB entries with timeout protection."""
+) -> bool:
+    """Send buy/sell signal to webhook and manage DynamoDB entries with timeout protection.
+
+    Returns:
+        True if webhook signal was sent successfully, False otherwise.
+    """
     # Add overall timeout protection
     try:
         return await asyncio.wait_for(
@@ -51,7 +55,8 @@ async def send_signal_to_webhook(
             timeout=8.0,
         )
     except asyncio.TimeoutError:
-        logger.debug(f"Webhook signal timeout for {ticker} {action}")
+        logger.error(f"Webhook signal timeout for {ticker} {action}")
+        return False
 
 
 async def _send_signal_to_webhook_impl(  # noqa: C901
@@ -66,8 +71,12 @@ async def _send_signal_to_webhook_impl(  # noqa: C901
     exit_price: Optional[float] = None,
     technical_indicators: Optional[dict] = None,
     confidence_score: Optional[float] = None,
-) -> None:
-    """Internal implementation of webhook signal sending."""
+) -> bool:
+    """Internal implementation of webhook signal sending.
+
+    Returns:
+        True if webhook signal was sent successfully to at least one URL, False otherwise.
+    """
 
     # Input validation
     if not ticker or not ticker.strip():
@@ -132,11 +141,11 @@ async def _send_signal_to_webhook_impl(  # noqa: C901
             quote_response = await AlpacaClient.quote(ticker)
             if not quote_response:
                 logger.warning(f"Failed to get quote for {ticker}")
-
-            quote_data = quote_response.get("quote", {})
-            quotes = quote_data.get("quotes", {})
-            ticker_quote = quotes.get(ticker, {})
-            current_price = ticker_quote.get("ap", 0.0)  # Ask price for buy
+            else:
+                quote_data = quote_response.get("quote", {})
+                quotes = quote_data.get("quotes", {})
+                ticker_quote = quotes.get(ticker, {})
+                current_price = ticker_quote.get("ap", 0.0)  # Ask price for buy
 
         except Exception as e:
             logger.debug(f"⚠️ Could not fetch current price for {ticker}: {e}")
@@ -244,8 +253,8 @@ async def _send_signal_to_webhook_impl(  # noqa: C901
         logger.error(
             f"❌ All webhook attempts failed for {action} signal {ticker}: {last_error}"
         )
-        # Continue with database operations even if webhook fails
-        # This prevents losing trade signals due to webhook issues
+
+    return webhook_success
 
 
 # Log webhook configuration on module load

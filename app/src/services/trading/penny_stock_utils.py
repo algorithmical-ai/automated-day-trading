@@ -148,28 +148,30 @@ class TieredTrailingStop:
     # Strategy: Lock in profits aggressively as price moves in our favor
     # Tiers ordered from highest to lowest profit threshold
     # This ensures we check the most profitable tier first
+    # SCALPING TIERS: Lock profits fast at low thresholds
+    # Strategy: Take the money and run - aggressive profit locking for volatile penny stocks
     TIERS = [
-        # High profit tier: Lock in substantial gains
+        # High profit: lock aggressively
         TrailingStopConfig(
-            profit_threshold=10.0, trail_percent=3.0, min_locked_profit=7.0
-        ),  # Lock 7% at 10%+ profit
+            profit_threshold=5.0, trail_percent=1.5, min_locked_profit=3.5
+        ),  # Lock 3.5% at 5%+ profit
         TrailingStopConfig(
-            profit_threshold=7.0, trail_percent=2.5, min_locked_profit=4.5
-        ),  # Lock 4.5% at 7%+ profit
+            profit_threshold=3.0, trail_percent=1.0, min_locked_profit=2.0
+        ),  # Lock 2.0% at 3%+ profit
+        # Medium profit: take the money and run
         TrailingStopConfig(
-            profit_threshold=5.0, trail_percent=2.0, min_locked_profit=3.0
-        ),  # Lock 3% at 5%+ profit
-        # Medium profit tier: Lock in moderate gains
+            profit_threshold=2.0, trail_percent=0.75, min_locked_profit=1.25
+        ),  # Lock 1.25% at 2%+ profit
         TrailingStopConfig(
-            profit_threshold=3.0, trail_percent=1.5, min_locked_profit=1.5
-        ),  # Lock 1.5% at 3%+ profit
-        # Low profit tier: Lock in small gains (protect breakeven)
+            profit_threshold=1.5, trail_percent=0.5, min_locked_profit=0.75
+        ),  # Lock 0.75% at 1.5%+ profit
+        # Small profit: protect breakeven aggressively
         TrailingStopConfig(
-            profit_threshold=1.5, trail_percent=1.0, min_locked_profit=0.5
-        ),  # Lock 0.5% at 1.5%+ profit
+            profit_threshold=0.75, trail_percent=0.4, min_locked_profit=0.25
+        ),  # Lock 0.25% at 0.75%+ profit
         TrailingStopConfig(
-            profit_threshold=0.5, trail_percent=0.5, min_locked_profit=0.0
-        ),  # Protect breakeven at 0.5%+ profit
+            profit_threshold=0.3, trail_percent=0.3, min_locked_profit=0.0
+        ),  # Protect breakeven at 0.3%+ profit
     ]
 
     @classmethod
@@ -219,7 +221,7 @@ class MomentumConfirmation:
     MIN_BARS_IN_TREND = 2  # 2 of 5 bars in trend direction is enough
     TOTAL_BARS_TO_CHECK = 5
     MIN_PRICE_CHANGE_PERCENT = (
-        3.0  # INCREASED from 2.0% - RIG entered with 0.24% which is noise
+        1.5  # REDUCED from 3.0% for scalping - catch earlier momentum moves
     )
 
     @classmethod
@@ -310,18 +312,17 @@ class ExitDecision:
 class ExitDecisionEngine:
     """Centralized exit decision logic with priority-based evaluation."""
 
-    # MUCH WIDER: Penny stocks routinely swing 3-5% - need room to breathe
-    # Dec 12: IRBT exited at 66s with -3.48% - still too fast
-    MIN_HOLDING_SECONDS = 90  # INCREASED from 60 - give trades MORE time to develop
-    EMERGENCY_STOP_PERCENT = -8.0  # WIDENED from -7.0% - only exit on catastrophic loss
+    # FAST SCALPING: Quick exits to protect capital
+    MIN_HOLDING_SECONDS = 15  # REDUCED from 90s - allow fast scalp exits
+    EMERGENCY_STOP_PERCENT = -5.0  # TIGHTENED from -8.0% - tighter loss protection
     CONSECUTIVE_CHECKS_REQUIRED = (
-        4  # INCREASED from 3 - require MORE confirmation before stop
+        2  # REDUCED from 4 - faster stop loss triggers for scalping
     )
 
-    # IMPROVED: Trend reversal detection for better exit timing
-    TREND_REVERSAL_BARS = 3  # Number of recent bars to check for reversal
+    # FAST SCALPING: Detect reversals quickly
+    TREND_REVERSAL_BARS = 2  # REDUCED from 3 - detect reversals faster
     TREND_REVERSAL_THRESHOLD = (
-        1.5  # % drop from peak to trigger reversal exit (for profitable trades)
+        0.75  # TIGHTENED from 1.5% - exit faster on reversal for scalping
     )
 
     def __init__(self):
@@ -629,11 +630,11 @@ class EnhancedExitDecisionEngine(ExitDecisionEngine):
     6. Trend reversal detection
     """
 
-    # Initial period configuration - tighter stops for quick reversals
-    INITIAL_PERIOD_SECONDS: int = 180  # 3 minutes
-    INITIAL_STOP_LOSS_PERCENT: float = -2.0  # Tightened to 2% stop loss
-    EARLY_EXIT_LOSS_PERCENT: float = -2.0  # Tightened to 2% stop loss
-    EARLY_EXIT_TIME_SECONDS: int = 120  # 2 minutes for early exit
+    # SCALPING: Tighter initial stops, faster early exits
+    INITIAL_PERIOD_SECONDS: int = 60  # REDUCED from 180s - shorter initial period for scalps
+    INITIAL_STOP_LOSS_PERCENT: float = -2.0  # Keep 2% during initial period
+    EARLY_EXIT_LOSS_PERCENT: float = -1.5  # TIGHTENED from -2.0% - exit bad trades faster
+    EARLY_EXIT_TIME_SECONDS: int = 30  # REDUCED from 120s - shorter early exit window
 
     def __init__(self, config=None):
         """Initialize with optional configuration.

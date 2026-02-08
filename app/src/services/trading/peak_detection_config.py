@@ -18,36 +18,36 @@ class PeakDetectionConfig:
     momentum acceleration, stop losses, and position sizing.
     """
     
-    # Peak detection parameters
-    peak_proximity_threshold: float = 0.85  # Score above this rejects entry
-    peak_lookback_bars: int = 10  # Number of bars to look back for peak
-    
-    # Volume confirmation parameters
-    volume_lookback_bars: int = 20  # Number of bars for volume average
-    high_volume_multiplier: float = 1.5  # 50% above average = score 1.0
-    
-    # Momentum acceleration parameters
-    momentum_deceleration_threshold: float = -2.0  # Below this rejects entry
-    momentum_normalization_range: float = 5.0  # Values beyond ±5 are clamped
-    
-    # Stop loss parameters - tighter for quick reversals
-    initial_stop_loss_percent: float = -5.0  # Stop during first 3 minutes
-    early_exit_loss_percent: float = -3.0  # Early exit threshold
-    early_exit_time_seconds: int = 120  # 2 minutes for early exit
-    initial_period_seconds: int = 180  # 3 minutes initial period
-    emergency_stop_percent: float = -8.0  # Emergency stop (always active)
-    
-    # Position sizing parameters
-    min_confidence_threshold: float = 0.4  # Below this rejects entry
+    # Peak detection parameters - LOOSENED for fast scalping entries
+    peak_proximity_threshold: float = 0.90  # LOOSENED: from 0.85 - allow entries closer to recent highs
+    peak_lookback_bars: int = 7  # REDUCED: from 10 - shorter lookback for fast-moving stocks
+
+    # Volume confirmation parameters - more permissive for penny stocks
+    volume_lookback_bars: int = 15  # REDUCED: from 20 - shorter volume baseline
+    high_volume_multiplier: float = 1.3  # LOOSENED: from 1.5 - more permissive volume gate
+
+    # Momentum acceleration parameters - more permissive for scalping
+    momentum_deceleration_threshold: float = -3.0  # LOOSENED: from -2.0 - allow more entries
+    momentum_normalization_range: float = 5.0  # Values beyond +/-5 are clamped
+
+    # Stop loss parameters - TIGHTER for fast scalping exits
+    initial_stop_loss_percent: float = -2.0  # TIGHTENED: from -5.0% - tight initial stop for scalps
+    early_exit_loss_percent: float = -1.5  # TIGHTENED: from -3.0% - exit bad trades fast
+    early_exit_time_seconds: int = 30  # REDUCED: from 120s - shorter "early" window
+    initial_period_seconds: int = 60  # REDUCED: from 180s - shorter initial protection period
+    emergency_stop_percent: float = -5.0  # TIGHTENED: from -8.0% - tighter emergency stop
+
+    # Position sizing parameters - lower threshold for more entries
+    min_confidence_threshold: float = 0.3  # LOWERED: from 0.4 - more entries pass confidence gate
     min_position_size: float = 50.0  # Minimum $50 position
-    high_confidence_threshold: float = 0.8  # 100% position size
-    medium_confidence_threshold: float = 0.6  # 75% position size
-    
-    # Confidence calculation weights (must sum to 1.0)
-    momentum_weight: float = 0.25
+    high_confidence_threshold: float = 0.7  # LOWERED: from 0.8 - easier to reach full size
+    medium_confidence_threshold: float = 0.5  # LOWERED: from 0.6 - easier to reach 75% size
+
+    # Confidence calculation weights (must sum to 1.0) - momentum-heavy for scalping
+    momentum_weight: float = 0.35  # INCREASED: from 0.25 - momentum matters most for scalping
     peak_proximity_weight: float = 0.25
     volume_weight: float = 0.25
-    acceleration_weight: float = 0.25
+    acceleration_weight: float = 0.15  # REDUCED: from 0.25 - less weight on acceleration
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary for serialization."""

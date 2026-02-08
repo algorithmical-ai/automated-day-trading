@@ -72,89 +72,62 @@ class PennyStocksIndicator(BaseTradingIndicator):
     - No entries after 3:30 PM ET to avoid late-day chaos
     """
 
-    # Configuration - CONSERVATIVE PENNY STOCK TRADING (Dec 2024)
-    # LESSON LEARNED: Penny stocks are extremely volatile, need MUCH wider stops
-    # Today's losses: 9/10 trades lost due to tight stops triggering on normal volatility
+    # Configuration - FAST SCALPING PENNY STOCK TRADING (Feb 2025)
+    # STRATEGY: Cash in on volatility with quick entries and exits
+    # Enter fast, take small profits, exit fast on reversals
     max_stock_price: float = 5.0  # Only trade stocks < $5
-    min_stock_price: float = 0.75  # INCREASED: Avoid ultra-low penny stocks (was 0.50)
+    min_stock_price: float = 0.75  # Avoid ultra-low penny stocks
 
-    # SIMPLE TRAILING STOP - exits when price drops 2% from peak
-    # This handles both profit-taking (when price reverses from high) and stop loss (2% from entry)
-    # Since entry price is the initial peak, a 2% drop from peak = 2% stop loss from entry
-    trailing_stop_percent: float = 2.0  # Exit when price drops 2% from peak
-    profit_threshold: float = (
-        2.5  # INCREASED: Exit at 2.5% profit (was 1.5%) - need bigger wins
-    )
-    immediate_loss_exit_threshold: float = (
-        -7.0
-    )  # WIDENED: Emergency stop at -7.0% (was -3.0%)
+    # SCALPING TRAILING STOP - tighter to lock profits fast
+    trailing_stop_percent: float = 1.0  # TIGHTENED: from 2.0% to 1.0% - lock profits fast
+    profit_threshold: float = 1.5  # LOWERED: from 2.5% to 1.5% - take quick profits (NOW ENFORCED in exit cycle!)
+    immediate_loss_exit_threshold: float = -5.0  # TIGHTENED: from -7.0% to -5.0% (NOW ENFORCED in exit cycle!)
     atr_period: int = 14  # ATR calculation period for entry analysis
 
-    top_k: int = 1  # Only top 1 ticker to reduce exposure
-    min_momentum_threshold: float = (
-        5.0  # INCREASED: Minimum 5% momentum (was 3.0% - too weak)
-    )
-    max_momentum_threshold: float = 20.0  # Maximum 20% momentum
-    exceptional_momentum_threshold: float = (
-        10.0  # INCREASED: Exceptional momentum for preemption (was 8.0%)
-    )
-    min_continuation_threshold: float = (
-        0.6  # NEW: Minimum continuation score (0.0-1.0) to avoid entering at trend peaks
-    )
+    top_k: int = 2  # INCREASED: from 1 to 2 - more candidates per cycle
+    min_momentum_threshold: float = 3.0  # LOWERED: from 5.0% to 3.0% - catch earlier moves
+    max_momentum_threshold: float = 25.0  # INCREASED: from 20.0% to 25.0%
+    exceptional_momentum_threshold: float = 8.0  # LOWERED: from 10.0% to 8.0%
+    min_continuation_threshold: float = 0.5  # LOWERED: from 0.6 to 0.5 - more permissive
 
-    min_volume: int = (
-        10000  # INCREASED: Minimum volume (was 5000) - need MORE liquidity
-    )
-    min_avg_volume: int = 10000  # INCREASED: Minimum average volume (was 5000)
-    max_price_discrepancy_percent: float = 2.0  # TIGHTENED: Max % difference (was 3.0%)
+    min_volume: int = 5000  # LOWERED: from 10000 to 5000 - penny stock friendly
+    min_avg_volume: int = 5000  # LOWERED: from 10000 to 5000
+    max_price_discrepancy_percent: float = 3.0  # LOOSENED: from 2.0% to 3.0% (fast moves cause discrepancy)
     max_bid_ask_spread_percent: float = (
-        0.75  # TIGHTENED: Max bid-ask spread (was 1.0%) - spread kills profits
+        0.75  # KEPT: spread still kills scalping profits
     )
 
-    # Entry time restrictions - no late-day entries
+    # Entry time restrictions - extended for more scalping opportunities
     max_entry_hour_et: int = 15  # No entries after 3:00 PM ET
-    max_entry_minute_et: int = 30  # EARLIER: No entries after 3:30 PM ET (was 3:55)
+    max_entry_minute_et: int = 45  # EXTENDED: from 30 to 45 - more scalping window
 
     # SAFETY: Disable shorting for penny stocks - too risky (can spike 100%+ in minutes)
     allow_short_positions: bool = False
 
-    # BASIC DYNO (512MB): Long cycle times to minimize memory pressure
-    entry_cycle_seconds: int = 15  # Check for entries every 15 seconds
-    exit_cycle_seconds: int = 10  # Check exits every 10 seconds
-    max_active_trades: int = 2  # REDUCED: Max concurrent trades (was 3) - less exposure
-    max_daily_trades: int = (
-        8  # REDUCED: Max trades per day (was 10) - quality over quantity
-    )
+    # FAST SCALPING CYCLES - speed is everything
+    entry_cycle_seconds: int = 5  # REDUCED: from 15s to 5s - catch fast moves
+    exit_cycle_seconds: int = 3  # REDUCED: from 10s to 3s - exit on reversals quickly
+    max_active_trades: int = 4  # INCREASED: from 2 to 4 - more concurrent scalps
+    max_daily_trades: int = 25  # INCREASED: from 8 to 25 - scalping means many trades
 
-    # MUCH LONGER holding period - give trades time to develop
-    min_holding_period_seconds: int = (
-        90  # INCREASED: from 60 to 90 seconds (IRBT exited at 66s)
-    )
-    min_holding_before_preempt_seconds: int = (
-        180  # INCREASED: Don't preempt trades held < 3 min (was 2 min)
-    )
-    max_holding_time_minutes: int = (
-        60  # NEW: Max 1 hour hold (prevents overnight like RIG)
-    )
+    # FAST HOLDING PERIOD for scalping
+    min_holding_period_seconds: int = 15  # REDUCED: from 90s to 15s - allow fast exits
+    min_holding_before_preempt_seconds: int = 60  # REDUCED: from 180s to 60s
+    max_holding_time_minutes: int = 15  # REDUCED: from 60min to 15min - scalps, not swings
     recent_bars_for_trend: int = 5  # Use last 5 bars to determine trend
+    ticker_cooldown_minutes: int = 5  # REDUCED: from 60min to 5min - allow fast re-entry
 
-    # ATR configuration for volatility-based stops - MUCH WIDER for penny stocks
-    atr_multiplier: float = (
-        3.5  # INCREASED: ATR multiplier (was 3.0) - penny stocks need MORE room
-    )
-    atr_stop_min: float = -4.0  # WIDENED: Minimum stop loss (was -3.0%) - FLOOR at 4%
-    atr_stop_max: float = -8.0  # WIDENED: Maximum stop loss (was -6.0%) - CAP at 8%
-    default_atr_stop_percent: float = (
-        -4.0
-    )  # WIDENED: Default ATR-based stop loss (was -2.5%)
+    # ATR configuration - TIGHTER for scalping
+    atr_multiplier: float = 2.5  # REDUCED: from 3.5 to 2.5 - tighter ATR stops
+    atr_stop_min: float = -3.0  # TIGHTENED: from -4.0% to -3.0% - tighter floor
+    atr_stop_max: float = -5.0  # TIGHTENED: from -8.0% to -5.0% - tighter cap
+    default_atr_stop_percent: float = -3.0  # TIGHTENED: from -4.0% to -3.0%
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
 
-    # IMPROVED: Track ALL traded tickers for the day (one entry per ticker per day)
-    _traded_tickers_today: set = (
-        set()
-    )  # Tickers that have been traded today (win or lose)
+    # Track traded tickers (used internally, but no longer blocks re-entry after cooldown)
+    _traded_tickers_today: set = set()  # Legacy tracking, re-entry allowed after cooldown
 
     # Exit decision engine instance (shared across exit cycles)
     _exit_engine: Optional[EnhancedExitDecisionEngine] = None
@@ -403,8 +376,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
             )
             return False
 
-        # 3. Spread check - but be lenient for penny stocks (they're volatile)
-        MAX_SPREAD_FOR_PENNY = 5.0  # Allow up to 5% spread for penny stocks
+        # 3. Spread check - use class-level max_bid_ask_spread_percent for consistency
+        # The same threshold is checked again in _process_ticker_entry, so use the same value
+        MAX_SPREAD_FOR_PENNY = cls.max_bid_ask_spread_percent  # 0.75% — consistent with entry validation
         if quote_data.spread_percent > MAX_SPREAD_FOR_PENNY:
             reason = f"Bid-ask spread too wide: {quote_data.spread_percent:.2f}% > {MAX_SPREAD_FOR_PENNY}%"
             collector.add_rejection(
@@ -736,7 +710,8 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         today_str = date_class.today().isoformat()
 
-        # Pre-filter using in-memory set (fast)
+        # SCALPING: Allow re-entry after cooldown instead of once-per-day restriction
+        # Only exclude: active tickers, tickers in cooldown, special securities, and losing tickers
         candidates_to_fetch = [
             ticker
             for ticker in all_tickers
@@ -744,39 +719,14 @@ class PennyStocksIndicator(BaseTradingIndicator):
             and not cls._is_ticker_in_cooldown(ticker)
             and not cls._is_special_security(ticker)
             and ticker
-            not in cls._losing_tickers_today  # Exclude tickers that showed loss today
-            and ticker
-            not in cls._traded_tickers_today  # IMPROVED: Exclude all previously traded tickers
+            not in cls._losing_tickers_today  # Still exclude tickers that showed loss today
+            # REMOVED: _traded_tickers_today filter - allow re-entry after cooldown
         ]
-
-        # Additional check: verify against database (prevents duplicate entries after restarts)
-        # This is a safety check - the in-memory set should catch most cases
-        verified_candidates = []
-        for ticker in candidates_to_fetch:
-            was_traded = await DynamoDBClient.was_ticker_traded_today(
-                date=today_str, indicator=cls.indicator_name(), ticker=ticker
-            )
-            if was_traded:
-                logger.debug(
-                    f"Excluding {ticker}: already traded today (found in database)"
-                )
-                # Add to in-memory set to avoid checking again
-                cls._traded_tickers_today.add(ticker)
-            else:
-                verified_candidates.append(ticker)
-
-        candidates_to_fetch = verified_candidates
 
         if cls._losing_tickers_today:
             logger.info(
                 f"Excluding {len(cls._losing_tickers_today)} losing tickers from today's selection: "
                 f"{list(cls._losing_tickers_today)[:10]}"  # Show first 10
-            )
-
-        if cls._traded_tickers_today:
-            logger.info(
-                f"Excluding {len(cls._traded_tickers_today)} previously traded tickers (one entry per ticker per day): "
-                f"{list(cls._traded_tickers_today)[:10]}"  # Show first 10
             )
 
         special_securities_count = sum(
@@ -896,6 +846,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             trend_metrics = TrendAnalyzer.calculate_trend_metrics(ticker_bars)
             momentum_score = trend_metrics.momentum_score
             reason = trend_metrics.reason
+            peak_price = trend_metrics.peak_price
 
             # SIMPLIFIED: Accept any momentum - Alpaca already screened these as gainers/most_actives
             # Even if our calculated momentum is 0, Alpaca identified this as a mover
@@ -917,7 +868,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     reason = "Alpaca gainer signal (insufficient price data for momentum calc)"
 
             stats["passed"] += 1
-            ticker_momentum_scores.append((ticker, momentum_score, reason))
+            ticker_momentum_scores.append((ticker, momentum_score, reason, peak_price))
             logger.debug(f"{ticker} passed all filters: momentum={momentum_score:.2f}%")
 
         # Batch write all rejection records using repository
@@ -952,13 +903,13 @@ class PennyStocksIndicator(BaseTradingIndicator):
         MIN_MOMENTUM_FOR_ENTRY = cls.min_momentum_threshold  # Use class config (3.0%)
 
         upward_tickers = [
-            (t, score, reason)
-            for t, score, reason in ticker_momentum_scores
+            (t, score, reason, peak)
+            for t, score, reason, peak in ticker_momentum_scores
             if score >= MIN_MOMENTUM_FOR_ENTRY  # Require meaningful upward momentum
         ]
         downward_tickers = [
-            (t, score, reason)
-            for t, score, reason in ticker_momentum_scores
+            (t, score, reason, peak)
+            for t, score, reason, peak in ticker_momentum_scores
             if score <= -MIN_MOMENTUM_FOR_ENTRY  # Require meaningful downward momentum
         ]
 
@@ -970,7 +921,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # Use MAB to select top tickers
         # For penny stocks, we'll use a simplified market data dict
         market_data_for_mab = {}
-        for ticker, _, _ in ticker_momentum_scores:
+        for ticker, _, _, _ in ticker_momentum_scores:
             bars_data = market_data_dict.get(ticker)
             if bars_data:
                 # Create a simplified market_data structure for MAB
@@ -1106,7 +1057,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             try:
                 # Find the ticker in the original candidates to get momentum score
                 ticker_data = None
-                for ticker, momentum_score, reason in all_candidates:
+                for ticker, momentum_score, reason, _peak in all_candidates:
                     if ticker == selected_ticker:
                         ticker_data = (ticker, momentum_score, reason)
                         break
@@ -1172,7 +1123,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 )
 
         # Process long entries
-        for rank, (ticker, momentum_score, reason) in enumerate(top_upward, start=1):
+        for rank, (ticker, momentum_score, reason, peak_price) in enumerate(top_upward, start=1):
             if not cls.running:
                 break
 
@@ -1185,12 +1136,13 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 market_data_dict=market_data_dict,
                 daily_limit_reached=daily_limit_reached,
                 is_golden=False,
+                peak_price=peak_price,
             )
 
         # Process short entries (if enabled)
         # SAFETY: Shorting penny stocks is extremely risky - they can spike 100%+ in minutes
         if cls.allow_short_positions:
-            for rank, (ticker, momentum_score, reason) in enumerate(
+            for rank, (ticker, momentum_score, reason, peak_price) in enumerate(
                 top_downward, start=1
             ):
                 if not cls.running:
@@ -1205,6 +1157,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     market_data_dict=market_data_dict,
                     daily_limit_reached=daily_limit_reached,
                     is_golden=False,
+                    peak_price=peak_price,
                 )
         else:
             if top_downward:
@@ -1358,8 +1311,8 @@ class PennyStocksIndicator(BaseTradingIndicator):
             if net_change <= 0:
                 return False  # Price is flat or declining - no momentum
 
-            if net_change_percent < 0.3:
-                return False  # Net change too small (< 0.3%) - weak momentum
+            if net_change_percent < 0.1:
+                return False  # Net change too small (< 0.1%) - weak momentum (relaxed for scalping)
 
             if down_moves > up_moves:
                 return False  # More down moves than up moves - reversal detected
@@ -1560,6 +1513,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
         market_data_dict: Dict[str, Any],
         daily_limit_reached: bool,
         is_golden: bool,
+        peak_price: Optional[float] = None,
     ) -> bool:
         """Process entry for a single ticker with improved validation."""
         if not cls.running:
@@ -1767,18 +1721,16 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         logger.debug(f"{ticker} momentum confirmed: {confirm_reason}")
 
-        # NEW: Peak price validation - don't enter if current ASK is at, above, or too close to detected peak
-        # This prevents entering after momentum has already peaked
-        # FIXED: Made stricter - reject entries at/above peak or too close to peak
+        # Peak price validation - don't enter if current ASK is at, above, or too close to detected peak
+        # Uses structured peak_price from TrendAnalyzer (no string parsing)
         if is_long and ticker_bars:
-            peak_price = cls._extract_peak_price_from_reason(reason)
             if peak_price and peak_price > 0:
                 # Calculate how much above/below peak the current ASK is
                 price_vs_peak_percent = ((ask - peak_price) / peak_price) * 100
 
-                # STRICT: Reject if entry is at or above peak (within 0.5% tolerance for rounding)
-                # This prevents entering when momentum has already peaked
-                if price_vs_peak_percent >= -0.5:
+                # Reject if entry is at or above peak (within 0.2% tolerance for rounding)
+                # LOOSENED for scalping: from -0.5 to -0.2 - allow closer entries
+                if price_vs_peak_percent >= -0.2:
                     logger.info(
                         f"Skipping {ticker}: entry ASK ${ask:.4f} is at or above detected peak ${peak_price:.4f} "
                         f"({price_vs_peak_percent:.2f}%) - momentum has already peaked"
@@ -1791,9 +1743,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     )
                     return False
 
-                # STRICT: Require entry to be meaningfully below peak (at least 1% below)
+                # Require entry to be below peak - LOOSENED for scalping
                 # This ensures we're entering during momentum build-up, not at the peak
-                min_below_peak_percent = 1.0  # Require at least 1% below peak
+                min_below_peak_percent = 0.5  # LOOSENED: from 1.0% to 0.5% for scalping
                 if price_vs_peak_percent > -min_below_peak_percent:
                     logger.info(
                         f"Skipping {ticker}: entry ASK ${ask:.4f} is only {abs(price_vs_peak_percent):.2f}% below "
@@ -1868,7 +1820,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         # Calculate confidence score using ENHANCED calculator (0.0 to 1.0)
         # This incorporates peak proximity, volume confirmation, and momentum acceleration
-        peak_price = cls._extract_peak_price_from_reason(reason)
+        # peak_price is now passed as a structured parameter from TrendAnalyzer
 
         # Get peak detection result for enhanced confidence
         peak_result = PeakDetector.detect_peak(
@@ -1916,7 +1868,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
         # Calculate position size based on confidence
         # Use a standard position size of $500 for penny stocks
-        STANDARD_POSITION_SIZE = 500.0
+        STANDARD_POSITION_SIZE = 300.0  # REDUCED for scalping: more trades, smaller each
         position_result = DynamicPositionSizer.calculate_position_size(
             standard_position_size=STANDARD_POSITION_SIZE,
             confidence_score=confidence_score,
@@ -1945,17 +1897,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
             confidence_result.components.to_dict()
         )
 
-        await send_signal_to_webhook(
-            ticker=ticker,
-            action=action,
-            indicator=cls.indicator_name(),
-            enter_reason=ranked_reason,
-            enter_price=enter_price,
-            technical_indicators=technical_indicators,
-            confidence_score=confidence_score,
-        )
-
-        # IMPROVED: Enter trade with ATR-based stop loss instead of fixed tight stop
+        # IMPROVED: Enter trade FIRST with ATR-based stop loss, then send webhook on success
         entry_success = await cls._enter_trade(
             ticker=ticker,
             action=action,
@@ -1976,6 +1918,21 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 "Failed to enter trade (database or API error)",
             )
             return False
+
+        # Send webhook AFTER successful entry to prevent orphaned signals
+        webhook_success = await send_signal_to_webhook(
+            ticker=ticker,
+            action=action,
+            indicator=cls.indicator_name(),
+            enter_reason=ranked_reason,
+            enter_price=enter_price,
+            technical_indicators=technical_indicators,
+            confidence_score=confidence_score,
+        )
+        if not webhook_success:
+            logger.warning(
+                f"Webhook failed for {ticker} {action} entry, but trade is tracked in DB"
+            )
 
         # Update trailing stop to 0.5% after entry (TIGHT for quick exits)
         await DynamoDBClient.update_momentum_trade_trailing_stop(
@@ -2255,32 +2212,92 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 enter_price, current_price, original_action
             )
 
-            # SIMPLE TRAILING STOP LOGIC
-            # Exit when price drops 2% from peak
-            # Since entry price is the initial peak, this also acts as 2% stop loss
+            # SCALPING EXIT LOGIC - Enhanced Engine + Active Profit Taking + Trailing Stop
             should_exit = False
             exit_reason = ""
+            exit_type = "none"
 
-            if is_long:
-                # For longs: exit when price drops 2% below peak
-                trailing_stop_price = peak_price * (1 - cls.trailing_stop_percent / 100)
-                if current_price <= trailing_stop_price:
+            # PRIORITY 1: EMERGENCY STOP - always active, even during min holding period
+            if profit_percent <= cls.immediate_loss_exit_threshold:
+                should_exit = True
+                exit_reason = f"Emergency stop: {profit_percent:.2f}% loss (threshold: {cls.immediate_loss_exit_threshold}%)"
+                exit_type = "emergency"
+
+            # PRIORITY 2: ACTIVE PROFIT TAKING - take profits at threshold
+            if not should_exit and profit_percent >= cls.profit_threshold:
+                should_exit = True
+                exit_reason = (
+                    f"Profit target hit: {profit_percent:.2f}% >= {cls.profit_threshold}% "
+                    f"(enter: ${enter_price:.4f}, current: ${current_price:.4f})"
+                )
+                exit_type = "profit_target"
+
+            # PRIORITY 3: MIN HOLDING PERIOD - block exits (except emergency and profit target)
+            if not should_exit and holding_seconds < cls.min_holding_period_seconds:
+                new_peak = max(peak_profit_percent, profit_percent)
+                await DynamoDBClient.update_momentum_trade_trailing_stop(
+                    ticker=ticker,
+                    indicator=cls.indicator_name(),
+                    trailing_stop=cls.trailing_stop_percent,
+                    peak_profit_percent=new_peak,
+                    skipped_exit_reason=f"Min hold ({holding_seconds:.0f}s < {cls.min_holding_period_seconds}s), profit {profit_percent:.2f}%",
+                )
+                logger.debug(
+                    f"{ticker}: Min hold period ({holding_seconds:.0f}s < {cls.min_holding_period_seconds}s), "
+                    f"profit: {profit_percent:.2f}%"
+                )
+                continue
+
+            # PRIORITY 4: ENHANCED EXIT ENGINE - tiered trailing stops, trend reversal, ATR stops
+            if not should_exit:
+                recent_bars_data = await AlpacaClient.get_market_data(
+                    ticker, limit=cls.recent_bars_for_trend + 5
+                )
+                recent_bars_list = None
+                if recent_bars_data:
+                    bars_dict_exit = recent_bars_data.get("bars", {})
+                    recent_bars_list = bars_dict_exit.get(ticker, None)
+
+                exit_decision = cls._exit_engine.evaluate_exit(
+                    ticker=ticker,
+                    entry_price=enter_price,
+                    breakeven_price=breakeven_price,
+                    current_price=current_price,
+                    peak_price=peak_price,
+                    atr_stop_percent=atr_stop_percent,
+                    holding_seconds=holding_seconds,
+                    is_long=is_long,
+                    spread_percent=spread_percent,
+                    recent_bars=recent_bars_list,
+                )
+
+                if exit_decision.should_exit:
                     should_exit = True
-                    drop_from_peak = ((peak_price - current_price) / peak_price) * 100
-                    exit_reason = (
-                        f"Trailing stop: price ${current_price:.4f} dropped "
-                        f"{drop_from_peak:.2f}% from peak ${peak_price:.4f}"
-                    )
-            else:
-                # For shorts: exit when price rises 2% above peak (lowest price)
-                trailing_stop_price = peak_price * (1 + cls.trailing_stop_percent / 100)
-                if current_price >= trailing_stop_price:
-                    should_exit = True
-                    rise_from_peak = ((current_price - peak_price) / peak_price) * 100
-                    exit_reason = (
-                        f"Trailing stop: price ${current_price:.4f} rose "
-                        f"{rise_from_peak:.2f}% from peak ${peak_price:.4f}"
-                    )
+                    exit_reason = exit_decision.reason
+                    exit_type = exit_decision.exit_type
+
+            # PRIORITY 5: SCALPING TRAILING STOP FALLBACK
+            if not should_exit:
+                if is_long:
+                    trailing_stop_price = peak_price * (1 - cls.trailing_stop_percent / 100)
+                    if current_price <= trailing_stop_price:
+                        should_exit = True
+                        drop_from_peak = ((peak_price - current_price) / peak_price) * 100
+                        exit_reason = (
+                            f"Trailing stop: price ${current_price:.4f} dropped "
+                            f"{drop_from_peak:.2f}% from peak ${peak_price:.4f}"
+                        )
+                        exit_type = "trailing_stop"
+                else:
+                    trailing_stop_price = peak_price * (1 + cls.trailing_stop_percent / 100)
+                    if current_price >= trailing_stop_price:
+                        should_exit = True
+                        rise_from_peak = ((current_price - peak_price) / peak_price) * 100
+                        exit_reason = (
+                            f"Trailing stop: price ${current_price:.4f} rose "
+                            f"{rise_from_peak:.2f}% from peak ${peak_price:.4f}"
+                        )
+                        exit_type = "trailing_stop"
 
             if not should_exit:
                 # Update peak profit in database
@@ -2294,7 +2311,7 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 )
                 logger.debug(
                     f"{ticker}: Holding (profit: {profit_percent:.2f}%, "
-                    f"peak: ${peak_price:.4f}, stop: ${trailing_stop_price:.4f})"
+                    f"peak: ${peak_price:.4f})"
                 )
                 continue
 
@@ -2318,23 +2335,20 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 enter_price, exit_price, original_action
             )
 
-            # Record metrics (trailing stop is not spread-induced)
+            # Record metrics
             cls._daily_metrics.record_trade(final_profit_percent, False)
 
-            # IMPROVED: Mark ticker as traded (already done on entry, but ensure it's marked)
-            cls._traded_tickers_today.add(ticker)
-
-            # If trade ended in loss, mark ticker as losing for today
+            # If trade ended in loss, mark ticker as losing for today (exclude from re-entry)
             if final_profit_percent < 0:
                 cls._losing_tickers_today.add(ticker)
                 logger.warning(
                     f"📛 Marked {ticker} as losing ticker (loss: {final_profit_percent:.2f}%) - "
-                    f"excluded from MAB selection for rest of day"
+                    f"excluded from re-entry for rest of day"
                 )
             else:
                 logger.info(
                     f"✅ {ticker} exited profitably ({final_profit_percent:.2f}%) - "
-                    f"will not re-enter today (one entry per ticker per day)"
+                    f"can re-enter after {cls.ticker_cooldown_minutes}min cooldown"
                 )
 
             # Get technical indicators for exit
@@ -2342,8 +2356,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
                 ticker, limit=cls.recent_bars_for_trend + 5
             )
             technical_indicators_exit = {
-                "exit_type": "trailing_stop",
+                "exit_type": exit_type,
                 "holding_seconds": holding_seconds,
+                "profit_percent": final_profit_percent,
             }
             if bars_data:
                 bars_dict = bars_data.get("bars", {})
