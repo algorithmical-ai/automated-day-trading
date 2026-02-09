@@ -386,21 +386,21 @@ class MABService:
     async def select_tickers_with_mab(
         cls,
         indicator: str,
-        ticker_candidates: List[Tuple[str, float, str]],
+        ticker_candidates: List[Tuple[str, float, str, Optional[float]]],
         market_data_dict: Dict[str, Any],
         top_k: int,
-    ) -> List[Tuple[str, float, str]]:
+    ) -> List[Tuple[str, float, str, Optional[float]]]:
         """
-        Helper method to select tickers using MAB from a list of (ticker, score, reason) tuples.
+        Helper method to select tickers using MAB from a list of (ticker, score, reason, peak_price) tuples.
 
         Args:
             indicator: Trading indicator name
-            ticker_candidates: List of (ticker, momentum_score, reason) tuples
+            ticker_candidates: List of (ticker, momentum_score, reason, peak_price) tuples
             market_data_dict: Dictionary of market data (not used, kept for compatibility)
             top_k: Number of tickers to select
 
         Returns:
-            List of selected (ticker, score, reason) tuples, ranked by Thompson Sampling
+            List of selected (ticker, score, reason, peak_price) tuples, ranked by Thompson Sampling
         """
         if not ticker_candidates:
             return []
@@ -433,7 +433,7 @@ class MABService:
     async def get_rejected_tickers_with_reasons(
         cls,
         indicator: str,
-        ticker_candidates: List[Tuple[str, float, str]],
+        ticker_candidates: List[Tuple[str, float, str, Optional[float]]],
         selected_tickers: List[str],
     ) -> Dict[str, Dict[str, str]]:
         """
@@ -441,7 +441,7 @@ class MABService:
 
         Args:
             indicator: Trading indicator name
-            ticker_candidates: List of (ticker, momentum_score, reason) tuples that passed validation
+            ticker_candidates: List of (ticker, momentum_score, reason, peak_price) tuples that passed validation
             selected_tickers: List of ticker symbols selected by MAB
 
         Returns:
@@ -458,7 +458,7 @@ class MABService:
         selected_set = set(selected_tickers)
 
         # Process each candidate
-        for ticker, momentum_score, _ in ticker_candidates:
+        for ticker, momentum_score, _, _ in ticker_candidates:
             # Skip if selected
             if ticker in selected_set:
                 continue
