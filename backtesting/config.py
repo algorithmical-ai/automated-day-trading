@@ -6,6 +6,12 @@ Defines ticker lists, date ranges, and indicator parameters.
 
 import os
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+env_path = os.path.join(project_root, ".env")
+load_dotenv(env_path)
 
 
 # =============================================================================
@@ -35,18 +41,50 @@ REQUEST_DELAY_SECONDS = 0.35  # Rate limit: ~170 req/min (under Alpaca's 200/min
 
 # Momentum indicator tickers (stocks >= $5)
 MOMENTUM_TICKERS = [
-    "AAPL", "MSFT", "NVDA", "TSLA", "AMD",
-    "META", "AMZN", "GOOG", "NFLX", "INTC",
-    "BA", "JPM", "BAC", "DIS", "UBER",
-    "PLTR", "SOFI", "COIN", "SNAP", "RIVN",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "TSLA",
+    "AMD",
+    "META",
+    "AMZN",
+    "GOOG",
+    "NFLX",
+    "INTC",
+    "BA",
+    "JPM",
+    "BAC",
+    "DIS",
+    "UBER",
+    "PLTR",
+    "SOFI",
+    "COIN",
+    "SNAP",
+    "RIVN",
 ]
 
 # Penny stocks indicator tickers (stocks < $5)
 PENNY_STOCK_TICKERS = [
-    "SIRI", "PLUG", "CLOV", "WISH", "EXPR",
-    "GSAT", "TELL", "AGEN", "ZYNE", "CRBP",
-    "INPX", "PRTY", "VEON", "MVST", "NKLA",
-    "GRAB", "VFS", "GEVO", "CLVR", "BIOR",
+    "SIRI",
+    "PLUG",
+    "CLOV",
+    "WISH",
+    "EXPR",
+    "GSAT",
+    "TELL",
+    "AGEN",
+    "ZYNE",
+    "CRBP",
+    "INPX",
+    "PRTY",
+    "VEON",
+    "MVST",
+    "NKLA",
+    "GRAB",
+    "VFS",
+    "GEVO",
+    "CLVR",
+    "BIOR",
 ]
 
 
@@ -55,9 +93,9 @@ PENNY_STOCK_TICKERS = [
 # =============================================================================
 
 # Position sizing
-MOMENTUM_BASE_POSITION_SIZE = 2000.0     # $2000 base for momentum
-PENNY_STOCK_POSITION_SIZE = 300.0        # $300 for penny stocks (as configured)
-MIN_POSITION_SIZE = 50.0                  # Minimum position
+MOMENTUM_BASE_POSITION_SIZE = 2000.0  # $2000 base for momentum
+PENNY_STOCK_POSITION_SIZE = 300.0  # $300 for penny stocks (as configured)
+MIN_POSITION_SIZE = 50.0  # Minimum position
 
 # Spread simulation from bar OHLC (since we don't have real bid/ask)
 # Estimate: spread ≈ (high - low) * SPREAD_ESTIMATE_FACTOR

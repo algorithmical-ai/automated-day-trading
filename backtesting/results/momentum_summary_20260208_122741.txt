@@ -1,0 +1,106 @@
+======================================================================
+BACKTESTING SUMMARY: Momentum Trading
+======================================================================
+
+Date Range:    2023-01-01 to 2026-01-31
+Tickers:       AAPL, AMD, AMZN, BA, BAC, COIN, DIS, GOOG, INTC, JPM, META, MSFT, NFLX, NVDA, PLTR, RIVN, SNAP, SOFI, TSLA, UBER
+Generated:     2026-02-08T12:27:41.993544
+
+----------------------------------------
+OVERALL STATISTICS
+----------------------------------------
+Total Trades:           348
+Winning Trades:         185
+Losing Trades:          163
+Win Rate:               53.2%
+Total Profit (winners): 201.39%
+Total Loss (losers):    -254.42%
+Net P&L ($):            $-1,060.42
+Profit Factor:          0.79
+Max Drawdown:           58.27%
+Sharpe Ratio:           -1.43
+Avg Hold Duration:      2628s (43.8 min)
+Avg Profit/Winner:      1.09%
+Avg Loss/Loser:         -1.56%
+
+----------------------------------------
+EXIT REASON BREAKDOWN
+----------------------------------------
+Reason                     Count    Avg P&L  Total P&L
+max_hold_time                177     -0.86%   -152.69%
+force_close_eod               24     -0.38%     -9.24%
+atr_stop_loss                 13     -4.22%    -54.87%
+Trailing stop triggered at $12      9      1.33%     11.96%
+Trailing stop triggered at $19      8      1.04%      8.30%
+Trailing stop triggered at $17      7      1.37%      9.59%
+Trailing stop triggered at $11      7      1.19%      8.30%
+Trailing stop triggered at $16      7      0.89%      6.24%
+Trailing stop triggered at $21      6      1.54%      9.24%
+Trailing stop triggered at $15      5      1.00%      5.00%
+Trailing stop triggered at $8.      5      1.52%      7.59%
+Trailing stop triggered at $13      5      0.92%      4.60%
+Trailing stop triggered at $7.      4      0.91%      3.62%
+Trend reversal detected: dropp      4      4.57%     18.28%
+Trailing stop triggered at $6.      4      0.89%      3.58%
+Trailing stop triggered at $9.      4      0.67%      2.69%
+Trailing stop triggered at $24      4      0.81%      3.25%
+Trailing stop triggered at $5.      3      1.00%      3.00%
+Trailing stop triggered at $20      3      1.32%      3.97%
+Trailing stop triggered at $33      3      0.68%      2.05%
+Trailing stop triggered at $10      3      1.19%      3.56%
+Trailing stop triggered at $26      3      0.83%      2.48%
+Trailing stop triggered at $37      2      1.83%      3.66%
+Trailing stop triggered at $57      2      0.90%      1.80%
+Trailing stop triggered at $18      2      1.17%      2.33%
+Trailing stop triggered at $14      2      0.67%      1.34%
+Trailing stop triggered at $77      2      0.66%      1.31%
+Trailing stop triggered at $22      2      1.72%      3.45%
+Trailing stop triggered at $30      2      0.95%      1.90%
+Trailing stop triggered at $42      2      1.23%      2.46%
+Trailing stop triggered at $68      1      0.64%      0.64%
+Trailing stop triggered at $38      1      1.21%      1.21%
+Trailing stop triggered at $56      1      1.81%      1.81%
+Trailing stop triggered at $59      1      2.06%      2.06%
+Trailing stop triggered at $58      1      0.73%      0.73%
+Trailing stop triggered at $60      1      0.57%      0.57%
+Trailing stop triggered at $67      1      0.79%      0.79%
+Trailing stop triggered at $66      1      3.24%      3.24%
+Trailing stop triggered at $64      1      1.60%      1.60%
+Trailing stop triggered at $69      1      0.83%      0.83%
+Trailing stop triggered at $61      1      0.69%      0.69%
+Trailing stop triggered at $63      1      1.25%      1.25%
+Trailing stop triggered at $50      1      0.70%      0.70%
+Trailing stop triggered at $51      1      1.39%      1.39%
+Trailing stop triggered at $96      1      1.37%      1.37%
+Trailing stop triggered at $46      1      0.84%      0.84%
+Trailing stop triggered at $23      1      1.43%      1.43%
+Trailing stop triggered at $82      1      0.65%      0.65%
+Trailing stop triggered at $87      1      2.55%      2.55%
+Trailing stop triggered at $71      1      0.89%      0.89%
+Trailing stop triggered at $91      1      0.99%      0.99%
+Trailing stop triggered at $92      1      0.72%      0.72%
+Trailing stop triggered at $27      1      0.60%      0.60%
+Trailing stop triggered at $39      1      0.67%      0.67%
+
+----------------------------------------
+PER-TICKER BREAKDOWN
+----------------------------------------
+Ticker   Trades  Wins Losses   Win%     P&L%       P&L$  AvgHold
+AAPL          2     1      1  50.0%    1.47% $    29.45   23.5m
+AMD           4     4      0 100.0%    1.20% $    24.07   38.5m
+AMZN          2     0      2   0.0%   -1.92% $   -38.39   61.0m
+BA            5     2      3  40.0%   -2.00% $   -40.10   49.0m
+BAC           1     1      0 100.0%    1.94% $    38.74   11.0m
+COIN         90    46     44  51.1%  -17.47% $  -349.33   41.8m
+DIS           2     1      1  50.0%   -2.82% $   -56.46   37.0m
+INTC         20     8     12  40.0%   -3.11% $   -62.13   43.6m
+META          3     0      3   0.0%   -2.63% $   -52.57   61.0m
+NVDA          3     3      0 100.0%    2.74% $    54.82   12.0m
+PLTR         36    20     16  55.6%   -9.75% $  -194.94   51.2m
+RIVN         81    42     39  51.9%  -18.59% $  -371.88   43.0m
+SNAP         36    22     14  61.1%   14.69% $   293.78   46.4m
+SOFI         49    28     21  57.1%  -15.29% $  -305.82   45.9m
+TSLA          8     3      5  37.5%   -1.94% $   -38.76   36.0m
+UBER          6     4      2  66.7%    0.46% $     9.10   34.8m
+
+======================================================================

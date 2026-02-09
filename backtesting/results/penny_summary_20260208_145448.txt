@@ -1,0 +1,67 @@
+======================================================================
+BACKTESTING SUMMARY: Penny Stocks
+======================================================================
+
+Date Range:    2023-01-01 to 2026-01-31
+Tickers:       AGEN, BIOR, CLOV, CLVR, CRBP, EXPR, GEVO, GRAB, GSAT, INPX, MVST, NKLA, PLUG, PRTY, SIRI, TELL, VEON, VFS, WISH, ZYNE
+Generated:     2026-02-08T14:54:48.979154
+
+----------------------------------------
+OVERALL STATISTICS
+----------------------------------------
+Total Trades:           4086
+Winning Trades:         1752
+Losing Trades:          2334
+Win Rate:               42.9%
+Total Profit (winners): 2162.29%
+Total Loss (losers):    -3410.68%
+Net P&L ($):            $-3,744.94
+Profit Factor:          0.63
+Max Drawdown:           1249.27%
+Sharpe Ratio:           -2.79
+Avg Hold Duration:      766s (12.8 min)
+Avg Profit/Winner:      1.23%
+Avg Loss/Loser:         -1.46%
+
+----------------------------------------
+EXIT REASON BREAKDOWN
+----------------------------------------
+Reason                     Count    Avg P&L  Total P&L
+max_hold_time               2529     -0.69%  -1738.17%
+profit_target                877      1.87%   1642.29%
+atr_stop_loss                254     -3.42%   -868.97%
+force_close_eod              161     -0.61%    -97.94%
+Trailing stop triggered at $1.     76      0.77%     58.22%
+emergency_stop                55     -6.11%   -335.78%
+Trailing stop triggered at $0.     36      0.77%     27.56%
+Trailing stop triggered at $2.     31      0.76%     23.59%
+Trailing stop triggered at $3.     23      0.74%     16.95%
+Trailing stop triggered at $4.     23      0.75%     17.17%
+trailing_stop                 19      0.28%      5.35%
+Trailing stop triggered at $5.      2      0.68%      1.36%
+
+----------------------------------------
+PER-TICKER BREAKDOWN
+----------------------------------------
+Ticker   Trades  Wins Losses   Win%     P&L%       P&L$  AvgHold
+AGEN        307   127    180  41.4%  -72.12% $  -216.32   13.2m
+BIOR        177    94     83  53.1%   -9.24% $   -27.69   11.8m
+CLOV        340   132    208  38.8%  -94.65% $  -283.87   13.7m
+CLVR          6     4      2  66.7%    4.70% $    14.09   14.7m
+CRBP         20    14      6  70.0%   16.13% $    48.36   12.1m
+EXPR        121    45     76  37.2%  -58.14% $  -174.39   12.8m
+GEVO        478   188    290  39.3% -160.29% $  -480.84   13.6m
+GRAB         49    20     29  40.8%  -13.67% $   -41.01   14.9m
+GSAT        257   104    153  40.5%  -58.43% $  -175.35   12.8m
+INPX        131    50     81  38.2% -107.04% $  -321.13   12.1m
+MVST        730   334    396  45.8% -237.76% $  -713.23   12.4m
+NKLA        579   247    332  42.7% -206.85% $  -620.59   12.3m
+PLUG        504   230    274  45.6% -143.83% $  -431.47   12.4m
+SIRI         21     8     13  38.1%   -0.92% $    -2.77   12.9m
+TELL        215    77    138  35.8% -100.66% $  -302.03   13.6m
+VEON          9     4      5  44.4%   -0.63% $    -1.88   16.4m
+VFS          86    48     38  55.8%   14.43% $    43.30   11.9m
+WISH         47    22     25  46.8%  -19.18% $   -57.48   11.8m
+ZYNE          9     4      5  44.4%   -0.21% $    -0.64   12.3m
+
+======================================================================
