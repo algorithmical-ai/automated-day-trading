@@ -2312,12 +2312,12 @@ class MomentumIndicator(BaseTradingIndicator):
         # Separate upward and downward momentum
         # Note: tickers with score == 0 are treated as upward (neutral momentum)
         upward_tickers = [
-            (t, score, reason)
+            (t, score, reason, None)  # Add None for peak_price to match MAB service expectation
             for t, score, reason in ticker_momentum_scores
             if score >= 0
         ]
         downward_tickers = [
-            (t, score, reason)
+            (t, score, reason, None)  # Add None for peak_price to match MAB service expectation
             for t, score, reason in ticker_momentum_scores
             if score < 0
         ]
@@ -2343,11 +2343,11 @@ class MomentumIndicator(BaseTradingIndicator):
         # Log selected tickers for visibility
         if top_upward:
             logger.debug(
-                f"Selected upward tickers: {[(t, f'{s:.2f}%', r[:50]) for t, s, r in top_upward]}"
+                f"Selected upward tickers: {[(t, f'{s:.2f}%', r[:50]) for t, s, r, _ in top_upward]}"
             )
         if top_downward:
             logger.debug(
-                f"Selected downward tickers: {[(t, f'{s:.2f}%', r[:50]) for t, s, r in top_downward]}"
+                f"Selected downward tickers: {[(t, f'{s:.2f}%', r[:50]) for t, s, r, _ in top_downward]}"
             )
 
         # Enhanced diagnostic logging for zero trades
@@ -2441,7 +2441,7 @@ class MomentumIndicator(BaseTradingIndicator):
                     )
 
         # Process long entries
-        for rank, (ticker, momentum_score, reason) in enumerate(top_upward, start=1):
+        for rank, (ticker, momentum_score, reason, _) in enumerate(top_upward, start=1):
             if not cls.running:
                 break
 
@@ -2468,7 +2468,7 @@ class MomentumIndicator(BaseTradingIndicator):
             )
 
         # Process short entries
-        for rank, (ticker, momentum_score, reason) in enumerate(top_downward, start=1):
+        for rank, (ticker, momentum_score, reason, _) in enumerate(top_downward, start=1):
             if not cls.running:
                 break
 
