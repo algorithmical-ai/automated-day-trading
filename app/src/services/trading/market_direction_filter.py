@@ -25,11 +25,11 @@ class MarketDirectionFilter:
     # Cache trend data to avoid excessive API calls
     _daily_trend_cache: Dict[str, Tuple[str, datetime]] = {}
     _intraday_trend_cache: Dict[str, Tuple[str, datetime]] = {}
-    _cache_ttl_minutes = 5  # Cache trend for 5 minutes
+    _cache_ttl_minutes = 2  # TIGHTENED: Cache trend for 2 minutes (was 5) - faster reaction to market changes
 
-    # Hybrid decision weights
-    _daily_trend_weight = 0.7  # 70% weight on 2-3 day trend
-    _intraday_trend_weight = 0.3  # 30% weight on real-time trend
+    # Hybrid decision weights - REBALANCED: Give more weight to real-time conditions
+    _daily_trend_weight = 0.5  # REDUCED from 0.7 - daily trend less dominant
+    _intraday_trend_weight = 0.5  # INCREASED from 0.3 - real-time trend matters more for scalping
 
     @classmethod
     async def get_hybrid_qqq_trend(cls) -> Tuple[str, Dict[str, Any]]:
@@ -185,10 +185,11 @@ class MarketDirectionFilter:
 
         percent_change = ((newest_price - oldest_price) / oldest_price) * 100
 
-        # For daily trend, use more conservative thresholds
-        if percent_change > 1.0:  # 1%+ upward move
+        # For daily trend, use TIGHTER thresholds to detect weak trends
+        # IMPROVED: Lowered from 1.0% to 0.5% - detect smaller directional moves
+        if percent_change > 0.5:  # 0.5%+ upward move (was 1.0%)
             return "UP"
-        elif percent_change < -1.0:  # 1%+ downward move
+        elif percent_change < -0.5:  # 0.5%+ downward move (was -1.0%)
             return "DOWN"
         else:
             return "SIDEWAYS"
@@ -237,10 +238,11 @@ class MarketDirectionFilter:
             + (medium_term_change * 0.2)
         )
 
-        # More sensitive thresholds for intraday
-        if trend_score > 1.0:
+        # TIGHTENED: More sensitive thresholds for intraday detection
+        # Was 1.0% - too wide, couldn't detect weak bearish conditions
+        if trend_score > 0.3:  # 0.3%+ upward (was 1.0%)
             return "UP"
-        elif trend_score < -1.0:
+        elif trend_score < -0.3:  # 0.3%+ downward (was -1.0%)
             return "DOWN"
         else:
             return "SIDEWAYS"
@@ -293,10 +295,10 @@ class MarketDirectionFilter:
             intraday_score * cls._intraday_trend_weight
         )
 
-        # Convert back to trend
-        if final_score > 0.3:  # Strong positive
+        # Convert back to trend - TIGHTENED: Lower thresholds to be more decisive
+        if final_score > 0.15:  # Positive (was 0.3) - detect weaker uptrends
             return "UP"
-        elif final_score < -0.3:  # Strong negative
+        elif final_score < -0.15:  # Negative (was -0.3) - detect weaker downtrends
             return "DOWN"
         else:
             return "SIDEWAYS"

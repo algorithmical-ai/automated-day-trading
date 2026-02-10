@@ -18,36 +18,36 @@ class PeakDetectionConfig:
     momentum acceleration, stop losses, and position sizing.
     """
     
-    # Peak detection parameters - LOOSENED for fast scalping entries
-    peak_proximity_threshold: float = 0.90  # LOOSENED: from 0.85 - allow entries closer to recent highs
-    peak_lookback_bars: int = 7  # REDUCED: from 10 - shorter lookback for fast-moving stocks
+    # Peak detection parameters - TIGHTENED to prevent entering near peaks
+    peak_proximity_threshold: float = 0.80  # TIGHTENED: from 0.90 - reject entries closer to recent highs
+    peak_lookback_bars: int = 10  # RAISED: from 7 - longer lookback for better peak detection
 
-    # Volume confirmation parameters - more permissive for penny stocks
-    volume_lookback_bars: int = 15  # REDUCED: from 20 - shorter volume baseline
-    high_volume_multiplier: float = 1.3  # LOOSENED: from 1.5 - more permissive volume gate
+    # Volume confirmation parameters - require stronger volume confirmation
+    volume_lookback_bars: int = 20  # RAISED: from 15 - longer volume baseline for reliability
+    high_volume_multiplier: float = 1.5  # TIGHTENED: from 1.3 - require real volume confirmation
 
-    # Momentum acceleration parameters - more permissive for scalping
-    momentum_deceleration_threshold: float = -3.0  # LOOSENED: from -2.0 - allow more entries
+    # Momentum acceleration parameters - reject decelerating momentum
+    momentum_deceleration_threshold: float = -2.0  # TIGHTENED: from -3.0 - catch slowing momentum earlier
     momentum_normalization_range: float = 5.0  # Values beyond +/-5 are clamped
 
-    # Stop loss parameters - TIGHTER for fast scalping exits
-    initial_stop_loss_percent: float = -2.0  # TIGHTENED: from -5.0% - tight initial stop for scalps
-    early_exit_loss_percent: float = -1.5  # TIGHTENED: from -3.0% - exit bad trades fast
-    early_exit_time_seconds: int = 30  # REDUCED: from 120s - shorter "early" window
-    initial_period_seconds: int = 60  # REDUCED: from 180s - shorter initial protection period
-    emergency_stop_percent: float = -5.0  # TIGHTENED: from -8.0% - tighter emergency stop
+    # Stop loss parameters - WIDENED to give penny stocks room to breathe
+    initial_stop_loss_percent: float = -4.0  # WIDENED: from -2.0% - penny stocks need more room
+    early_exit_loss_percent: float = -2.5  # WIDENED: from -1.5% - avoid premature exits on noise
+    early_exit_time_seconds: int = 60  # RAISED: from 30s - give trades more time
+    initial_period_seconds: int = 120  # RAISED: from 60s - longer initial protection
+    emergency_stop_percent: float = -7.0  # WIDENED: from -5.0% - penny stocks can swing
 
-    # Position sizing parameters - lower threshold for more entries
-    min_confidence_threshold: float = 0.3  # LOWERED: from 0.4 - more entries pass confidence gate
+    # Position sizing parameters - RAISED thresholds for higher quality entries
+    min_confidence_threshold: float = 0.5  # RAISED: from 0.3 - require higher confidence
     min_position_size: float = 50.0  # Minimum $50 position
-    high_confidence_threshold: float = 0.7  # LOWERED: from 0.8 - easier to reach full size
-    medium_confidence_threshold: float = 0.5  # LOWERED: from 0.6 - easier to reach 75% size
+    high_confidence_threshold: float = 0.8  # RAISED: from 0.7 - harder to reach full size
+    medium_confidence_threshold: float = 0.65  # RAISED: from 0.5 - harder to reach 75% size
 
-    # Confidence calculation weights (must sum to 1.0) - momentum-heavy for scalping
-    momentum_weight: float = 0.35  # INCREASED: from 0.25 - momentum matters most for scalping
+    # Confidence calculation weights (must sum to 1.0) - balanced for quality
+    momentum_weight: float = 0.25  # REDUCED: from 0.35 - don't overweight momentum alone
     peak_proximity_weight: float = 0.25
-    volume_weight: float = 0.25
-    acceleration_weight: float = 0.15  # REDUCED: from 0.25 - less weight on acceleration
+    volume_weight: float = 0.30  # INCREASED: from 0.25 - volume confirmation is critical
+    acceleration_weight: float = 0.20  # INCREASED: from 0.15 - momentum direction matters
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary for serialization."""

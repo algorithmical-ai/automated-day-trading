@@ -77,24 +77,25 @@ class PennyStocksIndicator(BaseTradingIndicator):
     # Enter fast, take small profits, exit fast on reversals
     max_stock_price: float = 5.0  # Only trade stocks < $5
     min_stock_price: float = 0.75  # Avoid ultra-low penny stocks
+    position_size_dollars: float = 500.0  # REDUCED: from $2000 base to $500 for penny stocks - limit risk
 
-    # SCALPING TRAILING STOP - tighter to lock profits fast
-    trailing_stop_percent: float = 1.0  # TIGHTENED: from 2.0% to 1.0% - lock profits fast
-    profit_threshold: float = 1.5  # LOWERED: from 2.5% to 1.5% - take quick profits (NOW ENFORCED in exit cycle!)
-    immediate_loss_exit_threshold: float = -5.0  # TIGHTENED: from -7.0% to -5.0% (NOW ENFORCED in exit cycle!)
+    # SCALPING TRAILING STOP - balance between locking profits and giving room
+    trailing_stop_percent: float = 1.5  # WIDENED: from 1.0% to 1.5% - give more room to breathe
+    profit_threshold: float = 2.0  # RAISED: from 1.5% to 2.0% - need larger profit to justify spread cost
+    immediate_loss_exit_threshold: float = -6.0  # WIDENED: from -5.0% to -6.0% - penny stocks need more room
     atr_period: int = 14  # ATR calculation period for entry analysis
 
-    top_k: int = 2  # INCREASED: from 1 to 2 - more candidates per cycle
-    min_momentum_threshold: float = 3.0  # LOWERED: from 5.0% to 3.0% - catch earlier moves
-    max_momentum_threshold: float = 25.0  # INCREASED: from 20.0% to 25.0%
-    exceptional_momentum_threshold: float = 8.0  # LOWERED: from 10.0% to 8.0%
-    min_continuation_threshold: float = 0.5  # LOWERED: from 0.6 to 0.5 - more permissive
+    top_k: int = 1  # REDUCED: from 2 to 1 - be more selective, fewer concurrent bets
+    min_momentum_threshold: float = 5.0  # RAISED: from 3.0% to 5.0% - require stronger momentum to justify spread
+    max_momentum_threshold: float = 20.0  # TIGHTENED: from 25.0% to 20.0% - extreme momentum = reversal risk
+    exceptional_momentum_threshold: float = 10.0  # RAISED: from 8.0% to 10.0% - higher bar for exceptional
+    min_continuation_threshold: float = 0.65  # RAISED: from 0.5 to 0.65 - require stronger trend continuation
 
-    min_volume: int = 5000  # LOWERED: from 10000 to 5000 - penny stock friendly
-    min_avg_volume: int = 5000  # LOWERED: from 10000 to 5000
-    max_price_discrepancy_percent: float = 3.0  # LOOSENED: from 2.0% to 3.0% (fast moves cause discrepancy)
+    min_volume: int = 10000  # RAISED: from 5000 to 10000 - need real liquidity
+    min_avg_volume: int = 10000  # RAISED: from 5000 to 10000
+    max_price_discrepancy_percent: float = 2.0  # TIGHTENED: from 3.0% to 2.0% - fast moves = danger
     max_bid_ask_spread_percent: float = (
-        0.75  # KEPT: spread still kills scalping profits
+        0.50  # TIGHTENED: from 0.75% to 0.50% - wide spreads eat all profit
     )
 
     # Entry time restrictions - extended for more scalping opportunities
@@ -104,24 +105,24 @@ class PennyStocksIndicator(BaseTradingIndicator):
     # SAFETY: Disable shorting for penny stocks - too risky (can spike 100%+ in minutes)
     allow_short_positions: bool = False
 
-    # FAST SCALPING CYCLES - speed is everything
-    entry_cycle_seconds: int = 5  # REDUCED: from 15s to 5s - catch fast moves
-    exit_cycle_seconds: int = 3  # REDUCED: from 10s to 3s - exit on reversals quickly
-    max_active_trades: int = 4  # INCREASED: from 2 to 4 - more concurrent scalps
-    max_daily_trades: int = 25  # INCREASED: from 8 to 25 - scalping means many trades
+    # CONTROLLED SCALPING CYCLES - balance speed with quality
+    entry_cycle_seconds: int = 10  # RAISED: from 5s to 10s - give more time between analyses
+    exit_cycle_seconds: int = 5  # RAISED: from 3s to 5s - avoid exit noise
+    max_active_trades: int = 2  # REDUCED: from 4 to 2 - concentrate on fewer, better trades
+    max_daily_trades: int = 10  # REDUCED: from 25 to 10 - quality over quantity
 
-    # FAST HOLDING PERIOD for scalping
-    min_holding_period_seconds: int = 15  # REDUCED: from 90s to 15s - allow fast exits
-    min_holding_before_preempt_seconds: int = 60  # REDUCED: from 180s to 60s
-    max_holding_time_minutes: int = 15  # REDUCED: from 60min to 15min - scalps, not swings
-    recent_bars_for_trend: int = 5  # Use last 5 bars to determine trend
-    ticker_cooldown_minutes: int = 5  # REDUCED: from 60min to 5min - allow fast re-entry
+    # LONGER HOLDING PERIOD - give trades room to develop
+    min_holding_period_seconds: int = 60  # RAISED: from 15s to 60s - stop exiting immediately
+    min_holding_before_preempt_seconds: int = 120  # RAISED: from 60s to 120s
+    max_holding_time_minutes: int = 20  # RAISED: from 15min to 20min - give trades room
+    recent_bars_for_trend: int = 10  # RAISED: from 5 to 10 bars - more data for trend detection
+    ticker_cooldown_minutes: int = 15  # RAISED: from 5min to 15min - prevent rapid re-entry into losers
 
-    # ATR configuration - TIGHTER for scalping
-    atr_multiplier: float = 2.5  # REDUCED: from 3.5 to 2.5 - tighter ATR stops
-    atr_stop_min: float = -3.0  # TIGHTENED: from -4.0% to -3.0% - tighter floor
-    atr_stop_max: float = -5.0  # TIGHTENED: from -8.0% to -5.0% - tighter cap
-    default_atr_stop_percent: float = -3.0  # TIGHTENED: from -4.0% to -3.0%
+    # ATR configuration - WIDENED to give penny stocks room to breathe
+    atr_multiplier: float = 3.0  # RAISED: from 2.5 to 3.0 - wider stops for volatile penny stocks
+    atr_stop_min: float = -4.0  # WIDENED: from -3.0% to -4.0% - penny stocks need wider floor
+    atr_stop_max: float = -7.0  # WIDENED: from -5.0% to -7.0% - allow more room for volatile stocks
+    default_atr_stop_percent: float = -4.0  # WIDENED: from -3.0% to -4.0%
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
@@ -320,6 +321,50 @@ class PennyStocksIndicator(BaseTradingIndicator):
         return any(ticker.upper().endswith(suffix) for suffix in special_suffixes)
 
     @classmethod
+    def _calculate_rsi_from_bars(cls, bars: List[Dict[str, Any]], period: int = 14) -> Optional[float]:
+        """
+        Calculate RSI from price bars without requiring talib.
+        Returns RSI value (0-100) or None if insufficient data.
+        """
+        if not bars or len(bars) < period + 1:
+            return None
+
+        closes = []
+        for bar in bars:
+            c = bar.get("c")
+            if c is not None:
+                closes.append(float(c))
+
+        if len(closes) < period + 1:
+            return None
+
+        # Calculate price changes
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            change = closes[i] - closes[i - 1]
+            if change > 0:
+                gains.append(change)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(abs(change))
+
+        # Use exponential moving average (Wilder's smoothing)
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+        if avg_loss == 0:
+            return 100.0
+
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    @classmethod
     async def _validate_ticker_with_pipeline(
         cls,
         ticker: str,
@@ -330,12 +375,13 @@ class PennyStocksIndicator(BaseTradingIndicator):
         """
         Validate ticker using ENHANCED validation for penny stocks.
 
-        IMPROVED VALIDATION (Jan 2026):
-        1. Have at least 3 bars (minimal data quality)
+        IMPROVED VALIDATION (Feb 2026):
+        1. Have at least 10 bars (raised from 3 - need more data for reliable trend)
         2. Valid bid/ask spread (can actually trade)
-        3. Continuation score meets minimum threshold (avoids entering at trend peaks)
-        4. NEW: Peak detection - reject if price is at/near local peak
-        5. NEW: Momentum deceleration - reject if momentum is slowing down
+        3. RSI filter - reject overbought longs and oversold shorts
+        4. Continuation score meets minimum threshold (avoids entering at trend peaks)
+        5. Peak detection - reject if price is at/near local peak
+        6. Momentum deceleration - reject if momentum is slowing down
 
         Args:
             ticker: Stock ticker symbol
@@ -349,10 +395,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
         # Calculate trend metrics for logging purposes
         trend_metrics = TrendAnalyzer.calculate_trend_metrics(bars)
 
-        # SIMPLIFIED VALIDATION - Only essential checks
+        # IMPROVED VALIDATION - Essential checks + RSI filter
 
-        # 1. Minimal data quality - need at least 3 bars to calculate any trend
-        MIN_BARS_REQUIRED = 3
+        # 1. Data quality - need at least 10 bars for reliable trend detection (raised from 3)
+        MIN_BARS_REQUIRED = 10
         if not bars or len(bars) < MIN_BARS_REQUIRED:
             reason = f"Insufficient bars data (need {MIN_BARS_REQUIRED}, got {len(bars) if bars else 0})"
             collector.add_rejection(
@@ -390,7 +436,50 @@ class PennyStocksIndicator(BaseTradingIndicator):
             )
             return False
 
-        # 4. Continuation check - avoid entering when trend is weakening (NEW)
+        # 4. RSI filter - prevent entering overbought/oversold conditions
+        # This is critical for penny stocks which can spike and reverse rapidly
+        rsi = cls._calculate_rsi_from_bars(bars)
+        if rsi is not None:
+            RSI_OVERBOUGHT = 70.0  # Don't buy overbought
+            RSI_OVERSOLD = 30.0    # Don't short oversold
+            RSI_MIN_FOR_LONG = 40.0  # Don't buy into falling knife territory
+
+            if trend_metrics and trend_metrics.momentum_score > 0:
+                # For long entries: reject if RSI is overbought or too low (falling knife)
+                if rsi > RSI_OVERBOUGHT:
+                    reason = f"RSI overbought at {rsi:.1f} > {RSI_OVERBOUGHT} - price likely to reverse"
+                    collector.add_rejection(
+                        ticker=ticker,
+                        indicator=cls.indicator_name(),
+                        reason_long=reason,
+                        reason_short=None,
+                        technical_indicators={**(trend_metrics.to_dict() if trend_metrics else {}), "rsi": rsi},
+                    )
+                    return False
+                if rsi < RSI_MIN_FOR_LONG:
+                    reason = f"RSI too low at {rsi:.1f} < {RSI_MIN_FOR_LONG} - falling knife, avoid buying"
+                    collector.add_rejection(
+                        ticker=ticker,
+                        indicator=cls.indicator_name(),
+                        reason_long=reason,
+                        reason_short=None,
+                        technical_indicators={**(trend_metrics.to_dict() if trend_metrics else {}), "rsi": rsi},
+                    )
+                    return False
+            elif trend_metrics and trend_metrics.momentum_score < 0:
+                # For short entries: reject if RSI is oversold
+                if rsi < RSI_OVERSOLD:
+                    reason = f"RSI oversold at {rsi:.1f} < {RSI_OVERSOLD} - price likely to bounce"
+                    collector.add_rejection(
+                        ticker=ticker,
+                        indicator=cls.indicator_name(),
+                        reason_long=None,
+                        reason_short=reason,
+                        technical_indicators={**(trend_metrics.to_dict() if trend_metrics else {}), "rsi": rsi},
+                    )
+                    return False
+
+        # 5. Continuation check - avoid entering when trend is weakening
         # This prevents entering at trend peaks like WOK (continuation=0.50)
         if trend_metrics and trend_metrics.momentum_score > 0:
             # Upward trend - check continuation for long entries

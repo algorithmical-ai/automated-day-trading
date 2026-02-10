@@ -52,26 +52,26 @@ from app.src.services.trading.market_direction_filter import MarketDirectionFilt
 class MomentumIndicator(BaseTradingIndicator):
     """Momentum-based trading indicator with improved exit logic (Dec 2024)"""
 
-    # Momentum-specific configuration
-    profit_threshold: float = 1.5
-    top_k: int = 2
-    exceptional_momentum_threshold: float = 5.0
-    min_momentum_threshold: float = 1.5  # Meaningful momentum (not noise)
-    max_momentum_threshold: float = 15.0  # Reduced from 50% - 15%+ is already extreme
-    min_daily_volume: int = 1000
-    min_volume_ratio: float = 1.5  # Volume must be >1.5x SMA for entry
+    # Momentum-specific configuration - TIGHTENED for quality over quantity
+    profit_threshold: float = 2.0  # RAISED: from 1.5% to 2.0% - need more profit to justify entry
+    top_k: int = 1  # REDUCED: from 2 to 1 - be more selective
+    exceptional_momentum_threshold: float = 7.0  # RAISED: from 5.0% to 7.0%
+    min_momentum_threshold: float = 2.5  # RAISED: from 1.5% to 2.5% - require stronger signal
+    max_momentum_threshold: float = 12.0  # TIGHTENED: from 15.0% to 12.0% - extreme = reversal risk
+    min_daily_volume: int = 5000  # RAISED: from 1000 to 5000 - need real liquidity
+    min_volume_ratio: float = 2.0  # RAISED: from 1.5x to 2.0x SMA - require stronger volume confirmation
     stop_loss_threshold: float = (
         -4.0
-    )  # WIDENED from -2.5% - give trades room to breathe, will be overridden by ATR-based calculation
+    )  # Keep at -4% - give trades room to breathe
     trailing_stop_percent: float = (
         2.5  # Base trailing stop, will be adjusted for shorts
     )
     trailing_stop_short_multiplier: float = 1.5  # Wider trailing stop for shorts (3-4%)
-    min_adx_threshold: float = 20.0
+    min_adx_threshold: float = 25.0  # RAISED: from 20.0 to 25.0 - require stronger trend
     rsi_min_for_long: float = 45.0  # Not oversold (avoiding catching falling knives)
 
-    # IMPROVED: Max bid-ask spread for entry (reject high spread tickers)
-    max_bid_ask_spread_percent: float = 3.0  # INCREASED from 2.0% to 3.0%
+    # TIGHTENED: Max bid-ask spread for entry - wide spreads kill scalping profits
+    max_bid_ask_spread_percent: float = 1.5  # TIGHTENED: from 3.0% to 1.5%
 
     # Exit decision engine instance (shared across exit cycles)
     _exit_engine: Optional[ExitDecisionEngine] = None
@@ -101,10 +101,10 @@ class MomentumIndicator(BaseTradingIndicator):
     mfi_max_for_short: float = 80.0  # Don't short into extreme buying (squeeze)
     # IMPROVED: Longer holding periods to let trades develop
     min_holding_period_seconds: int = (
-        60  # INCREASED from 30 to 60 seconds - give trades room to breathe
+        90  # RAISED: from 60 to 90 seconds - give trades more room
     )
     min_holding_period_penny_stocks_seconds: int = (
-        60  # INCREASED from 15 to 60 seconds - same as regular stocks now
+        90  # RAISED: from 60 to 90 seconds - match regular stocks
     )
 
     # Volatility and low-priced stock filters
@@ -1770,9 +1770,18 @@ class MomentumIndicator(BaseTradingIndicator):
             logger.warning(f"Invalid entry price for {ticker}, skipping")
             return False
 
+        # CRITICAL FIX: Re-validate entry price against min_stock_price using actual quote
+        # This catches stocks that dropped below $5 since screening (e.g., SUNE at $1.44)
+        if enter_price < cls.min_stock_price:
+            logger.warning(
+                f"Skipping {ticker}: actual entry price ${enter_price:.2f} < ${cls.min_stock_price:.2f} "
+                f"minimum (penny stock, should be handled by PennyStocksIndicator)"
+            )
+            return False
+
         logger.debug(f"Entry price for {ticker}: ${enter_price:.4f}")
 
-        # NEW: Validate entry price vs technical analysis close price
+        # Validate entry price vs technical analysis close price
         # Reject if there's significant divergence (stale data or bad quote)
         ta_close_price = (
             market_data_response.get("close_price", 0.0)
