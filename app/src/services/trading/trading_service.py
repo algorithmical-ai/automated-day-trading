@@ -45,7 +45,7 @@ class TradingServiceCoordinator:
         # Requirement 1.5: WHERE a Trading Indicator is disabled, THEN exclude from execution
         cls._enabled_indicators = []
         
-        enable_momentum = os.getenv("ENABLE_MOMENTUM_INDICATOR", "true").lower() == "true"
+        enable_momentum = os.getenv("ENABLE_MOMENTUM_INDICATOR", "false").lower() == "true"  # DISABLED: unprofitable in backtesting, penny stocks covers <$5 universe
         enable_penny_stocks = os.getenv("ENABLE_PENNY_STOCKS_INDICATOR", "true").lower() == "true"
         enable_deep_analyzer = os.getenv("ENABLE_DEEP_ANALYZER_INDICATOR", "true").lower() == "true"
         enable_uw_enhanced = os.getenv("ENABLE_UW_ENHANCED_INDICATOR", "true").lower() == "true"

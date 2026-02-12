@@ -98,9 +98,9 @@ class PennyStocksIndicator(BaseTradingIndicator):
         0.50  # TIGHTENED: from 0.75% to 0.50% - wide spreads eat all profit
     )
 
-    # Entry time restrictions - extended for more scalping opportunities
-    max_entry_hour_et: int = 15  # No entries after 3:00 PM ET
-    max_entry_minute_et: int = 45  # EXTENDED: from 30 to 45 - more scalping window
+    # Entry time restrictions - tight cutoff to avoid low-liquidity late-day penny stock trades
+    max_entry_hour_et: int = 14  # TIGHTENED: from 15 to 14 - penny stock liquidity dries up after 2:30 PM
+    max_entry_minute_et: int = 30  # TIGHTENED: from 45 to 30 - avoid widening spreads near close
 
     # SAFETY: Disable shorting for penny stocks - too risky (can spike 100%+ in minutes)
     allow_short_positions: bool = False
@@ -126,9 +126,16 @@ class PennyStocksIndicator(BaseTradingIndicator):
 
     # Track losing tickers for the day (exclude from MAB)
     _losing_tickers_today: set = set()  # Tickers that showed loss today
+    _losing_tickers_loaded_from_db: bool = False  # Whether we've loaded losing tickers from DB today
 
     # Track traded tickers (used internally, but no longer blocks re-entry after cooldown)
     _traded_tickers_today: set = set()  # Legacy tracking, re-entry allowed after cooldown
+
+    # Track last exit prices per ticker (for re-entry price distance check)
+    _last_exit_prices: Dict[str, float] = {}  # ticker -> exit_price
+
+    # Re-entry price distance threshold
+    max_reentry_price_distance_percent: float = 2.0  # Skip re-entry if price moved >2% above last exit
 
     # Exit decision engine instance (shared across exit cycles)
     _exit_engine: Optional[EnhancedExitDecisionEngine] = None
@@ -139,6 +146,74 @@ class PennyStocksIndicator(BaseTradingIndicator):
     @classmethod
     def indicator_name(cls) -> str:
         return "Penny Stocks"
+
+    @classmethod
+    async def _load_losing_tickers_from_db(cls) -> None:
+        """Load losing tickers from DynamoDB completed trades for today.
+
+        This ensures losing ticker exclusion survives Heroku dyno restarts.
+        Queries today's completed trades and adds any tickers with negative P&L
+        to the _losing_tickers_today set.
+        """
+        from datetime import date as date_class
+
+        today_str = date_class.today().isoformat()
+        try:
+            instance = DynamoDBClient._get_instance()
+            item = await instance.get_item(
+                table_name="CompletedTradesForAutomatedDayTrading",
+                key={"date": today_str, "indicator": cls.indicator_name()},
+            )
+            if item:
+                completed_trades = item.get("completed_trades", [])
+                for trade in completed_trades:
+                    profit = float(trade.get("profit_or_loss", 0))
+                    ticker = trade.get("ticker")
+                    if ticker and profit < 0:
+                        cls._losing_tickers_today.add(ticker)
+                    # Also rebuild last exit prices for re-entry distance check
+                    if ticker:
+                        exit_price = trade.get("exit_price")
+                        if exit_price is not None and float(exit_price) > 0:
+                            cls._last_exit_prices[ticker] = float(exit_price)
+            cls._losing_tickers_loaded_from_db = True
+            if cls._losing_tickers_today:
+                logger.info(
+                    f"📋 Loaded {len(cls._losing_tickers_today)} losing tickers from DB: "
+                    f"{list(cls._losing_tickers_today)}"
+                )
+            if cls._last_exit_prices:
+                logger.info(
+                    f"📋 Loaded {len(cls._last_exit_prices)} exit prices from DB for re-entry checks"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load losing tickers from DB: {e}")
+            cls._losing_tickers_loaded_from_db = True  # Don't retry on error
+
+    @classmethod
+    def _is_reentry_price_too_high(cls, ticker: str, current_price: float) -> bool:
+        """Check if current price has moved too far above the last exit price.
+
+        Prevents chasing the same move at worse levels after a profitable exit.
+        Returns True if ticker should be SKIPPED (price too high above last exit).
+        """
+        if ticker not in cls._last_exit_prices:
+            return False
+
+        last_exit = cls._last_exit_prices[ticker]
+        if last_exit <= 0:
+            return False
+
+        price_change_pct = ((current_price - last_exit) / last_exit) * 100
+
+        if price_change_pct > cls.max_reentry_price_distance_percent:
+            logger.info(
+                f"🚫 Skipping {ticker}: price ${current_price:.4f} is {price_change_pct:.1f}% above "
+                f"last exit ${last_exit:.4f} (max: {cls.max_reentry_price_distance_percent}%)"
+            )
+            return True
+
+        return False
 
     @classmethod
     def _calculate_recent_trend(
@@ -765,10 +840,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
         ):
             cls._losing_tickers_today = set()
             cls._traded_tickers_today = set()  # IMPROVED: Reset all traded tickers
+            cls._last_exit_prices = {}  # Reset exit price tracking for new day
+            cls._losing_tickers_loaded_from_db = False  # Force reload from DB
             cls._losing_tickers_date = today
             logger.info(
-                "🔄 Reset losing tickers and traded tickers lists for new trading day"
+                "🔄 Reset losing tickers, exit prices, and traded tickers lists for new trading day"
             )
+
+        # Load losing tickers and exit prices from DB if not yet loaded
+        # (survives Heroku dyno restarts mid-day)
+        if not cls._losing_tickers_loaded_from_db:
+            await cls._load_losing_tickers_from_db()
 
         # Check daily limit
         daily_limit_reached = await cls._has_reached_daily_trade_limit()
@@ -846,9 +928,10 @@ class PennyStocksIndicator(BaseTradingIndicator):
             return_exceptions=True,
         )
 
-        # Filter to only include stocks < $5 USD
+        # Filter to only include stocks < $5 USD AND not too far above last exit price
         penny_stock_candidates = []
         price_filtered_count = 0
+        reentry_filtered_count = 0
         for result in price_results:
             if isinstance(result, Exception):
                 continue
@@ -858,6 +941,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     price_filtered_count += 1
                     continue
                 if price < cls.max_stock_price:
+                    # FIX 1: Re-entry price distance check
+                    # Skip if price has moved >2% above last profitable exit
+                    if cls._is_reentry_price_too_high(ticker, price):
+                        reentry_filtered_count += 1
+                        continue
                     penny_stock_candidates.append(ticker)
                 else:
                     price_filtered_count += 1
@@ -871,6 +959,11 @@ class PennyStocksIndicator(BaseTradingIndicator):
             f"Price filtering: {len(candidates_to_fetch)} penny stocks (< ${cls.max_stock_price:.2f}), "
             f"{price_filtered_count} filtered out (>= ${cls.max_stock_price:.2f} or no price data)"
         )
+        if reentry_filtered_count > 0:
+            logger.info(
+                f"🚫 Re-entry price filter: {reentry_filtered_count} tickers skipped "
+                f"(price moved >{cls.max_reentry_price_distance_percent}% above last exit)"
+            )
 
         logger.info(
             f"Fetching market data for {len(candidates_to_fetch)} penny stock tickers in parallel batches"
@@ -2252,6 +2345,17 @@ class PennyStocksIndicator(BaseTradingIndicator):
                             )
                             technical_indicators_exit["volume"] = latest_bar.get("v", 0)
 
+                    # FIX 2: Track losing tickers and exit prices for max-holding-time exits
+                    # (Previously this path did NOT mark losing tickers, allowing re-entry)
+                    if profit_percent < 0:
+                        cls._losing_tickers_today.add(ticker)
+                        logger.warning(
+                            f"📛 Marked {ticker} as losing ticker via max-hold exit "
+                            f"(loss: {profit_percent:.2f}%) - excluded from re-entry for rest of day"
+                        )
+                    else:
+                        cls._last_exit_prices[ticker] = float(current_price_check)
+
                     await cls._exit_trade(
                         ticker=ticker,
                         original_action=original_action,
@@ -2435,9 +2539,12 @@ class PennyStocksIndicator(BaseTradingIndicator):
                     f"excluded from re-entry for rest of day"
                 )
             else:
+                # FIX 1: Track exit price for re-entry distance check
+                cls._last_exit_prices[ticker] = float(exit_price)
                 logger.info(
-                    f"✅ {ticker} exited profitably ({final_profit_percent:.2f}%) - "
-                    f"can re-enter after {cls.ticker_cooldown_minutes}min cooldown"
+                    f"✅ {ticker} exited profitably ({final_profit_percent:.2f}%) at ${exit_price:.4f} - "
+                    f"can re-enter after {cls.ticker_cooldown_minutes}min cooldown "
+                    f"if price stays within {cls.max_reentry_price_distance_percent}% of exit"
                 )
 
             # Get technical indicators for exit
